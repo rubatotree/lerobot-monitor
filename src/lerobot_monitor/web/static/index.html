@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>LeRobot Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="/static/styles.css"/>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span id="ws-dot" class="dot" title="WebSocket"></span>
+      <h1>LeRobot Monitor</h1>
+      <span id="mode-pill" class="pill idle">offline</span>
+    </div>
+    <div class="header-meta">
+      <span id="fps">— Hz</span>
+      <span id="clock">—</span>
+    </div>
+  </header>
+
+  <section id="status-bar" aria-label="hardware status">
+    <div class="stat">
+      <span class="stat-lbl">Follower</span>
+      <span class="stat-val" id="st-robot">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-lbl">Leader</span>
+      <span class="stat-val" id="st-leader">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-lbl">Task</span>
+      <span class="stat-val" id="st-task">idle</span>
+    </div>
+    <div class="stat">
+      <span class="stat-lbl">Elapsed</span>
+      <span class="stat-val" id="st-elapsed">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-lbl">Session</span>
+      <span class="stat-val" id="st-session">—</span>
+    </div>
+    <div class="stat grow">
+      <span class="stat-lbl">Episode</span>
+      <div class="prog">
+        <div id="prog-fill"></div>
+      </div>
+      <span class="stat-val" id="st-episode">—</span>
+    </div>
+  </section>
+
+  <main>
+    <section id="cameras" aria-label="cameras"></section>
+
+    <aside id="side">
+      <section class="panel" id="joint-panel">
+        <h2>Joints</h2>
+        <div id="joint-rows"></div>
+        <div class="row-actions">
+          <button type="button" data-preset="home">Home</button>
+          <button type="button" data-preset="zero">Zero</button>
+          <button type="button" id="btn-apply">Apply targets</button>
+        </div>
+        <label class="check">
+          <input type="checkbox" id="chk-hold" checked/>
+          Hold pose when idle
+        </label>
+      </section>
+
+      <section class="panel" id="task-panel">
+        <h2>Tasks</h2>
+        <div class="task-block">
+          <h3>Hardware</h3>
+          <div class="row-actions">
+            <button type="button" id="btn-robot-on">Connect arm</button>
+            <button type="button" id="btn-robot-off" class="ghost">Disconnect</button>
+          </div>
+          <div class="row-actions">
+            <button type="button" id="btn-leader-on">Connect leader</button>
+            <button type="button" id="btn-leader-off" class="ghost">Disconnect</button>
+          </div>
+        </div>
+        <div class="task-block">
+          <h3>Teleop test</h3>
+          <div class="row-actions">
+            <button type="button" id="btn-teleop-on">Start teleop</button>
+            <button type="button" id="btn-teleop-off" class="ghost">Stop</button>
+          </div>
+        </div>
+        <div class="task-block">
+          <h3>Record</h3>
+          <label>Task
+            <input id="rec-task" type="text" placeholder="classify the blocks"/>
+          </label>
+          <label>Repo id
+            <input id="rec-repo" type="text" placeholder="user/dataset"/>
+          </label>
+          <label>Episode s
+            <input id="rec-ep" type="number" value="20" min="1" step="1"/>
+          </label>
+          <div class="row-actions">
+            <button type="button" id="btn-rec-on">Start record</button>
+            <button type="button" id="btn-rec-next" class="ghost">Next ep</button>
+            <button type="button" id="btn-rec-off" class="ghost">Stop</button>
+          </div>
+        </div>
+        <div class="task-block">
+          <h3>Deploy / rollout</h3>
+          <label>Policy path
+            <input id="pol-path" type="text" placeholder="rubatotree/so101_classify_the_blocks_act_512"/>
+          </label>
+          <label>Instruction
+            <input id="pol-task" type="text" placeholder="Match each loose plastic block…"/>
+          </label>
+          <div class="split">
+            <label>Duration s
+              <input id="pol-dur" type="number" value="60" min="0" step="1"/>
+            </label>
+            <label>Device
+              <input id="pol-dev" type="text" value="cuda"/>
+            </label>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="chk-roll-rec" checked/>
+            Record video + joints
+          </label>
+          <div class="row-actions">
+            <button type="button" id="btn-roll-on">Start rollout</button>
+            <button type="button" id="btn-roll-off" class="ghost">Stop</button>
+          </div>
+        </div>
+        <div class="row-actions estop-row">
+          <button type="button" id="btn-estop" class="danger">E-STOP</button>
+          <button type="button" id="btn-resume" class="ghost">Resume torque</button>
+        </div>
+      </section>
+    </aside>
+
+    <section id="bottom">
+      <div class="chart-wrap">
+        <h2>Joint state</h2>
+        <canvas id="chart-state"></canvas>
+      </div>
+      <div class="chart-wrap">
+        <h2>Commanded action</h2>
+        <canvas id="chart-action"></canvas>
+      </div>
+      <div class="log-wrap">
+        <h2>Log</h2>
+        <ol id="log"></ol>
+        <h2>Sessions</h2>
+        <ol id="sessions"></ol>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

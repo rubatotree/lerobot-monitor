@@ -1,0 +1,49 @@
+# Default SO-101 layout matching scripts.ps1 (Windows).
+# Cameras are HTTP MJPEG from robot_tools/win_cam_server.py so this process
+# never contends for DirectShow devices.
+
+server:
+  host: "0.0.0.0"
+  port: 8088
+
+robot:
+  type: so101_follower
+  port: COM6
+  id: my_awesome_follower_arm
+  use_degrees: true
+  auto_connect: true
+  disable_torque_on_disconnect: true
+
+leader:
+  type: so101_leader
+  port: COM5
+  id: my_awesome_leader_arm
+  use_degrees: true
+  auto_connect: false
+
+cameras:
+  front:
+    source: "http://localhost:5000/video"
+    width: 640
+    height: 480
+    fps: 25
+  side:
+    source: "http://localhost:5001/video"
+    width: 640
+    height: 480
+    fps: 25
+
+control:
+  fps: 30
+  hold_when_idle: true
+  jog_duration_s: 1.5
+
+recording:
+  root: data/sessions
+  fps: 15
+  default_episode_time_s: 20
+  default_reset_time_s: 5
+
+rollout:
+  device: cuda
+  default_duration_s: 60

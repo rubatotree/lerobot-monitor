@@ -5,29 +5,39 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from pathlib import Path
+
 from .cameras import CameraHub
 from .config import MonitorConfig
 from .leader import LeaderArm
+from .library import VideoLibrary, list_hf_datasets, list_local_models
 from .loop import ControlLoop
 from .robot import FollowerArm
+from .runtime import format_runtime, probe_runtime
 from .session import list_sessions
+from .store import JsonStore
 from .types import JOINT_LIMITS, JOINT_ORDER, PRESETS
 
 
 class RuntimeHub:
     def __init__(self, config: MonitorConfig) -> None:
         self.config = config
-        self.cameras = CameraHub(config.cameras)
+        self.store = JsonStore(config.store_path)
+        self.cameras = CameraHub(config.cameras, self.store)
+        self.videos = VideoLibrary(config.videos_root())
+        self.datasets = self.videos
         self.follower = FollowerArm(config.robot)
         self.leader = LeaderArm(config.leader)
         self._snapshot: dict[str, Any] = {}
         self._lock = threading.Lock()
+        self.runtime = probe_runtime()
         self.loop = ControlLoop(
             config,
             self.cameras,
             self.follower,
             self.leader,
             on_snapshot=self._store_snapshot,
+            store=self.store,
         )
 
     def _store_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -45,18 +55,81 @@ class RuntimeHub:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             if self._snapshot:
-                return dict(self._snapshot)
-        return self.loop.snapshot()
+                data = dict(self._snapshot)
+            else:
+                data = self.loop.snapshot()
+        data["runtime"] = dict(self.runtime)
+        data["runtime_label"] = format_runtime(self.runtime)
+        return data
 
     def static_meta(self) -> dict[str, Any]:
         return {
             "joints": list(JOINT_ORDER),
             "limits": {name: {"min": lo, "max": hi} for name, (lo, hi) in JOINT_LIMITS.items()},
             "presets": PRESETS,
-            "cameras": list(self.config.cameras.keys()),
+            "saved_presets": self.store.presets(),
+            "ui": self.store.ui(),
+            "cameras": self.cameras.snapshots(),
             "recording_root": str(self.config.recording.root),
             "control_fps": self.config.control.fps,
+            "robot": {
+                "type": self.config.robot.type,
+                "port": self.config.robot.port,
+                "id": self.config.robot.id,
+                "use_degrees": self.config.robot.use_degrees,
+            },
+            "leader": {
+                "type": self.config.leader.type,
+                "port": self.config.leader.port,
+                "id": self.config.leader.id,
+                "use_degrees": self.config.leader.use_degrees,
+            },
+            "recording": {
+                "fps": self.config.recording.fps,
+                "default_episode_time_s": self.config.recording.default_episode_time_s,
+                "default_reset_time_s": self.config.recording.default_reset_time_s,
+                "default_num_episodes": self.config.recording.default_num_episodes,
+                "video_format": self.config.recording.video_format,
+                "streaming_encoding": self.config.recording.streaming_encoding,
+                "encoder_threads": self.config.recording.encoder_threads,
+                "root": str(self.config.videos_root()),
+            },
+            "runtime": dict(self.runtime),
+            "runtime_label": format_runtime(self.runtime),
         }
 
     def sessions(self) -> list[dict[str, Any]]:
-        return list_sessions(self.config.recording.root)
+        items = self.videos.list()
+        extra_root = Path(self.config.recording.root)
+        if extra_root.resolve() != self.videos.root.resolve():
+            items.extend(list_sessions(extra_root))
+        leftover = Path("data/datasets")
+        if leftover.resolve() != self.videos.root.resolve() and leftover.is_dir():
+            items.extend(list_sessions(leftover))
+        for item in items:
+            root = Path(item.get("path") or "")
+            log_path = root / "run.log"
+            if log_path.is_file():
+                try:
+                    lines = log_path.read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    lines = []
+                item["log_tail"] = lines[-8:]
+                item["session_id"] = item.get("session_id") or item.get("id")
+        return items
+
+    def hf_datasets(self) -> list[dict[str, Any]]:
+        extra = list(self.config.library.dataset_roots)
+        if self.config.library.datasets_root:
+            extra.append(Path(self.config.library.datasets_root))
+        return list_hf_datasets(extra)
+
+    def resolve_dataset(self, repo_id: str) -> dict[str, Any]:
+        for row in self.hf_datasets():
+            if row.get("repo_id") == repo_id or row.get("id") == repo_id:
+                return row
+        raise FileNotFoundError(repo_id)
+
+    def models(self) -> list[dict[str, Any]]:
+        roots = [Path(p) for p in self.config.library.models_roots]
+        return list_local_models(roots)

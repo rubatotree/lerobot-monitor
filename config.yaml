@@ -1,17 +1,18 @@
 # Default SO-101 layout matching scripts.ps1 (Windows).
-# Cameras are HTTP MJPEG from robot_tools/win_cam_server.py so this process
-# never contends for DirectShow devices.
+# Cameras are probed locally (DirectShow / V4L). Enable a network stream in
+# the Cameras panel; only those streams appear on the main grid.
 
 server:
   host: "0.0.0.0"
-  port: 8088
+  port: 8090
+  base_path: "/lerobot"
 
 robot:
   type: so101_follower
   port: COM6
   id: my_awesome_follower_arm
   use_degrees: true
-  auto_connect: true
+  auto_connect: false
   disable_torque_on_disconnect: true
 
 leader:
@@ -22,28 +23,40 @@ leader:
   auto_connect: false
 
 cameras:
-  front:
-    source: "http://localhost:5000/video"
-    width: 640
-    height: 480
-    fps: 25
-  side:
-    source: "http://localhost:5001/video"
-    width: 640
-    height: 480
-    fps: 25
+  probe: true
+  max_probe: 8
+  default_width: 640
+  default_height: 480
+  default_port_base: 5000
 
 control:
   fps: 30
   hold_when_idle: true
-  jog_duration_s: 1.5
+  jog_duration_s: 2.5
+  bus_release_s: 0.0
 
 recording:
-  root: data/sessions
+  root: data/videos
   fps: 15
   default_episode_time_s: 20
   default_reset_time_s: 5
+  default_num_episodes: 50
+  video_format: mp4
+  merge: true
+  streaming_encoding: true
+  encoder_threads: 2
+
+library:
+  videos_root: data/videos
+  dataset_roots:
+    - D:/datasets/lerobot
+  models_roots:
+    - data/models
+    - ../outputs
 
 rollout:
   device: cuda
   default_duration_s: 60
+  default_fps: 15
+  rename_map:
+    "observation.images.0": "observation.images.front"

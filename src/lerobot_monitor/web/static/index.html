@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-base="/lerobot">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
-  <link rel="stylesheet" href="/static/styles.css"/>
+  <link rel="stylesheet" href="/lerobot/static/styles.css"/>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -16,80 +16,142 @@
       <span id="ws-dot" class="dot" title="WebSocket"></span>
       <h1>LeRobot Monitor</h1>
       <span id="mode-pill" class="pill idle">offline</span>
+      <span class="hdr-stat">bus <b id="st-bus">free</b></span>
+      <span class="hdr-stat">mode <b id="st-mode">offline</b></span>
+      <span class="hdr-stat">F <b id="st-robot">—</b></span>
+      <span class="hdr-stat">L <b id="st-leader">—</b></span>
+      <span class="hdr-stat" id="st-env" title="python / torch">env —</span>
+      <span class="hdr-stat" id="st-elapsed">—</span>
+      <span class="hdr-stat" id="st-episode">—</span>
+      <div class="prog hdr-prog"><div id="prog-fill"></div></div>
+    </div>
+    <div class="header-actions">
+      <button type="button" id="btn-hdr-scan" class="hdr-icon" title="Scan serial and cameras">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.3M21 12a9 9 0 0 1-15.5 6.3"/><polyline points="3 5 3 12 10 12"/><polyline points="21 19 21 12 14 12"/></svg>
+        scan
+      </button>
+      <button type="button" id="btn-hdr-relax" class="hdr-icon" title="Go to relax pose">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v6"/><circle cx="12" cy="12" r="3"/><path d="M6 21c0-3.3 2.7-6 6-6s6 2.7 6 6"/></svg>
+        relax
+      </button>
+      <button type="button" id="btn-hdr-teleop" class="hdr-icon" data-task="teleop" title="Teleop">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="8" width="16" height="10" rx="2"/><line x1="8" y1="12" x2="8" y2="14"/><line x1="16" y1="12" x2="16" y2="14"/><line x1="12" y1="8" x2="12" y2="4"/><circle cx="12" cy="3" r="1"/></svg>
+        <span class="hdr-lbl">teleop</span>
+      </button>
+      <button type="button" id="btn-hdr-record" class="hdr-icon" data-task="record" title="Record dataset">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.5" fill="currentColor" stroke="none"/></svg>
+        <span class="hdr-lbl">record</span>
+      </button>
+      <button type="button" id="btn-hdr-rollout" class="hdr-icon" data-task="rollout" title="Rollout">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="7 4 20 12 7 20 7 4"/></svg>
+        <span class="hdr-lbl">rollout</span>
+      </button>
+      <button type="button" id="btn-hdr-capture" class="hdr-icon" title="Record main-view cameras">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/></svg>
+        rec
+      </button>
+      <button type="button" id="btn-hdr-auto" class="hdr-icon" title="Auto-record during teleop and rollout">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"/><path d="M12 8v4l3 2"/></svg>
+        auto
+      </button>
+      <button type="button" id="btn-hdr-stop" class="hdr-icon stop" title="Stop teleop / record / rollout">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1" fill="currentColor" stroke="none"/></svg>
+        stop
+      </button>
+      <button type="button" id="btn-hdr-estop" class="hdr-estop" title="Emergency stop">E-STOP</button>
     </div>
     <div class="header-meta">
-      <span id="fps">— Hz</span>
-      <span id="clock">—</span>
+      <span id="fps"> 0.0 Hz</span>
+      <span id="clock">00:00:00</span>
     </div>
   </header>
 
-  <section id="status-bar" aria-label="hardware status">
-    <div class="stat">
-      <span class="stat-lbl">Follower</span>
-      <span class="stat-val" id="st-robot">—</span>
-    </div>
-    <div class="stat">
-      <span class="stat-lbl">Leader</span>
-      <span class="stat-val" id="st-leader">—</span>
-    </div>
-    <div class="stat">
-      <span class="stat-lbl">Task</span>
-      <span class="stat-val" id="st-task">idle</span>
-    </div>
-    <div class="stat">
-      <span class="stat-lbl">Elapsed</span>
-      <span class="stat-val" id="st-elapsed">—</span>
-    </div>
-    <div class="stat">
-      <span class="stat-lbl">Session</span>
-      <span class="stat-val" id="st-session">—</span>
-    </div>
-    <div class="stat grow">
-      <span class="stat-lbl">Episode</span>
-      <div class="prog">
-        <div id="prog-fill"></div>
-      </div>
-      <span class="stat-val" id="st-episode">—</span>
-    </div>
-  </section>
-
   <main>
+    <aside id="library" data-panel="library">
+      <button type="button" class="panel-toggle" aria-expanded="true">
+        <h2>Library</h2>
+        <span class="chevron" aria-hidden="true">▾</span>
+      </button>
+      <div class="panel-body">
+        <h3>Videos</h3>
+        <div class="row-actions">
+          <button type="button" id="btn-vid-refresh" class="ghost">Refresh</button>
+        </div>
+        <ol id="vid-list" class="lib-list"></ol>
+        <div id="viz" class="viz hidden">
+          <p class="hw-status" id="viz-title">—</p>
+          <div class="viz-nav">
+            <button type="button" id="viz-prev" class="ghost">◀</button>
+            <input id="viz-ep" type="number" min="0" value="0"/>
+            <span id="viz-ep-max">/ 0</span>
+            <button type="button" id="viz-next" class="ghost">▶</button>
+            <button type="button" id="viz-play" class="ghost">play</button>
+          </div>
+          <div id="viz-cams" class="viz-cams"></div>
+          <input id="viz-seek" type="range" min="0" max="1000" value="0" step="1"/>
+          <div class="viz-meta"><span id="viz-t">0.00s</span></div>
+          <canvas id="viz-chart"></canvas>
+        </div>
+        <div id="vid-detail" class="ds-detail hidden">
+          <ol id="ep-list" class="lib-list"></ol>
+        </div>
+        <h3>Datasets</h3>
+        <div class="row-actions">
+          <button type="button" id="btn-ds-refresh" class="ghost">Scan cache</button>
+        </div>
+        <ol id="ds-list" class="lib-list"></ol>
+        <h3>Models</h3>
+        <div class="row-actions">
+          <button type="button" id="btn-md-refresh" class="ghost">Rescan</button>
+        </div>
+        <ol id="md-list" class="lib-list"></ol>
+      </div>
+    </aside>
+    <div id="split-lib" class="split col" role="separator" aria-orientation="vertical"></div>
     <section id="cameras" aria-label="cameras"></section>
-
+    <div id="split-v" class="split col" role="separator" aria-orientation="vertical"></div>
     <aside id="side">
-      <section class="panel" id="joint-panel">
-        <h2>Joints</h2>
+      <section class="panel" id="joint-panel" data-panel="joints">
+        <button type="button" class="panel-toggle" aria-expanded="true">
+          <h2>Joints</h2>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="panel-body">
         <div id="joint-rows"></div>
         <div class="row-actions">
-          <button type="button" data-preset="home">Home</button>
-          <button type="button" data-preset="zero">Zero</button>
           <button type="button" id="btn-apply">Apply targets</button>
+          <button type="button" id="btn-read-pose">From follower</button>
+          <button type="button" id="btn-read-leader" class="ghost">From leader</button>
+        </div>
+        <div class="preset-row">
+          <select id="pose-preset"></select>
+          <input id="pose-preset-name" type="text" placeholder="preset name"/>
+          <span class="preset-btns">
+            <button type="button" id="btn-pose-save">Save</button>
+            <button type="button" id="btn-pose-load" class="ghost">Load</button>
+            <button type="button" id="btn-pose-dup" class="ghost">Duplicate</button>
+            <button type="button" id="btn-pose-del" class="ghost">Delete</button>
+          </span>
         </div>
         <label class="check">
           <input type="checkbox" id="chk-hold" checked/>
-          Hold pose when idle
+          Hold pose while serial is leased
         </label>
+        </div>
       </section>
 
-      <section class="panel" id="task-panel">
-        <h2>Tasks</h2>
+      <section class="panel" id="task-panel" data-panel="tasks">
+        <button type="button" class="panel-toggle" aria-expanded="true">
+          <h2>Tasks</h2>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="panel-body">
         <div class="task-block">
-          <h3>Hardware</h3>
-          <div class="row-actions">
-            <button type="button" id="btn-robot-on">Connect arm</button>
-            <button type="button" id="btn-robot-off" class="ghost">Disconnect</button>
-          </div>
-          <div class="row-actions">
-            <button type="button" id="btn-leader-on">Connect leader</button>
-            <button type="button" id="btn-leader-off" class="ghost">Disconnect</button>
-          </div>
-        </div>
-        <div class="task-block">
-          <h3>Teleop test</h3>
-          <div class="row-actions">
-            <button type="button" id="btn-teleop-on">Start teleop</button>
-            <button type="button" id="btn-teleop-off" class="ghost">Stop</button>
-          </div>
+          <h3>Teleop</h3>
+          <details class="task-info">
+            <summary>Info</summary>
+            <pre id="info-teleop"></pre>
+          </details>
         </div>
         <div class="task-block">
           <h3>Record</h3>
@@ -99,65 +161,185 @@
           <label>Repo id
             <input id="rec-repo" type="text" placeholder="user/dataset"/>
           </label>
-          <label>Episode s
-            <input id="rec-ep" type="number" value="20" min="1" step="1"/>
+          <label>Episodes
+            <input id="rec-num" type="number" value="50" min="1" step="1"/>
           </label>
-          <div class="row-actions">
-            <button type="button" id="btn-rec-on">Start record</button>
-            <button type="button" id="btn-rec-next" class="ghost">Next ep</button>
-            <button type="button" id="btn-rec-off" class="ghost">Stop</button>
+          <div class="pair">
+            <label>Episode s
+              <input id="rec-ep" type="number" value="20" min="1" step="1"/>
+            </label>
+            <label>Reset s
+              <input id="rec-reset" type="number" value="5" min="0" step="1"/>
+            </label>
           </div>
+          <div class="pair">
+            <label>FPS
+              <input id="rec-fps" type="number" value="15" min="1" step="1"/>
+            </label>
+            <label>Format
+              <select id="rec-format">
+                <option value="mp4">mp4</option>
+                <option value="avi">avi</option>
+              </select>
+            </label>
+          </div>
+          <label>Save path
+            <input id="rec-root" type="text" placeholder="data/datasets"/>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="chk-rec-resume"/>
+            Continue recording
+          </label>
+          <label class="check">
+            <input type="checkbox" id="chk-rec-video" checked/>
+            Video
+          </label>
+          <label class="check">
+            <input type="checkbox" id="chk-rec-stream-enc" checked/>
+            Streaming encoding
+          </label>
+          <label>Encoder threads
+            <input id="rec-enc-threads" type="number" value="2" min="1" step="1"/>
+          </label>
+          <div class="preset-row">
+            <select id="rec-preset"></select>
+            <input id="rec-preset-name" type="text" placeholder="preset name"/>
+            <span class="preset-btns">
+              <button type="button" id="btn-rec-save">Save</button>
+              <button type="button" id="btn-rec-load" class="ghost">Load</button>
+              <button type="button" id="btn-rec-dup" class="ghost">Duplicate</button>
+              <button type="button" id="btn-rec-del" class="ghost">Delete</button>
+            </span>
+          </div>
+          <div class="row-actions">
+            <button type="button" id="btn-rec-next" class="ghost">Next ep</button>
+          </div>
+          <details class="task-info">
+            <summary>Info</summary>
+            <pre id="info-record"></pre>
+          </details>
         </div>
         <div class="task-block">
-          <h3>Deploy / rollout</h3>
+          <h3>Rollout</h3>
           <label>Policy path
             <input id="pol-path" type="text" placeholder="rubatotree/so101_classify_the_blocks_act_512"/>
           </label>
           <label>Instruction
-            <input id="pol-task" type="text" placeholder="Match each loose plastic block…"/>
+            <input id="pol-task" type="text" placeholder="Match each loose plastic block to the examples in the organizer and put it in the matching compartment."/>
           </label>
-          <div class="split">
+          <div class="pair">
             <label>Duration s
               <input id="pol-dur" type="number" value="60" min="0" step="1"/>
             </label>
-            <label>Device
-              <input id="pol-dev" type="text" value="cuda"/>
+            <label>FPS
+              <input id="pol-fps" type="number" value="15" min="1" step="1"/>
             </label>
           </div>
-          <label class="check">
-            <input type="checkbox" id="chk-roll-rec" checked/>
-            Record video + joints
+          <label>Device
+            <input id="pol-dev" type="text" value="cuda"/>
           </label>
-          <div class="row-actions">
-            <button type="button" id="btn-roll-on">Start rollout</button>
-            <button type="button" id="btn-roll-off" class="ghost">Stop</button>
+          <p class="kv-lbl">Extra params</p>
+          <div id="roll-kv" class="kv-table"></div>
+          <button type="button" id="btn-kv-add" class="ghost">Add param</button>
+          <div class="preset-row">
+            <select id="roll-preset"></select>
+            <input id="roll-preset-name" type="text" placeholder="preset name"/>
+            <span class="preset-btns">
+              <button type="button" id="btn-roll-save">Save</button>
+              <button type="button" id="btn-roll-load" class="ghost">Load</button>
+              <button type="button" id="btn-roll-dup" class="ghost">Duplicate</button>
+              <button type="button" id="btn-roll-del" class="ghost">Delete</button>
+            </span>
           </div>
+          <details class="task-info">
+            <summary>Info</summary>
+            <pre id="info-roll"></pre>
+          </details>
         </div>
         <div class="row-actions estop-row">
           <button type="button" id="btn-estop" class="danger">E-STOP</button>
           <button type="button" id="btn-resume" class="ghost">Resume torque</button>
         </div>
+        </div>
+      </section>
+
+      <section class="panel" id="hw-panel" data-panel="hardware">
+        <button type="button" class="panel-toggle" aria-expanded="true">
+          <h2>Hardware</h2>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="panel-body">
+        <div class="task-block">
+          <h3>Arm</h3>
+          <label>Port
+            <select id="arm-port"></select>
+          </label>
+          <p class="hw-status" id="arm-status">disconnected</p>
+          <div class="row-actions">
+            <button type="button" id="btn-robot-on">Connect arm</button>
+            <button type="button" id="btn-robot-off" class="ghost">Disconnect</button>
+          </div>
+        </div>
+        <div class="task-block">
+          <h3>Leader</h3>
+          <label>Port
+            <select id="leader-port"></select>
+          </label>
+          <p class="hw-status" id="leader-status">disconnected</p>
+          <div class="row-actions">
+            <button type="button" id="btn-leader-on">Connect leader</button>
+            <button type="button" id="btn-leader-off" class="ghost">Disconnect</button>
+          </div>
+        </div>
+        <details class="task-info">
+          <summary>Info</summary>
+          <pre id="info-hw"></pre>
+        </details>
+        <div class="task-block">
+          <h3>Cameras</h3>
+          <div id="cam-rows"></div>
+        </div>
+        </div>
       </section>
     </aside>
 
+    <div id="split-h" class="split row" role="separator" aria-orientation="horizontal"></div>
     <section id="bottom">
-      <div class="chart-wrap">
-        <h2>Joint state</h2>
-        <canvas id="chart-state"></canvas>
+      <div class="chart-wrap panel" data-panel="chart-state">
+        <button type="button" class="panel-toggle" aria-expanded="true">
+          <h2>Joint state</h2>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="panel-body">
+          <canvas id="chart-state"></canvas>
+        </div>
       </div>
-      <div class="chart-wrap">
-        <h2>Commanded action</h2>
-        <canvas id="chart-action"></canvas>
+      <div class="chart-wrap panel" data-panel="chart-action">
+        <button type="button" class="panel-toggle" aria-expanded="true">
+          <h2>Commanded action</h2>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="panel-body">
+          <canvas id="chart-action"></canvas>
+        </div>
       </div>
-      <div class="log-wrap">
-        <h2>Log</h2>
-        <ol id="log"></ol>
-        <h2>Sessions</h2>
-        <ol id="sessions"></ol>
+      <div id="split-log" class="split col" role="separator" aria-orientation="vertical"></div>
+      <div class="log-wrap panel" data-panel="log">
+        <button type="button" class="panel-toggle" aria-expanded="true">
+          <h2>Log / Sessions</h2>
+          <span class="log-tools">
+            <span id="btn-log-copy" class="log-copy">Copy</span>
+            <span class="chevron" aria-hidden="true">▾</span>
+          </span>
+        </button>
+        <div class="panel-body">
+          <ol id="log"></ol>
+          <ol id="sessions"></ol>
+        </div>
       </div>
     </section>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/lerobot/static/app.js"></script>
 </body>
 </html>

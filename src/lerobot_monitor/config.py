@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field, field_validator
 
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
-    port: int = 8088
+    port: int = 8090
+    base_path: str = "/lerobot"
 
 
 class RobotConfig(BaseModel):
@@ -19,7 +20,7 @@ class RobotConfig(BaseModel):
     port: str = "COM6"
     id: str = "my_awesome_follower_arm"
     use_degrees: bool = True
-    auto_connect: bool = True
+    auto_connect: bool = False
     disable_torque_on_disconnect: bool = True
     calibrate: bool = False
 
@@ -33,49 +34,77 @@ class LeaderConfig(BaseModel):
     calibrate: bool = False
 
 
-class CameraConfig(BaseModel):
-    source: str | int
-    width: int = 640
-    height: int = 480
-    fps: int = 25
+class CamerasConfig(BaseModel):
+    probe: bool = True
+    max_probe: int = 8
+    default_width: int = 640
+    default_height: int = 480
+    default_port_base: int = 5000
     jpeg_quality: int = 80
-
-    @field_validator("source", mode="before")
-    @classmethod
-    def _coerce_source(cls, value: Any) -> str | int:
-        if isinstance(value, int):
-            return value
-        text = str(value)
-        return int(text) if text.isdigit() else text
 
 
 class ControlConfig(BaseModel):
     fps: float = 30.0
     hold_when_idle: bool = True
-    jog_duration_s: float = 1.5
+    jog_duration_s: float = 2.5
+    # Unused for idle timeout. Relax-then-release only runs when COM is being
+    # dropped and no later mode will hold the pose (disconnect / process stop).
+    bus_release_s: float = 0.0
 
 
 class RecordingConfig(BaseModel):
-    root: Path = Path("data/sessions")
+    root: Path = Path("data/videos")
     fps: int = 15
     default_episode_time_s: float = 20.0
     default_reset_time_s: float = 5.0
+    default_num_episodes: int = 50
+    video_format: str = "mp4"
+    merge: bool = True
+    streaming_encoding: bool = True
+    encoder_threads: int = 2
+    video: bool = True
+
+
+class LibraryConfig(BaseModel):
+    videos_root: Path | None = None
+    datasets_root: Path | None = None
+    dataset_roots: list[Path] = Field(default_factory=list)
+    models_roots: list[Path] = Field(default_factory=lambda: [Path("data/models"), Path("../outputs")])
 
 
 class RolloutConfig(BaseModel):
     device: str = "cuda"
     default_duration_s: float = 60.0
+    default_fps: int = 15
     rename_map: dict[str, str] = Field(default_factory=dict)
 
 
 class MonitorConfig(BaseModel):
+    store_path: Path = Path("data/monitor_store.json")
     server: ServerConfig = Field(default_factory=ServerConfig)
     robot: RobotConfig = Field(default_factory=RobotConfig)
     leader: LeaderConfig = Field(default_factory=LeaderConfig)
-    cameras: dict[str, CameraConfig] = Field(default_factory=dict)
+    cameras: CamerasConfig = Field(default_factory=CamerasConfig)
+
+    @field_validator("cameras", mode="before")
+    @classmethod
+    def _coerce_cameras(cls, value: Any) -> Any:
+        if value is None:
+            return CamerasConfig()
+        if isinstance(value, dict) and "probe" not in value and "default_width" not in value:
+            return CamerasConfig()
+        return value
     control: ControlConfig = Field(default_factory=ControlConfig)
     recording: RecordingConfig = Field(default_factory=RecordingConfig)
+    library: LibraryConfig = Field(default_factory=LibraryConfig)
     rollout: RolloutConfig = Field(default_factory=RolloutConfig)
+
+    def videos_root(self) -> Path:
+        return Path(self.library.videos_root or self.recording.root)
+
+    def datasets_root(self) -> Path:
+        """Backward-compatible alias for the local video session root."""
+        return self.videos_root()
 
     @classmethod
     def load(cls, path: str | Path | None) -> MonitorConfig:

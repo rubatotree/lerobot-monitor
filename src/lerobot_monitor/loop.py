@@ -2,23 +2,71 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 
 from .cameras import CameraHub
 from .config import MonitorConfig
 from .leader import LeaderArm
+from .library import DatasetRecorder, VideoLibrary
 from .policy import LoadedPolicy, load_policy, predict_pose
 from .robot import FollowerArm
-from .session import SessionWriter
-from .types import PRESETS, lerp_pose, merge_partial
+from .store import JsonStore
+from .types import JOINT_ORDER, RELAX_POSE, lerp_pose, merge_partial
 
 logger = logging.getLogger(__name__)
+_LOG_SKIP_PREFIXES = ("uvicorn.access", "lerobot_monitor")
+
+
+class _UiLogHandler(logging.Handler):
+    """Forward third-party loggers (policy load, HF download) into the UI log."""
+
+    def __init__(self, loop: ControlLoop) -> None:
+        super().__init__(level=logging.INFO)
+        self.loop = loop
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if any(record.name.startswith(prefix) for prefix in _LOG_SKIP_PREFIXES):
+            return
+        try:
+            message = record.getMessage().strip()
+        except Exception:
+            return
+        if not message:
+            return
+        level = "error" if record.levelno >= logging.ERROR else "info"
+        self.loop.log(level, f"[{record.name}] {message}", echo=False)
+
+
+class _StdioToLog:
+    def __init__(self, loop: ControlLoop, stream: TextIO) -> None:
+        self.loop = loop
+        self.stream = stream
+        self._buf = ""
+
+    def write(self, text: str) -> int:
+        self.stream.write(text)
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.strip()
+            if line:
+                self.loop.log("info", line, echo=False)
+        return len(text)
+
+    def flush(self) -> None:
+        self.stream.flush()
+        leftover = self._buf.strip()
+        self._buf = ""
+        if leftover:
+            self.loop.log("info", leftover, echo=False)
 
 
 def _precise_sleep(seconds: float) -> None:
@@ -45,12 +93,14 @@ class ControlLoop:
         follower: FollowerArm,
         leader: LeaderArm,
         on_snapshot: Callable[[dict[str, Any]], None] | None = None,
+        store: JsonStore | None = None,
     ) -> None:
         self.config = config
         self.cameras = cameras
         self.follower = follower
         self.leader = leader
         self.on_snapshot = on_snapshot
+        self.store = store
 
         self.mode = "offline"
         self.hold_when_idle = config.control.hold_when_idle
@@ -66,37 +116,65 @@ class ControlLoop:
         self._slew_t0 = 0.0
         self._slew_duration = config.control.jog_duration_s
 
-        self.writer: SessionWriter | None = None
+        self.writer: DatasetRecorder | None = None
         self.record_kind: str | None = None
         self.episode_index = 0
         self.episode_t0 = 0.0
         self.episode_time_s = config.recording.default_episode_time_s
+        self.reset_time_s = config.recording.default_reset_time_s
+        self.num_episodes = config.recording.default_num_episodes
+        self._resetting = False
+        ui = store.ui() if store is not None else {}
+        self.auto_record = bool(ui.get("auto_record"))
+        self.selected_dataset_id: str | None = None
+        self.pending: str | None = None
+        self._cancel = threading.Event()
+        self._log_lock = threading.Lock()
+        self.rollout_extra: dict[str, str] = {}
         self.task_t0 = 0.0
         self.task_deadline: float | None = None
         self.loaded_policy: LoadedPolicy | None = None
         self.rollout_task = ""
+        self._policy_cache: dict[tuple[Any, ...], LoadedPolicy] = {}
+        self._policy_job: threading.Thread | None = None
+        self._policy_result: LoadedPolicy | None = None
+        self._policy_error: str | None = None
+        self._rollout_payload: dict[str, Any] | None = None
+        self.library = VideoLibrary(config.videos_root())
 
         self._commands: queue.Queue[Command] = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._record_interval = 1.0 / max(1, config.recording.fps)
         self._last_record_t = 0.0
+        self._last_bus_use = 0.0
+        self._pending_release: str | None = None
+        self._pending_release_reply: queue.Queue[dict[str, Any]] | None = None
+        self._estop = threading.Event()
+        self._ui_log_handler: logging.Handler | None = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        if self._ui_log_handler is None:
+            handler = _UiLogHandler(self)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            logging.getLogger().addHandler(handler)
+            logging.getLogger().setLevel(logging.INFO)
+            self._ui_log_handler = handler
         self._thread = threading.Thread(target=self._run, name="control-loop", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=10.0)
             self._thread = None
         self._close_writer()
+        if self.follower.connected:
+            self.follower.disconnect()
         self.leader.disconnect()
-        self.follower.disconnect()
 
     def submit(self, kind: str, payload: dict[str, Any] | None = None, timeout: float = 8.0) -> dict[str, Any]:
         reply: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
@@ -106,18 +184,223 @@ class ControlLoop:
         except queue.Empty:
             return {"ok": False, "error": f"command '{kind}' timed out"}
 
-    def log(self, level: str, message: str) -> None:
+    def submit_nowait(self, kind: str, payload: dict[str, Any] | None = None) -> None:
+        self._commands.put(Command(kind=kind, payload=payload or {}, reply=None))
+
+    def request_estop(self) -> dict[str, Any]:
+        """Disable torque immediately; do not wait for the control-queue tick."""
+        self._cancel.set()
+        self._estop.set()
+        self._apply_estop()
+        return {"ok": True}
+
+    def request_stop(self) -> dict[str, Any]:
+        """Abort a pending start immediately; queue a real stop if a task is running."""
+        self._cancel.set()
+        pending = self.pending
+        self.pending = None
+        self.log("info", "stop requested")
+        try:
+            self._commands.put_nowait(Command(kind="task_stop", payload={}))
+        except Exception:
+            pass
+        if self.on_snapshot is not None:
+            self.on_snapshot(self.snapshot())
+        return {"ok": True, "pending": pending, "mode": self.mode}
+
+    def _aborted(self, cmd: Command, label: str) -> bool:
+        if not self._cancel.is_set():
+            return False
+        self.pending = None
+        self.log("info", f"{label} cancelled")
+        self._reply(cmd, ok=True, cancelled=True)
+        return True
+
+    def _apply_estop(self) -> None:
+        first = self.mode != "estop"
+        self.mode = "estop"
+        self.hold_when_idle = False
+        self._slew_goal = None
+        self._pending_release = None
+        try:
+            self._close_writer()
+        except Exception as exc:  # noqa: BLE001
+            self.log("error", f"E-STOP session: {exc}")
+        try:
+            if self.follower.connected:
+                self.follower.disable_torque()
+                self._release_follower("estop")
+        except Exception as exc:  # noqa: BLE001
+            self.log("error", f"E-STOP bus: {exc}")
+            try:
+                self.follower.disable_torque()
+            except Exception:
+                pass
+        if first:
+            self.log("error", "E-STOP — torque disabled, serial released")
+
+    def display_mode(self) -> str:
+        if self._estop.is_set() or self.mode == "estop":
+            return "estop"
+        if self.pending:
+            return "loading"
+        if self.mode == "idle" and self.follower.connected:
+            return "hold" if self.hold_when_idle else "idle"
+        if self.mode == "jogging":
+            return "jog"
+        return self.mode
+
+    def bus_owner(self) -> str:
+        if self._estop.is_set() or self.mode == "estop":
+            return "estop"
+        if not self.follower.connected:
+            return "free"
+        return {
+            "teleop": "teleop",
+            "record": "record",
+            "rollout": "rollout",
+            "jogging": "jog",
+            "idle": "hold" if self.hold_when_idle else "monitor",
+            "offline": "free",
+        }.get(self.mode, self.mode)
+
+    def log(self, level: str, message: str, *, echo: bool = True) -> None:
         entry = {"level": level, "message": message, "t": time.strftime("%H:%M:%S")}
-        self.logs.append(entry)
-        self.logs = self.logs[-80:]
-        logger.log(logging.ERROR if level == "error" else logging.INFO, message)
+        with self._log_lock:
+            self.logs.append(entry)
+            self.logs = self.logs[-400:]
+            writer = self.writer
+        if writer is not None and not getattr(writer, "closed", False):
+            try:
+                log_path = Path(writer.root) / "run.log"
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"{entry['t']} {level} {message}\n")
+            except OSError:
+                pass
+        if echo:
+            logger.log(logging.ERROR if level == "error" else logging.INFO, message)
+        if self.pending and self.on_snapshot is not None:
+            self.on_snapshot(self.snapshot())
+
+    def _remember_port(self, role: str, port: str) -> None:
+        if self.store is None or not port:
+            return
+        ui = self.store.ui()
+        hardware = dict(ui.get("hardware") or {})
+        hardware[f"{role}_port"] = str(port)
+        ui["hardware"] = hardware
+        try:
+            self.store.save_ui(ui)
+        except OSError:
+            pass
+
+    @contextlib.contextmanager
+    def _capture_task_output(self):
+        stdout = _StdioToLog(self, sys.stdout)
+        stderr = _StdioToLog(self, sys.stderr)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            yield
+
+    def _policy_key(self, path: str, device: str, extra: dict[str, str]) -> tuple[Any, ...]:
+        return (path, device, tuple(sorted(extra.items())))
+
+    def _get_or_load_policy(self, path: str, device: str, task: str, extra: dict[str, str]) -> LoadedPolicy:
+        key = self._policy_key(path, device, extra)
+        cached = self._policy_cache.get(key)
+        if cached is not None:
+            cached.task = task or cached.task
+            return cached
+        loaded = load_policy(
+            path,
+            device=device,
+            task=task,
+            robot_type=self.config.robot.type,
+            rename_map=self.config.rollout.rename_map,
+            extra=extra,
+        )
+        self._policy_cache[key] = loaded
+        return loaded
+
+    def _policy_worker(self, path: str, device: str, task: str, extra: dict[str, str]) -> None:
+        try:
+            with self._capture_task_output():
+                loaded = self._get_or_load_policy(path, device, task, extra)
+            self._policy_result = loaded
+            self._policy_error = None
+        except Exception as exc:  # noqa: BLE001
+            self._policy_result = None
+            self._policy_error = str(exc)
+            self.log("error", f"policy load failed: {exc}")
+
+    def _begin_rollout(self, loaded: LoadedPolicy, payload: dict[str, Any], path: str) -> None:
+        loaded.reset()
+        loaded.task = str(payload.get("task") or loaded.task)
+        self.loaded_policy = loaded
+        self.rollout_task = loaded.task
+        duration = float(payload.get("duration_s") or self.config.rollout.default_duration_s)
+        self.task_t0 = time.perf_counter()
+        self.task_deadline = None if duration <= 0 else self.task_t0 + duration
+        if payload.get("auto_record") is not None:
+            self.auto_record = bool(payload.get("auto_record"))
+        want_record = bool(payload.get("record")) if payload.get("record") is not None else self.auto_record
+        if want_record:
+            self._close_writer()
+            rec_payload = dict(payload)
+            rec_payload.setdefault("task", self.rollout_task)
+            rec_payload.setdefault("name", Path(path).name or "rollout")
+            self.writer = self._open_recorder("rollout", rec_payload)
+            self.record_kind = "rollout"
+            self.episode_t0 = self.task_t0
+        self.pending = None
+        self.mode = "rollout"
+        self._touch_bus()
+        self.log("info", f"rollout started ({loaded.policy.__class__.__name__})")
+
+    def _complete_rollout_load(self) -> None:
+        if self._rollout_payload is None:
+            return
+        if self._policy_job is not None and self._policy_job.is_alive():
+            return
+        payload = self._rollout_payload
+        self._rollout_payload = None
+        self._policy_job = None
+        if self._cancel.is_set():
+            self.pending = None
+            self.log("info", "rollout cancelled")
+            return
+        if self._policy_error:
+            self.pending = None
+            self.last_error = self._policy_error
+            return
+        if self._policy_result is None:
+            self.pending = None
+            return
+        path = str(payload.get("policy_path") or "")
+        self._begin_rollout(self._policy_result, payload, path)
+
+    def note_pending(self, kind: str, message: str) -> None:
+        """Log and mark a task requested before the control thread picks it up."""
+        self._cancel.clear()
+        self.pending = kind
+        self.log("info", message)
+        if self.on_snapshot is not None:
+            self.on_snapshot(self.snapshot())
+
+    def clear_pending(self) -> None:
+        self.pending = None
+        if self.on_snapshot is not None:
+            self.on_snapshot(self.snapshot())
 
     def snapshot(self) -> dict[str, Any]:
         elapsed = time.perf_counter() - self.task_t0 if self.task_t0 else 0.0
         rec_elapsed = time.perf_counter() - self.episode_t0 if self.episode_t0 else 0.0
+        owner = self.bus_owner()
+        shown = self.display_mode()
         return {
             "ts": time.time(),
             "mode": self.mode,
+            "display_mode": shown,
+            "owner": owner,
             "fps": round(self.loop_fps, 1),
             "robot": self.follower.snapshot(),
             "leader": self.leader.snapshot(),
@@ -127,18 +410,25 @@ class ControlLoop:
             "action": self.action,
             "hold": self.hold_when_idle,
             "task": {
-                "kind": self.mode,
+                "kind": shown,
                 "elapsed_s": round(elapsed, 2),
                 "episode_index": self.episode_index,
                 "episode_elapsed_s": round(rec_elapsed, 2) if self.writer else None,
                 "episode_time_s": self.episode_time_s if self.writer else None,
+                "reset_time_s": self.reset_time_s if self.writer and self.mode == "record" else None,
+                "resetting": bool(getattr(self, "_resetting", False)),
                 "recording": self.writer is not None,
+                "auto_record": self.auto_record,
+                "pending": self.pending,
                 "session_id": None if self.writer is None else self.writer.session_id,
+                "dataset_id": self.selected_dataset_id,
+                "video_id": None if self.writer is None else self.writer.session_id,
+                "num_episodes": self.num_episodes if self.writer else None,
                 "policy_path": None if self.loaded_policy is None else self.loaded_policy.path,
                 "task": self.rollout_task,
                 "message": self.last_error,
             },
-            "logs": self.logs[-12:],
+            "logs": self.logs[-200:],
         }
 
     def _reply(self, cmd: Command, **kwargs: Any) -> None:
@@ -149,10 +439,74 @@ class ControlLoop:
         if self.writer is None:
             return None
         path = self.writer.close()
-        self.log("info", f"session saved: {path}")
+        self.log("info", f"dataset saved: {path}")
         self.writer = None
         self.record_kind = None
         return path
+
+    def _open_recorder(self, kind: str, payload: dict[str, Any] | None = None) -> DatasetRecorder:
+        p = payload or {}
+        fps = int(p.get("fps") or self.config.recording.fps)
+        self._record_interval = 1.0 / max(1, fps)
+        video_format = str(p.get("format") or self.config.recording.video_format)
+        merge = bool(p["merge"] if p.get("merge") is not None else self.config.recording.merge)
+        dataset_id = str(p.get("video_id") or p.get("dataset_id") or self.selected_dataset_id or "").strip()
+        extra = {
+            "task": p.get("task") or "",
+            "repo_id": p.get("repo_id") or "",
+            "kind": kind,
+            "format": video_format,
+            "streaming_encoding": bool(
+                p["streaming_encoding"]
+                if p.get("streaming_encoding") is not None
+                else self.config.recording.streaming_encoding
+            ),
+            "encoder_threads": int(
+                p["encoder_threads"]
+                if p.get("encoder_threads") is not None
+                else self.config.recording.encoder_threads
+            ),
+            "video": bool(p["video"] if p.get("video") is not None else self.config.recording.video),
+        }
+        root: Path | None = None
+        if dataset_id:
+            try:
+                candidate = self.library._dataset_dir(dataset_id)
+            except ValueError:
+                candidate = None
+            if candidate is not None and (candidate / "meta.json").is_file():
+                root = candidate
+        if root is not None:
+            recorder = DatasetRecorder(
+                root,
+                fps=fps,
+                kind=kind,
+                extra_meta=extra,
+                resume=True,
+                video_format=video_format,
+                merge=merge,
+            )
+        else:
+            created = self.library.create(
+                str(p.get("name") or p.get("repo_id") or p.get("task") or kind),
+                fps=fps,
+                task=str(p.get("task") or ""),
+                repo_id=str(p.get("repo_id") or ""),
+                extra=extra,
+            )
+            recorder = DatasetRecorder(
+                Path(created["path"]),
+                fps=fps,
+                kind=kind,
+                extra_meta=extra,
+                resume=False,
+                video_format=video_format,
+                merge=merge,
+            )
+        self.selected_dataset_id = recorder.dataset_id
+        self.episode_index = recorder.episode_index
+        self._last_record_t = 0.0
+        return recorder
 
     def _maybe_record(self, kind: str) -> None:
         if self.writer is None:
@@ -161,10 +515,13 @@ class ControlLoop:
         if now - self._last_record_t < self._record_interval:
             return
         self._last_record_t = now
+        images = self.cameras.latest_main_bgr_map()
+        if not images:
+            images = self.cameras.latest_bgr_map()
         self.writer.add_frame(
             self.joints,
             self.action or self.latched,
-            self.cameras.latest_bgr_map(),
+            images,
             episode_index=self.episode_index,
             kind=kind,
         )
@@ -177,7 +534,10 @@ class ControlLoop:
         fps_t = time.perf_counter()
         while not self._stop.is_set():
             t0 = time.perf_counter()
+            if self._estop.is_set() and self.mode != "estop":
+                self._apply_estop()
             self._drain_commands()
+            self._complete_rollout_load()
             self._tick()
             fps_n += 1
             now = time.perf_counter()
@@ -188,21 +548,89 @@ class ControlLoop:
             if self.on_snapshot is not None:
                 self.on_snapshot(self.snapshot())
             _precise_sleep(max(0.0, period - (time.perf_counter() - t0)))
+        if self.follower.connected and self.mode != "estop":
+            self._park_relax_blocking()
+        self.leader.disconnect()
+        self.follower.disconnect()
+
+    def _touch_bus(self) -> None:
+        self._last_bus_use = time.perf_counter()
 
     def _connect_follower(self) -> None:
         try:
             self.follower.connect()
             pose = self.follower.get_pose()
             self.joints = dict(pose)
-            self.latched = dict(pose)
+            if not self.latched:
+                self.latched = dict(pose)
             self.mode = "idle"
             self.last_error = None
-            self.log("info", f"follower connected on {self.config.robot.port}")
+            self._touch_bus()
+            self.log("info", f"acquired follower serial {self.config.robot.port}")
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
             self.follower.error = str(exc)
             self.mode = "offline"
             self.log("error", f"follower connect failed: {exc}")
+
+    def _ensure_follower(self) -> None:
+        if not self.follower.connected:
+            self._connect_follower()
+        if not self.follower.connected:
+            raise RuntimeError(self.follower.error or "follower serial not available")
+        self._touch_bus()
+
+    def _release_follower(self, reason: str) -> None:
+        if not self.follower.connected:
+            return
+        self.follower.disconnect()
+        self.mode = "estop" if reason == "estop" or self._estop.is_set() else "offline"
+        self._pending_release = None
+        self.log("info", f"released follower serial ({reason})")
+        if self._pending_release_reply is not None:
+            self._pending_release_reply.put({"ok": True})
+            self._pending_release_reply = None
+
+    def _relax_pose(self) -> dict[str, float]:
+        if self.store is not None:
+            saved = self.store.presets("pose").get("relax")
+            if isinstance(saved, dict) and saved:
+                return {name: float(saved[name]) for name in JOINT_ORDER if name in saved}
+        return dict(RELAX_POSE)
+
+    def _begin_relax_then_release(self, reason: str) -> None:
+        if not self.follower.connected or self._pending_release:
+            return
+        try:
+            current = self.joints or self.follower.get_pose()
+        except Exception:
+            self._release_follower(reason)
+            return
+        target = merge_partial(current, self._relax_pose())
+        self._slew_start = dict(current)
+        self._slew_goal = target
+        self._slew_t0 = time.perf_counter()
+        self._slew_duration = max(self.config.control.jog_duration_s, 2.0)
+        self._pending_release = reason
+        self.mode = "jogging"
+        self.log("info", f"relax pose before release ({reason})")
+
+    def _park_relax_blocking(self) -> None:
+        try:
+            current = self.joints or self.follower.get_pose()
+            goal = merge_partial(current, self._relax_pose())
+            duration = max(self.config.control.jog_duration_s, 2.0)
+            t0 = time.perf_counter()
+            while True:
+                alpha = (time.perf_counter() - t0) / max(duration, 1e-3)
+                pose = lerp_pose(current, goal, alpha)
+                self.follower.send_pose(pose)
+                if alpha >= 1.0:
+                    break
+                _precise_sleep(1.0 / 30.0)
+            self.log("info", "parked at relax")
+        except Exception as exc:  # noqa: BLE001
+            self.log("error", f"relax park failed: {exc}")
 
     def _drain_commands(self) -> None:
         while True:
@@ -211,6 +639,9 @@ class ControlLoop:
             except queue.Empty:
                 return
             try:
+                if self._estop.is_set() and cmd.kind not in {"resume", "estop", "task_stop"}:
+                    self._reply(cmd, ok=False, error="estop")
+                    continue
                 self._handle(cmd)
             except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
@@ -221,16 +652,36 @@ class ControlLoop:
         kind = cmd.kind
         p = cmd.payload
         if kind == "connect_robot":
+            if p.get("port"):
+                self.follower.config.port = str(p["port"])
+            if p.get("id"):
+                self.follower.config.id = str(p["id"])
+            if self.follower.connected:
+                self.follower.disconnect()
             self._connect_follower()
+            if self.follower.connected:
+                self._remember_port("arm", self.follower.config.port)
             self._reply(cmd, ok=self.follower.connected, error=self.follower.error)
         elif kind == "disconnect_robot":
             self._close_writer()
-            self.mode = "offline"
-            self.follower.disconnect()
-            self._reply(cmd, ok=True)
+            if self.follower.connected:
+                self._pending_release_reply = cmd.reply
+                cmd.reply = None
+                self._begin_relax_then_release("disconnect")
+            else:
+                self.mode = "offline"
+                self._reply(cmd, ok=True)
         elif kind == "connect_leader":
+            if p.get("port"):
+                self.leader.config.port = str(p["port"])
+            if p.get("id"):
+                self.leader.config.id = str(p["id"])
+            if self.leader.connected:
+                self.leader.disconnect()
             self.leader.connect()
-            self.log("info", f"leader connected on {self.config.leader.port}")
+            if self.leader.connected:
+                self._remember_port("leader", self.leader.config.port)
+            self.log("info", f"leader connected on {self.leader.config.port}")
             self._reply(cmd, ok=True)
         elif kind == "disconnect_leader":
             if self.mode in {"teleop", "record"}:
@@ -238,153 +689,247 @@ class ControlLoop:
             self.leader.disconnect()
             self._reply(cmd, ok=True)
         elif kind == "jog":
-            if not self.follower.connected:
-                raise RuntimeError("follower not connected")
+            self._ensure_follower()
+            self._pending_release = None
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"cannot jog while {self.mode} is running")
             current = self.joints or self.follower.get_pose()
             target = merge_partial(current, p.get("joints") or {})
+            live = bool(p.get("live"))
+            duration = p.get("duration_s")
+            if live or (duration is not None and float(duration) <= 0):
+                self._slew_goal = None
+                self.latched = dict(target)
+                self.action = dict(target)
+                self.mode = "idle"
+                self.follower.send_pose(target)
+                self._touch_bus()
+                self._reply(cmd, ok=True, target=target, live=True)
+                return
             self._slew_start = dict(current)
             self._slew_goal = target
             self._slew_t0 = time.perf_counter()
-            self._slew_duration = float(p.get("duration_s") or self.config.control.jog_duration_s)
+            self._slew_duration = float(duration if duration is not None else self.config.control.jog_duration_s)
             self.mode = "jogging"
+            self._touch_bus()
             self.log("info", f"jog {list((p.get('joints') or {}).keys())} in {self._slew_duration:.1f}s")
             self._reply(cmd, ok=True, target=target)
         elif kind == "preset":
-            name = str(p.get("name", "home"))
-            if name not in PRESETS:
-                raise ValueError(f"unknown preset '{name}'")
-            cmd.payload = {"joints": dict(PRESETS[name]), "duration_s": p.get("duration_s")}
+            name = str(p.get("name") or "relax")
+            pose: dict[str, float] | None = None
+            if self.store is not None:
+                saved = self.store.presets("pose").get(name)
+                if isinstance(saved, dict):
+                    pose = {k: float(v) for k, v in saved.items()}
+            if pose is None:
+                raise ValueError(f"unknown pose preset '{name}'")
+            cmd.payload = {"joints": pose, "duration_s": p.get("duration_s")}
             cmd.kind = "jog"
             self._handle(cmd)
+        elif kind == "read_pose":
+            self._ensure_follower()
+            pose = self.follower.get_pose()
+            self.joints = dict(pose)
+            self._touch_bus()
+            self._reply(cmd, ok=True, joints=pose)
+        elif kind == "read_leader":
+            if not self.leader.connected:
+                self.leader.connect()
+            pose = self.leader.get_action_pose()
+            self._reply(cmd, ok=True, joints=pose)
         elif kind == "hold":
             self.hold_when_idle = bool(p.get("enabled", True))
             self._reply(cmd, ok=True, hold=self.hold_when_idle)
         elif kind == "estop":
-            self._close_writer()
-            self.mode = "estop"
-            self.hold_when_idle = False
-            self._slew_goal = None
-            if self.follower.connected:
-                self.follower.disable_torque()
-            self.log("error", "E-STOP — torque disabled")
+            self.request_estop()
             self._reply(cmd, ok=True)
-        elif kind == "resume":
-            if not self.follower.connected:
-                self._connect_follower()
+        elif kind == "task_stop":
+            self._cancel.clear()
+            stopped = self.mode
+            if stopped == "teleop":
+                path = None
+                if self.record_kind == "teleop":
+                    path = self._close_writer()
+                self.mode = "idle"
+                if self.joints:
+                    self.latched = dict(self.joints)
+                self._touch_bus()
+                self.log("info", "teleop stopped")
+                self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
+            elif stopped == "record":
+                path = self._close_writer()
+                self.mode = "idle" if self.follower.connected else "offline"
+                self._touch_bus()
+                self.log("info", "record stopped")
+                self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
+            elif stopped == "rollout":
+                path = self._close_writer()
+                self.loaded_policy = None
+                self.mode = "idle" if self.follower.connected else "offline"
+                if self.joints:
+                    self.latched = dict(self.joints)
+                self._touch_bus()
+                self.log("info", "rollout stopped")
+                self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
+            elif stopped == "jogging":
+                self._slew_goal = None
+                if self.joints:
+                    self.latched = dict(self.joints)
+                self.mode = "idle"
+                self._touch_bus()
+                self._reply(cmd, ok=True, stopped=stopped)
             else:
-                self.follower.enable_torque()
-                pose = self.follower.get_pose()
-                self.joints = dict(pose)
-                self.latched = dict(pose)
+                path = self._close_writer()
+                self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
+        elif kind == "resume":
+            self._estop.clear()
+            self._ensure_follower()
+            self.follower.enable_torque()
+            pose = self.follower.get_pose()
+            self.joints = dict(pose)
+            self.latched = dict(pose)
             self.hold_when_idle = self.config.control.hold_when_idle
-            self.mode = "idle" if self.follower.connected else "offline"
+            self.mode = "idle"
             self.log("info", "torque re-enabled, idle")
             self._reply(cmd, ok=True)
         elif kind == "teleop_start":
-            if not self.follower.connected:
-                raise RuntimeError("follower not connected")
+            if self.mode in {"teleop", "record", "rollout"}:
+                raise RuntimeError(f"stop {self.mode} before starting teleop")
+            if self._aborted(cmd, "teleop"):
+                return
+            self._ensure_follower()
+            if self._aborted(cmd, "teleop"):
+                return
             if not self.leader.connected:
                 self.leader.connect()
+            if p.get("auto_record") is not None:
+                self.auto_record = bool(p.get("auto_record"))
             self.mode = "teleop"
             self.task_t0 = time.perf_counter()
+            self._touch_bus()
+            if self.auto_record and self.writer is None:
+                self.writer = self._open_recorder("teleop", p)
+                self.record_kind = "teleop"
+                self.episode_t0 = self.task_t0
             self.log("info", "teleop started")
-            self._reply(cmd, ok=True)
+            self._reply(cmd, ok=True, session_id=None if self.writer is None else self.writer.session_id)
         elif kind == "teleop_stop":
             if self.mode == "teleop":
                 self.mode = "idle"
                 if self.joints:
                     self.latched = dict(self.joints)
+                if self.record_kind == "teleop":
+                    self._close_writer()
+                self._touch_bus()
             self._reply(cmd, ok=True)
         elif kind == "record_start":
-            if not self.follower.connected:
-                raise RuntimeError("follower not connected")
+            if self.mode in {"teleop", "record", "rollout"}:
+                raise RuntimeError(f"stop {self.mode} before starting record")
+            if self._aborted(cmd, "record"):
+                return
+            self._ensure_follower()
+            if self._aborted(cmd, "record"):
+                return
             if not self.leader.connected:
                 self.leader.connect()
             self._close_writer()
-            self.episode_index = 0
             self.episode_time_s = float(p.get("episode_time_s") or self.config.recording.default_episode_time_s)
-            self.writer = SessionWriter(
-                self.config.recording.root,
-                kind="record",
-                fps=int(p.get("fps") or self.config.recording.fps),
-                extra_meta={
-                    "task": p.get("task") or "",
-                    "repo_id": p.get("repo_id") or "",
-                },
+            self.reset_time_s = float(
+                p["reset_time_s"] if p.get("reset_time_s") is not None else self.config.recording.default_reset_time_s
             )
+            self.num_episodes = int(p.get("num_episodes") or self.config.recording.default_num_episodes)
+            self._resetting = False
+            self.writer = self._open_recorder("record", p)
             self.record_kind = "record"
             self.mode = "record"
             self.task_t0 = time.perf_counter()
             self.episode_t0 = self.task_t0
-            self._last_record_t = 0.0
-            self.log("info", f"recording {self.writer.session_id}")
-            self._reply(cmd, ok=True, session_id=self.writer.session_id)
+            self._touch_bus()
+            self.log("info", f"recording {self.writer.session_id} ep {self.episode_index}")
+            self._reply(cmd, ok=True, session_id=self.writer.session_id, dataset_id=self.selected_dataset_id)
         elif kind == "record_stop":
             path = self._close_writer()
             self.mode = "idle" if self.follower.connected else "offline"
+            self._touch_bus()
             self._reply(cmd, ok=True, path=None if path is None else str(path))
         elif kind == "record_next":
             if self.writer is None:
                 raise RuntimeError("not recording")
+            self._resetting = False
             self.episode_index += 1
             self.episode_t0 = time.perf_counter()
             self.log("info", f"episode {self.episode_index}")
             self._reply(cmd, ok=True, episode_index=self.episode_index)
         elif kind == "rollout_start":
-            if not self.follower.connected:
-                raise RuntimeError("follower not connected")
+            if self.mode in {"teleop", "record", "rollout"}:
+                raise RuntimeError(f"stop {self.mode} before starting rollout")
+            if self._aborted(cmd, "rollout"):
+                return
+            if self._policy_job is not None and self._policy_job.is_alive():
+                raise RuntimeError("policy is already loading")
+            self._ensure_follower()
+            if self._aborted(cmd, "rollout"):
+                return
             path = str(p.get("policy_path") or "")
             if not path:
                 raise ValueError("policy_path is required")
-            self.log("info", f"loading policy {path}")
-            self.loaded_policy = load_policy(
-                path,
-                device=str(p.get("device") or self.config.rollout.device),
-                task=str(p.get("task") or ""),
-                robot_type=self.config.robot.type,
-                rename_map=self.config.rollout.rename_map,
+            extra = p.get("extra") or {}
+            self.rollout_extra = {str(k): str(v) for k, v in extra.items() if str(k).strip()}
+            device = str(p.get("device") or self.config.rollout.device)
+            task = str(p.get("task") or "")
+            cached = self._policy_cache.get(self._policy_key(path, device, self.rollout_extra))
+            if cached is not None:
+                self.log("info", f"using cached policy {path}")
+                self._begin_rollout(cached, p, path)
+                self._reply(cmd, ok=True, session_id=None if self.writer is None else self.writer.session_id)
+                return
+            self.log("info", f"loading policy {path} (background, local cache first)")
+            self._policy_error = None
+            self._policy_result = None
+            self._rollout_payload = dict(p)
+            self._policy_job = threading.Thread(
+                target=self._policy_worker,
+                args=(path, device, task, self.rollout_extra),
+                daemon=True,
+                name="policy-load",
             )
-            self.loaded_policy.reset()
-            self.rollout_task = self.loaded_policy.task
-            duration = float(p.get("duration_s") or self.config.rollout.default_duration_s)
-            self.task_t0 = time.perf_counter()
-            self.task_deadline = None if duration <= 0 else self.task_t0 + duration
-            if p.get("record"):
-                self._close_writer()
-                self.episode_index = 0
-                self.writer = SessionWriter(
-                    self.config.recording.root,
-                    kind="rollout",
-                    fps=int(p.get("fps") or self.config.recording.fps),
-                    extra_meta={
-                        "task": self.rollout_task,
-                        "policy_path": path,
-                        "device": self.loaded_policy.device,
-                    },
-                )
-                self.record_kind = "rollout"
-                self.episode_t0 = self.task_t0
-                self._last_record_t = 0.0
-            self.mode = "rollout"
-            self.log("info", f"rollout started ({self.loaded_policy.policy.__class__.__name__})")
-            self._reply(
-                cmd,
-                ok=True,
-                session_id=None if self.writer is None else self.writer.session_id,
-            )
+            self._policy_job.start()
+            self._reply(cmd, ok=True, accepted=True)
         elif kind == "rollout_stop":
             path = self._close_writer()
             self.loaded_policy = None
             self.mode = "idle" if self.follower.connected else "offline"
             if self.joints:
                 self.latched = dict(self.joints)
+            self._touch_bus()
             self._reply(cmd, ok=True, path=None if path is None else str(path))
+        elif kind == "capture_start":
+            if self._aborted(cmd, "capture"):
+                return
+            if self.writer is not None:
+                self._reply(cmd, ok=True, session_id=self.writer.session_id, already=True)
+                return
+            self.writer = self._open_recorder(str(p.get("kind") or self.mode or "capture"), p)
+            self.record_kind = self.writer.kind
+            self.episode_t0 = time.perf_counter()
+            self.log("info", f"capture {self.writer.session_id}")
+            self._reply(cmd, ok=True, session_id=self.writer.session_id, dataset_id=self.selected_dataset_id)
+        elif kind == "capture_stop":
+            if self.mode == "record":
+                raise RuntimeError("stop the record task to finish the dataset")
+            path = self._close_writer()
+            self._reply(cmd, ok=True, path=None if path is None else str(path))
+        elif kind == "auto_record":
+            self.auto_record = bool(p.get("enabled", True))
+            self._reply(cmd, ok=True, auto_record=self.auto_record)
         else:
             raise ValueError(f"unknown command '{kind}'")
 
     def _tick(self) -> None:
+        if self._estop.is_set():
+            if self.mode != "estop":
+                self._apply_estop()
+            return
         if not self.follower.connected:
             if self.mode not in {"offline", "estop"}:
                 self.mode = "offline"
@@ -405,9 +950,11 @@ class ControlLoop:
                 self._tick_record()
             elif self.mode == "rollout":
                 self._tick_rollout()
-            elif self.mode == "idle" and self.hold_when_idle and self.latched:
-                self.follower.send_pose(self.latched)
-                self.action = dict(self.latched)
+            elif self.mode == "idle":
+                if self.hold_when_idle and self.latched:
+                    self.follower.send_pose(self.latched)
+                    self.action = dict(self.latched)
+                self._maybe_record(self.record_kind or "capture")
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
             self.log("error", f"{self.mode} tick failed: {exc}")
@@ -425,21 +972,47 @@ class ControlLoop:
         if alpha >= 1.0:
             self.latched = dict(self._slew_goal)
             self._slew_goal = None
-            self.mode = "idle"
+            if self._pending_release:
+                reason = self._pending_release
+                self._release_follower(reason)
+            else:
+                self.mode = "idle"
+                self._touch_bus()
 
     def _tick_teleop(self) -> None:
         pose = self.leader.get_action_pose()
         self.follower.send_pose(pose)
         self.action = dict(pose)
         self.latched = dict(pose)
+        if self.mode == "teleop":
+            self._maybe_record(self.record_kind or "teleop")
 
     def _tick_record(self) -> None:
         self._tick_teleop()
+        now = time.perf_counter()
+        if getattr(self, "_resetting", False):
+            if now - self.episode_t0 >= getattr(self, "reset_time_s", 0.0):
+                self._resetting = False
+                self.episode_index += 1
+                self.episode_t0 = now
+                self.log("info", f"episode {self.episode_index}")
+            return
         self._maybe_record("record")
-        if time.perf_counter() - self.episode_t0 >= self.episode_time_s:
-            self.episode_index += 1
-            self.episode_t0 = time.perf_counter()
-            self.log("info", f"auto-advance episode {self.episode_index}")
+        if now - self.episode_t0 >= self.episode_time_s:
+            finished = self.episode_index + 1
+            if finished >= self.num_episodes:
+                self.log("info", f"reached {self.num_episodes} episodes")
+                self._close_writer()
+                self.mode = "idle"
+                self._touch_bus()
+            elif getattr(self, "reset_time_s", 0.0) > 0:
+                self._resetting = True
+                self.episode_t0 = now
+                self.log("info", "reset")
+            else:
+                self.episode_index += 1
+                self.episode_t0 = now
+                self.log("info", f"episode {self.episode_index}")
 
     def _tick_rollout(self) -> None:
         if self.loaded_policy is None:
@@ -454,6 +1027,8 @@ class ControlLoop:
             return
         images = self.cameras.latest_rgb_map()
         pose = predict_pose(self.loaded_policy, self.joints, images)
+        if self._estop.is_set():
+            return
         self.follower.send_pose(pose)
         self.action = dict(pose)
         self.latched = dict(pose)

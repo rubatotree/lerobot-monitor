@@ -5,7 +5,9 @@ from lerobot_monitor.config import MonitorConfig
 
 def test_default_config() -> None:
     cfg = MonitorConfig()
-    assert cfg.server.port == 8088
+    assert cfg.server.port == 8090
+    assert cfg.server.base_path == "/lerobot"
+    assert cfg.robot.auto_connect is False
     assert cfg.robot.type == "so101_follower"
 
 

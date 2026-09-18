@@ -36,11 +36,19 @@ def main() -> None:
     host = args.host or config.server.host
     port = args.port or config.server.port
 
+    prefix = (config.server.base_path or "").rstrip("/") or "/lerobot"
     print(f"[lerobot-monitor] config: {config_path if config_path.is_file() else '(defaults)'}")
-    print(f"[lerobot-monitor] http://{host}:{port}")
-    print(f"[lerobot-monitor] LAN:    http://{_local_ip()}:{port}")
+    print(f"[lerobot-monitor] http://127.0.0.1:{port}{prefix}/")
+    print(f"[lerobot-monitor] LAN:    http://{_local_ip()}:{port}{prefix}/")
 
     from .app import create_app
+    from .runtime import format_runtime, probe_runtime
+
+    runtime = probe_runtime()
+    print(f"[lerobot-monitor] python: {runtime['python']}")
+    print(f"[lerobot-monitor] env:    {format_runtime(runtime)}")
+    if not runtime.get("cuda"):
+        print("[lerobot-monitor] WARNING: CUDA torch is not available; rollout with device=cuda will fail.")
 
     uvicorn.run(create_app(config), host=host, port=port, log_level="info")
 

@@ -25,8 +25,9 @@ JOINT_LIMITS: dict[str, tuple[float, float]] = {
     "gripper": (0.0, 100.0),
 }
 
-# Folded rest pose used by LeRobot SO-101 reset (avoids a fully extended arm).
-HOME_POSE: dict[str, float] = {
+# Folded rest pose (former "home"). Used as the default relax preset so the
+# arm can be parked before torque is dropped.
+RELAX_POSE: dict[str, float] = {
     "shoulder_pan": -4.0,
     "shoulder_lift": -103.0,
     "elbow_flex": 97.0,
@@ -37,8 +38,9 @@ HOME_POSE: dict[str, float] = {
 
 ZERO_POSE: dict[str, float] = {name: 0.0 for name in JOINT_ORDER}
 
+HOME_POSE = RELAX_POSE
 PRESETS: dict[str, dict[str, float]] = {
-    "home": dict(HOME_POSE),
+    "relax": dict(RELAX_POSE),
     "zero": dict(ZERO_POSE),
 }
 

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
-from lerobot_monitor.session import SessionWriter, list_sessions
+from lerobot_monitor.session import SessionWriter, list_sessions, video_copies
 from lerobot_monitor.types import JOINT_ORDER
 
 
@@ -17,8 +17,16 @@ def test_session_writes_csv_and_video(tmp_path: Path) -> None:
     assert (out / "joints.csv").is_file()
     assert (out / "meta.json").is_file()
     assert (out / "videos" / "front.mp4").is_file()
+    assert (out / "videos" / "merged.mp4").is_file()
     rows = (out / "joints.csv").read_text(encoding="utf-8").strip().splitlines()
     assert len(rows) == 3  # header + 2 frames
     sessions = list_sessions(tmp_path)
     assert sessions[0]["kind"] == "rollout"
-    assert sessions[0]["frames"] == 2
+    assert sessions[0]["frames"] >= 2
+
+
+def test_video_copies_pads_to_wall_clock() -> None:
+    assert video_copies(0.0, 15, 0) == 1
+    assert video_copies(1.0 / 15.0, 15, 1) == 1
+    assert video_copies(0.4, 15, 1) >= 5
+    assert video_copies(20.0, 15, 0) == 75

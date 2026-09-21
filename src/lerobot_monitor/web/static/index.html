@@ -4,6 +4,7 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>LeRobot Monitor</title>
+  <link rel="icon" href="data:,"/>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
@@ -112,6 +113,24 @@
             <h3 id="lib-models-title">Models</h3>
             <button type="button" id="btn-md-refresh" class="ghost">Rescan</button>
           </div>
+          <div id="md-drop" class="model-drop" tabindex="0" role="region" aria-label="Add model from Hugging Face or a dropped model card">
+            <p class="model-drop-hint">
+              Search the Hub, drop a model card (.json / .txt), or paste a local model folder path.
+              <button type="button" id="btn-md-file" class="ghost">Choose file</button>
+            </p>
+            <input id="md-file-input" type="file" accept=".json,.txt" hidden/>
+            <div class="model-search">
+              <input id="md-search" type="search" placeholder="Search Hugging Face models" aria-label="Search Hugging Face models"/>
+              <button type="button" id="btn-md-search" class="ghost">Search</button>
+            </div>
+            <p id="md-hub-status" class="library-status" role="status" aria-live="polite"></p>
+            <ol id="md-hub-list" class="lib-list model-hub-list" aria-busy="false"></ol>
+            <div class="model-add">
+              <input id="md-remote" type="text" placeholder="org/name, huggingface.co URL, or local path" aria-label="Model remote address"/>
+              <input id="md-name" type="text" placeholder="display name (optional)" aria-label="Model display name"/>
+              <button type="button" id="btn-md-add">Add model</button>
+            </div>
+          </div>
           <p id="md-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="md-list" class="lib-list" aria-busy="false"></ol>
         </section>
@@ -153,7 +172,7 @@
       <div id="replay" class="hidden">
         <header class="replay-bar">
           <div class="replay-info">
-            <span class="replay-tag">REPLAY</span>
+            <span id="replay-badge" class="replay-tag">REPLAY</span>
             <span id="snapshot-badge" class="replay-tag snapshot hidden">SNAPSHOT</span>
             <span id="replay-title">—</span>
             <span id="replay-status" class="replay-status" role="status" aria-live="polite"></span>
@@ -428,13 +447,14 @@
               <button type="button" id="btn-dbg-del" class="ghost">Delete</button>
             </span>
           </div>
-          <p class="kv-lbl">Camera map</p>
+          <p class="kv-lbl">Camera inputs</p>
           <div id="dbg-cam-map" class="kv-table"></div>
           <p id="dbg-source" class="bus-hint">source: open an episode or snapshot</p>
           <div class="row-actions">
             <button type="button" id="btn-dbg-run">Run inference</button>
             <button type="button" id="btn-dbg-send" class="ghost" disabled>Send first step</button>
           </div>
+          <div id="dbg-eval" class="debug-eval hidden" aria-live="polite"></div>
           <p id="dbg-status" class="hw-status" role="status" aria-live="polite">idle</p>
           <div id="dbg-snap-editor" class="snap-editor hidden"></div>
         </div>

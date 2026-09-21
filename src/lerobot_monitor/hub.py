@@ -10,8 +10,9 @@ from pathlib import Path
 from .cameras import CameraHub
 from .config import MonitorConfig
 from .leader import LeaderArm
-from .library import VideoLibrary, list_hf_datasets, list_local_models
+from .library import VideoLibrary, list_hf_datasets
 from .loop import ControlLoop
+from .model_hub import ModelRegistry
 from .robot import FollowerArm
 from .runtime import format_runtime, probe_runtime
 from .session import list_sessions
@@ -28,6 +29,10 @@ class RuntimeHub:
         self.videos = VideoLibrary(config.videos_root())
         self.datasets = self.videos
         self.snapshots = SnapshotLibrary(config.snapshots_root())
+        self.model_registry = ModelRegistry(
+            self.store,
+            [Path(p) for p in config.library.models_roots],
+        )
         self.follower = FollowerArm(config.robot)
         self.leader = LeaderArm(config.leader)
         self._snapshot: dict[str, Any] = {}
@@ -143,5 +148,4 @@ class RuntimeHub:
         raise FileNotFoundError(repo_id)
 
     def models(self) -> list[dict[str, Any]]:
-        roots = [Path(p) for p in self.config.library.models_roots]
-        return list_local_models(roots)
+        return self.model_registry.list()

@@ -95,6 +95,8 @@ class RolloutConfig(BaseModel):
     device: str = "cuda"
     default_duration_s: float = 60.0
     default_fps: int = 15
+    prediction_interval_s: float = 0.5
+    prediction_chunk_size: int = 16
     rename_map: dict[str, str] = Field(default_factory=dict)
 
 

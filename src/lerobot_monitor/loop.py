@@ -167,6 +167,14 @@ class ControlLoop:
         self.effective_policy_fps = min(self.policy_fps, float(config.control.fps))
         self._policy_interval = 1.0 / max(1.0, self.effective_policy_fps)
         self._next_policy_t = 0.0
+        # Latest rollout action-chunk preview for the charts (telemetry only).
+        self._rollout_prediction: dict[str, Any] | None = None
+        self._prediction_sequence = 0
+        self._next_prediction_t = 0.0
+        prediction_interval = float(getattr(config.rollout, "prediction_interval_s", 0.5))
+        # A non-positive interval disables the preview inference entirely.
+        self._prediction_interval = max(0.1, prediction_interval) if prediction_interval > 0 else 0.0
+        self._prediction_warned = False
         self._policy_cache: dict[tuple[Any, ...], LoadedPolicy] = {}
         self._debug_lease_token: str | None = None
         self._policy_generation = 0
@@ -338,6 +346,7 @@ class ControlLoop:
         first = self.mode != "estop"
         self.mode = "estop"
         self._clear_debug_lease()
+        self._clear_rollout_prediction()
         self.hold_when_idle = False
         self._slew_goal = None
         self._pending_release = None
@@ -515,6 +524,8 @@ class ControlLoop:
         self.policy_fps, self.effective_policy_fps = self._policy_rates(payload)
         self._policy_interval = 1.0 / self.effective_policy_fps
         self._next_policy_t = self.task_t0
+        self._clear_rollout_prediction()
+        self._next_prediction_t = self.task_t0
         if payload.get("auto_record") is not None:
             self.auto_record = bool(payload.get("auto_record"))
         want_record = bool(payload.get("record")) if payload.get("record") is not None else self.auto_record
@@ -608,6 +619,8 @@ class ControlLoop:
             "joints": self.joints,
             "goal": self.latched,
             "action": self.action,
+            # Dashed overlay for the charts; only meaningful while a rollout runs.
+            "prediction": self._rollout_prediction if self.mode == "rollout" else None,
             "hold": self.hold_when_idle,
             "task": {
                 "kind": shown,
@@ -887,6 +900,7 @@ class ControlLoop:
 
     def _release_follower(self, reason: str) -> None:
         self._clear_debug_lease()
+        self._clear_rollout_prediction()
         if not self.follower.connected:
             return
         self.follower.disconnect()
@@ -1101,6 +1115,7 @@ class ControlLoop:
             elif stopped == "rollout":
                 path = self._close_writer()
                 self.loaded_policy = None
+                self._clear_rollout_prediction()
                 self.mode = "idle" if self.follower.connected else "offline"
                 if self.joints:
                     self.latched = dict(self.joints)
@@ -1281,6 +1296,7 @@ class ControlLoop:
             self._invalidate_policy_load()
             path = self._close_writer()
             self.loaded_policy = None
+            self._clear_rollout_prediction()
             self.mode = "idle" if self.follower.connected else "offline"
             if self.joints:
                 self.latched = dict(self.joints)
@@ -1415,6 +1431,7 @@ class ControlLoop:
 
     def _tick_rollout(self) -> None:
         if self._cancel.is_set() or self.loaded_policy is None:
+            self._clear_rollout_prediction()
             self.mode = "idle"
             return
         now = time.perf_counter()
@@ -1422,6 +1439,7 @@ class ControlLoop:
             self.log("info", "rollout duration reached")
             self._close_writer()
             self.loaded_policy = None
+            self._clear_rollout_prediction()
             self.mode = "idle"
             self.latched = dict(self.joints)
             return
@@ -1437,3 +1455,64 @@ class ControlLoop:
         self.action = dict(pose)
         self.latched = dict(pose)
         self._maybe_record("rollout")
+        if self._prediction_interval > 0 and now >= self._next_prediction_t:
+            self._capture_rollout_prediction(now, images)
+
+    def _clear_rollout_prediction(self) -> None:
+        self._rollout_prediction = None
+        self._prediction_warned = False
+
+    def _capture_rollout_prediction(self, now: float, images: Mapping[str, np.ndarray]) -> None:
+        """Store a chunk preview for the charts.
+
+        Rollout execution keeps using ``predict_pose``/``select_action``, so this
+        is a second, throttled inference purely for the dashed overlay. It never
+        resets the running policy and never falls back to sequential
+        ``select_action`` calls, so a failure or an unsupported policy only drops
+        the overlay instead of disturbing the actions being sent.
+        """
+        loaded = self.loaded_policy
+        if loaded is None:
+            self._next_prediction_t = time.perf_counter() + self._prediction_interval
+            return
+        started = time.perf_counter()
+        observed_t_s = now - self.task_t0
+        try:
+            with _POLICY_INFER_LOCK, self._capture_task_output():
+                chunk: ActionChunk = predict_action_chunk(
+                    loaded,
+                    self.joints,
+                    images,
+                    self.config.rollout.prediction_chunk_size,
+                    reset=False,
+                    allow_sequential=False,
+                )
+        except Exception as exc:  # noqa: BLE001 - a preview must never stop a rollout
+            if not self._prediction_warned:
+                self._prediction_warned = True
+                self.log("error", f"rollout chunk preview unavailable: {exc}")
+            self._rollout_prediction = None
+            self._next_prediction_t = time.perf_counter() + self._prediction_interval
+            return
+        finished = time.perf_counter()
+        # Schedule from completion so a slow preview cannot build an
+        # immediate backlog of extra inferences.
+        self._next_prediction_t = finished + self._prediction_interval
+        latency_ms = (finished - started) * 1000.0
+        step_s = 1.0 / max(1.0, float(self.policy_fps))
+        self._prediction_sequence += 1
+        self._prediction_warned = False
+        self._rollout_prediction = {
+            "id": self._prediction_sequence,
+            # The chunk only becomes actionable after inference completes.
+            "t_s": round(finished - self.task_t0, 3),
+            "observed_t_s": round(observed_t_s, 3),
+            "step_s": round(step_s, 6),
+            "strategy": chunk.strategy,
+            "degraded": chunk.degraded,
+            "latency_ms": round(latency_ms, 2),
+            "actions": [
+                {name: round(float(value), 6) for name, value in action.items()}
+                for action in chunk.actions
+            ],
+        }

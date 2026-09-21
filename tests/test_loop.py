@@ -11,6 +11,7 @@ import pytest
 from lerobot_monitor import loop as loop_module
 from lerobot_monitor.config import CamerasConfig, LibraryConfig, MonitorConfig, RecordingConfig, RobotConfig
 from lerobot_monitor.loop import Command, ControlLoop
+from lerobot_monitor.policy import ActionChunk
 
 
 def _loop(tmp_path: Path) -> ControlLoop:
@@ -444,6 +445,8 @@ def test_rollout_policy_deadline_runs_at_policy_rate_without_drift(tmp_path: Pat
     assert loop._begin_rollout(loaded, {"record": False, "policy_fps": 15}, "policy")
     predict = MagicMock(return_value={"gripper": 1.0})
     monkeypatch.setattr(loop_module, "predict_pose", predict)
+    # The chart preview is a separate, throttled inference; keep it out of this clock.
+    monkeypatch.setattr(loop, "_capture_rollout_prediction", MagicMock())
 
     clock = iter((0.0, 1 / 30, 2 / 30, 3 / 30, 4 / 30))
     monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(clock))
@@ -453,6 +456,60 @@ def test_rollout_policy_deadline_runs_at_policy_rate_without_drift(tmp_path: Pat
     assert predict.call_count == 3
     assert loop.follower.send_pose.call_count == 3
     assert loop._next_policy_t == pytest.approx(0.2)
+
+
+def test_rollout_prediction_uses_completion_time_and_unique_ids(tmp_path: Path, monkeypatch) -> None:
+    loop = _loop(tmp_path)
+    loop.loaded_policy = SimpleNamespace(path="policy", task="", policy=MagicMock(), reset=MagicMock())
+    loop.task_t0 = 10.0
+    loop.policy_fps = 20.0
+    calls: list[dict] = []
+
+    def fake_chunk(*_args, **kwargs):
+        calls.append(kwargs)
+        return ActionChunk(
+            actions=[{"gripper": 1.0}, {"gripper": 2.0}],
+            strategy="policy_chunk",
+            degraded=False,
+            warnings=[],
+        )
+
+    monkeypatch.setattr(loop_module, "predict_action_chunk", fake_chunk)
+    clock = iter((12.0, 12.25, 13.0, 13.5))
+    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(clock))
+
+    loop._capture_rollout_prediction(11.5, {})
+    first = loop._rollout_prediction
+    assert loop._next_prediction_t == pytest.approx(12.75)
+    loop._capture_rollout_prediction(12.75, {})
+    second = loop._rollout_prediction
+
+    assert first is not None and second is not None
+    assert first["id"] == 1
+    assert first["observed_t_s"] == 1.5
+    assert first["t_s"] == 2.25
+    assert first["step_s"] == 0.05
+    assert second["id"] == 2
+    assert second["t_s"] == 3.5
+    assert loop._next_prediction_t == pytest.approx(14.0)
+    assert all(call["reset"] is False and call["allow_sequential"] is False for call in calls)
+
+
+def test_rollout_prediction_failure_is_non_fatal_and_throttled(tmp_path: Path, monkeypatch) -> None:
+    loop = _loop(tmp_path)
+    loop.loaded_policy = SimpleNamespace(path="policy", task="", policy=MagicMock(), reset=MagicMock())
+    loop.task_t0 = 1.0
+
+    monkeypatch.setattr(loop_module, "predict_action_chunk", MagicMock(side_effect=RuntimeError("no chunk")))
+    clock = iter((2.0, 2.25, 3.0, 3.25))
+    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(clock))
+
+    loop._capture_rollout_prediction(1.5, {})
+    loop._capture_rollout_prediction(2.5, {})
+
+    assert loop._rollout_prediction is None
+    messages = [entry["message"] for entry in loop.logs]
+    assert sum("rollout chunk preview unavailable" in message for message in messages) == 1
 
 
 def test_rollout_legacy_fps_is_policy_rate_and_is_capped_to_control(tmp_path: Path) -> None:

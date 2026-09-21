@@ -337,3 +337,71 @@ E-STOP、Stop 和任务切换的现有所有权语义。
 - 未执行真实硬件与浏览器视觉验证：快照抓帧、note/description 行内编辑、chunk overlay
   与 Send first step 的手动清单仍待在有机械臂与相机的环境确认；`test_sim` 因当前 venv
   缺少 `scservo_sdk` 无法运行，与本次改动无关。
+
+## 2026-09-21（Rollout 预测对照与模型库闭环）
+
+### 目标
+
+在现有 Replay、Snapshot 与 Model Debug 基础上，修正模式标题和图例状态，并把模型管理、
+推理评分和 rollout 预测轨迹做成可直接解释、可回归验证的工作流。
+
+### 设计
+
+- 模式标题由单一的 `snapshotActive` 派生：Snapshot 只显示 SNAPSHOT，普通 episode replay
+  只显示 REPLAY；标签 `.hidden` 必须有明确的样式所有权，不能依赖不存在的全局规则。
+- 模型库注册表保存用户可编辑的 remote/revision，Hugging Face 搜索与本地路径共享同一
+  注册语义；重复 remote 采用更新而不是追加，权重更新后重新解析本地路径。
+- debug inference 以 replay 的 `act.*` 为标准 command reference，报告 action-chunk
+  MAE、RMSE、DTW、归一化分数与参考覆盖率，不以单一不可解释分数替代原始误差。
+- rollout 预测轨迹使用带单调 ID 的 chunk 记录。后一个 chunk 覆盖重叠时间窗，超过
+  正常采样步长的断档标红；预测的可用时间从实际推理完成时刻计算，避免高延迟被画进过去。
+
+### 实施任务
+
+1. 修复 REPLAY/SNAPSHOT 标签互斥和 Chart.js 预测图例过滤。
+2. 完善模型搜索、拖拽/文件入口、远程地址编辑、去重注册和更新路径。
+3. 结构化展示 chunk 评分，补充 reference 覆盖范围与空参考状态。
+4. 让 rollout chunk 记录具备唯一 ID、完成时刻和迟到断点语义，并保持两张图同步。
+5. 增加 metrics、model hub、API、loop 与静态 UI 约束测试，执行回归与浏览器 smoke。
+
+### 验收标准
+
+- Snapshot 视图不会同时出现 REPLAY 标签；虚线预测数据不出现在图例中。
+- 每个相机可独立决定是否输入模型，至少选择一台相机才能 Run inference。
+- 模型可从 Hugging Face 搜索、remote 地址或拖拽 model card/本地路径添加，可编辑
+  remote/revision 并显式更新权重。
+- 有标准 command reference 时显示 chunk 分数及常用误差指标；无参考时明确说明不评分。
+- rollout 两张图在预测时间经过后保留虚线，新推断覆盖重叠区，断档/迟到显示红色断点。
+- `pytest`、`node --check`、`git diff --check` 与可执行的浏览器 smoke 通过，无法覆盖的
+  真实硬件边界记录在 `docs/dev_log.md`。
+
+## 后续里程碑（2026-09-21）：Blender 远程虚拟相机接入
+
+状态：已实现并通过自动化与当前运行中的 Blender 流验证。
+
+目标
+
+- Monitor 扫描本机设备时，同时读取 Blender 注册表中的 `cameras[]`，把每一路
+  注册成独立的远程 MJPEG 相机。
+- 远程相机使用与本地相机相同的显示、录制和策略输入接口；URL、画幅、FPS 与
+  质量由 Blender 面板控制，Monitor 只允许修改名称、启用、主视图和策略输入。
+- 本地扫描只维护 DirectShow / V4L 设备，不能因为远程相机不在本机枚举结果里
+  就将其删除。
+
+实现
+
+- `sim.py` 新增 `sim_cameras()`，优先解析 `cameras[]`，并兼容旧注册表的单数
+  `camera`。
+- `cameras.py` 新增 `RemoteMjpegCamera`：连接超时、增量 JPEG 分帧、单帧上限、
+  指数退避重连，以及 `latest_jpeg/latest_bgr/latest_rgb/wait_for_frame` 接口。
+- `CameraHub` 独立维护远程设备与后台发现线程；手动扫描同步远程列表，断开的
+  Blender 流从列表移除，已有用户的启用/显示/策略开关设置保留。
+- 前端远程相机卡片不再暴露宽度、端口、自动对焦、焦点和网络流按钮，主视图
+  元数据显示 Blender 与目标 FPS；策略配置使用远程 URL。
+
+验收
+
+- 当前 Blender 注册表的单数 `camera` 回退路径已实测注册为
+  `blender_sim_follower_camera_1`，成功收到 `640×480` JPEG 帧。
+- 新增测试覆盖多相机解析、单相机回退、远程注册与移除、本地重扫不误删、
+  MJPEG 分帧、远程只读 API 返回 400。

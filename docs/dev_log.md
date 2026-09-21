@@ -1,5 +1,42 @@
 # Dev log
 
+## 2026-09-21（Rollout 预测对照、模型库与 chunk 评分）
+
+- 修复 Snapshot 与 Replay 标题同时显示：`replay-badge` / `snapshot-badge` 都由
+  `snapshotActive` 派生，并补上 `.replay-tag.hidden` 的实际样式所有权。Chart.js 图例过滤
+  改为读取 `legendItem.datasetIndex`，模型预测虚线不再进入图例。
+- Model Debug 的每台相机新增输入开关；没有勾选相机时 Run 禁用，运行时只上传所选相机。
+  有 replay command reference 时返回并展示 chunk score、MAE、RMSE、DTW 与参考覆盖率；
+  snapshot 或 reference 不足时明确显示不评分。
+- Models 支持 Hugging Face 搜索、remote/revision 编辑、显式更新和本地路径/model card
+  拖拽；同一 repo 或本地路径采用 upsert，不再重复追加。拖拽入口同时提供文件选择器，
+  `.json` 可读取 `repo_id`、`remote`、`path` 或 `_name_or_path`，`.txt` 可读取纯文本地址。
+- Rollout 预测 chunk 增加单调 ID 和实际推理完成时间；重叠的新 chunk 覆盖旧预测，预测
+  可用时间晚于上一段时形成红色断点。两张图共用相同 overlay，新预测不会因时间戳相同而
+  被错误去重。
+- 验证：排除 `test_sim` 为 `127 passed`；新增 metrics、model registry/API、prediction
+  timing 测试。Chrome 浏览器 smoke 通过 `7/7`，覆盖模式标题互斥、相机开关、图例过滤、
+  虚线保留/红色断点和 model card 地址解析；`node --check` 与目标文件 `git diff --check`
+  通过。`test_sim` 仍有当前 venv/仿真环境下的 1 个既有断言失败，与本次改动路径无关。
+
+## 2026-09-21（Blender 多相机发现与远程 MJPEG 接入）
+
+- 修复“Blender 已上线但 Monitor 搜索不到相机”：Monitor 现在会从虚拟机械臂注册表读取
+  `cameras[]`，旧协议只有单数 `camera` 时自动回退；每路 Blender 相机注册为独立的
+  `RemoteMjpegCamera`，并保留用户已有的启用、主视图与策略输入设置。
+- 远程相机使用增量 JPEG SOI/EOI 分帧、读取超时、单帧大小上限和指数退避重连；对外
+  与本地 `DeviceCamera` 提供相同的 `latest_jpeg/latest_bgr/latest_rgb/wait_for_frame`
+  接口，因此显示、录制与策略输入链路无需分支。
+- `CameraHub.rescan()` 只清理本机 DirectShow/V4L 设备，后台线程负责远程列表同步；
+  `/api/scan` 与 `/api/cameras/rescan` 会立即同步远程相机。远程相机拒绝修改分辨率、
+  焦点和网络流，API 返回稳定的 400。
+- Web 端远程相机卡片显示 Blender URL 与连接状态，隐藏本地宽度、端口、对焦和网络流
+  控件；策略配置直接使用远程 `url`，不再拼 `localhost:<port>`。
+- 验证：新增解析、注册、移除、本地重扫保留、MJPEG 分帧和只读 API 测试；当前运行中的
+  Blender 流实测可发现 `blender_sim_follower_camera_1` 并收到 `640×480` JPEG 帧。
+  `test_sim` 中依赖 `scservo_sdk` 的 5 个既有用例在当前 venv 仍因缺少该可选依赖
+  无法运行。
+
 ## 2026-09-21（Snapshot 库、可编辑备注与 VLA Model Debug 完成）
 
 - Snapshot 采用“一个目录一条记录”：`snapshots_root/<id>/snapshot.json` 是唯一 manifest，目录名即权威 ID，扫描时忽略 JSON 内的旧 `id`、跳过缺失或损坏的目录，并校验 ID 与解析后的路径都落在 `snapshots_root` 内。相机 JPEG 与 `preview.jpg`（首张相机图缩放到宽 ≤ 320）通过独立路由以 `FileResponse` 返回。

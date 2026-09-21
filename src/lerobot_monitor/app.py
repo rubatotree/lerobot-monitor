@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 
 from .config import MonitorConfig
 from .hub import RuntimeHub
+from .metrics import evaluate_action_chunk
+from .model_hub import ModelHubError, search_hf_models
 from .preview import (
     find_lerobot_video,
     lerobot_episode_count,
@@ -148,6 +150,22 @@ class DebugInferBody(BaseModel):
     source: dict[str, Any] | None = None
     joints: dict[str, float] = Field(default_factory=dict)
     cameras: list[SnapshotCameraBody] = Field(default_factory=list)
+    reference: list[dict[str, float]] = Field(default_factory=list)
+
+
+class ModelRegisterBody(BaseModel):
+    remote: str
+    name: str = ""
+    revision: str = ""
+    note: str = ""
+    download: bool = True
+
+
+class ModelSaveBody(BaseModel):
+    name: str | None = None
+    remote: str | None = None
+    revision: str | None = None
+    note: str | None = None
 
 
 class AutoRecordBody(BaseModel):
@@ -402,6 +420,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     async def scan_devices() -> dict[str, Any]:
         from .ports import list_serial_ports
 
+        hub.cameras.sync_remote_cameras()
         cameras = hub.cameras.rescan()
         return {"cameras": cameras, "ports": list_serial_ports()}
 
@@ -806,6 +825,57 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     async def list_models() -> list[dict[str, Any]]:
         return await asyncio.to_thread(hub.models)
 
+    @router.get("/api/models/search")
+    async def search_models(q: str, limit: int = 20) -> list[dict[str, Any]]:
+        try:
+            return await asyncio.to_thread(search_hf_models, q, limit=max(1, min(int(limit), 50)))
+        except ModelHubError as exc:
+            raise HTTPException(502, str(exc)) from exc
+
+    @router.post("/api/models")
+    async def register_model(body: ModelRegisterBody) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                hub.model_registry.register,
+                remote=body.remote,
+                name=body.name,
+                revision=body.revision,
+                note=body.note,
+                download=body.download,
+            )
+        except ModelHubError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.put("/api/models/{model_id}")
+    async def save_model(model_id: str, body: ModelSaveBody) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                hub.model_registry.save,
+                model_id,
+                body.model_dump(exclude_unset=True),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown model '{model_id}'") from exc
+        except ModelHubError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.post("/api/models/{model_id}/update")
+    async def update_model(model_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(hub.model_registry.update, model_id)
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown model '{model_id}'") from exc
+        except ModelHubError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.delete("/api/models/{model_id}")
+    async def delete_model(model_id: str) -> dict[str, Any]:
+        try:
+            await asyncio.to_thread(hub.model_registry.delete, model_id)
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown model '{model_id}'") from exc
+        return {"ok": True}
+
     @router.post("/api/debug/infer")
     async def debug_infer(body: DebugInferBody) -> dict[str, Any]:
         if not body.policy_path.strip():
@@ -869,6 +939,11 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             }
             for index, joints in enumerate(chunk.actions)
         ]
+        evaluation = (
+            evaluate_action_chunk([action["joints"] for action in actions], body.reference)
+            if body.reference
+            else None
+        )
         return {
             "ok": True,
             "source": body.source,
@@ -877,6 +952,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             "fps": body.fps,
             "latency_ms": round(latency_ms, 3),
             "actions": actions,
+            "evaluation": evaluation,
             "warnings": chunk.warnings,
         }
 
@@ -972,6 +1048,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.post("/api/cameras/rescan")
     async def rescan_cameras() -> list[dict[str, Any]]:
+        hub.cameras.sync_remote_cameras()
         return hub.cameras.rescan()
 
     @router.post("/api/cameras/{name}/focus")
@@ -980,6 +1057,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             return hub.cameras.set_focus(name, autofocus=body.autofocus, focus=body.focus)
         except KeyError:
             raise HTTPException(404, f"unknown camera '{name}'") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @router.post("/api/cameras/{name}/resolution")
     async def set_camera_resolution(name: str, body: CameraResolutionBody) -> dict[str, Any]:
@@ -1046,6 +1125,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             return hub.cameras.set_stream(name, body.enable, body.port)
         except KeyError:
             raise HTTPException(404, f"unknown camera '{name}'") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(400, str(exc)) from exc
 

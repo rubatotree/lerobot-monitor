@@ -9,7 +9,10 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from lerobot_monitor import app as app_module
+from lerobot_monitor import model_hub
 from lerobot_monitor.app import create_app
+from lerobot_monitor.cameras import RemoteMjpegCamera
 from lerobot_monitor.config import (
     CamerasConfig,
     LibraryConfig,
@@ -122,6 +125,47 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert saved.status_code == 200
         listed = client.get("/lerobot/api/presets")
         assert listed.json()["pose"]["fold"]["gripper"] == 1.0
+
+
+def test_remote_blender_camera_controls_return_bad_request(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    cfg = MonitorConfig(
+        store_path=tmp_path / "store.json",
+        server=ServerConfig(port=0, base_path="/lerobot"),
+        robot=RobotConfig(auto_connect=False, port="COM_UNUSED"),
+        cameras=CamerasConfig(probe=False),
+        recording=RecordingConfig(root=tmp_path / "videos"),
+        library=LibraryConfig(videos_root=tmp_path / "videos", models_roots=[tmp_path / "models"]),
+    )
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        hub = app.state.hub
+        camera = RemoteMjpegCamera(
+            "blender_sim_follower_front",
+            {
+                "robot_id": "sim_follower",
+                "id": "front",
+                "label": "Front",
+                "url": "http://127.0.0.1:9300/video",
+            },
+        )
+        hub.cameras.remote_streams[camera.name] = camera
+
+        assert client.get("/lerobot/api/cameras").json()[0]["remote"] is True
+        assert client.post(
+            f"/lerobot/api/cameras/{camera.name}/resolution",
+            json={"width": 320, "height": 240},
+        ).status_code == 400
+        assert client.post(
+            f"/lerobot/api/cameras/{camera.name}/focus",
+            json={"focus": 10},
+        ).status_code == 400
+        assert client.post(
+            f"/lerobot/api/cameras/{camera.name}/stream",
+            json={"enable": True, "port": 5000},
+        ).status_code == 400
 
 
 def test_episode_edit_persists(tmp_path: Path, monkeypatch) -> None:
@@ -649,6 +693,7 @@ def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatc
                 "source": {"kind": "video", "id": "v1", "episode": 0, "elapsed_s": 1.5},
                 "joints": {"gripper": 0.0},
                 "cameras": [{"key": "front", "jpeg_base64": _jpeg_base64()}],
+                "reference": [{"gripper": 1.5}, {"gripper": 2.0}],
             },
         )
 
@@ -661,6 +706,9 @@ def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatc
     assert [row["t_s"] for row in body["actions"]] == [0.1, 0.2]
     assert body["actions"][1]["joints"] == {"gripper": 2.0}
     assert body["source"]["id"] == "v1"
+    assert body["evaluation"]["steps"] == 2
+    assert body["evaluation"]["mae"] == 0.25
+    assert body["evaluation"]["coverage"] == 1.0
     kwargs = hub.loop.infer_action_chunk.call_args.kwargs
     assert kwargs["path"] == "fake/policy"
     assert kwargs["device"] == "cpu"
@@ -752,5 +800,79 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="btn-dbg-run"',
         'id="btn-dbg-send"',
         'id="dbg-cam-map"',
+        'id="dbg-eval"',
+        'id="md-file-input"',
     ):
         assert marker in page.text
+
+
+def test_model_registry_api_round_trip(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+
+    def fake_download(repo_id: str, revision: str = "") -> str:
+        path = tmp_path / "hf-models" / f"{repo_id.replace('/', '--')}-{revision or 'latest'}"
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    monkeypatch.setattr(app_module, "search_hf_models", lambda q, limit=20: [
+        {"repo_id": "lerobot/act_aloha", "downloads": 42, "likes": 3, "last_modified": "", "tags": ["lerobot"]}
+    ])
+    monkeypatch.setattr(model_hub, "download_hf_model", fake_download)
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        search = client.get("/lerobot/api/models/search", params={"q": "act"})
+        assert search.status_code == 200
+        assert search.json()[0]["repo_id"] == "lerobot/act_aloha"
+
+        created = client.post(
+            "/lerobot/api/models",
+            json={"remote": "lerobot/act_aloha", "name": "ACT Aloha"},
+        )
+        assert created.status_code == 200
+        row = created.json()
+        assert row["managed"] is True
+        assert row["repo_id"] == "lerobot/act_aloha"
+        assert row["path"]
+
+        listed = client.get("/lerobot/api/models")
+        assert listed.status_code == 200
+        assert [entry["id"] for entry in listed.json()] == [row["id"]]
+
+        saved = client.put(
+            f"/lerobot/api/models/{row['id']}",
+            json={"name": "ACT renamed", "revision": "main"},
+        )
+        assert saved.status_code == 200
+        assert saved.json()["name"] == "ACT renamed"
+        assert saved.json()["revision"] == "main"
+
+        updated = client.post(f"/lerobot/api/models/{row['id']}/update")
+        assert updated.status_code == 200
+        assert updated.json()["path"].endswith("main")
+
+        removed = client.delete(f"/lerobot/api/models/{row['id']}")
+        assert removed.status_code == 200
+        assert client.get("/lerobot/api/models").json() == []
+
+
+def test_model_api_rejects_unknown_or_invalid_entries(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        invalid = client.post("/lerobot/api/models", json={"remote": ""})
+        assert invalid.status_code == 400
+        missing = client.put("/lerobot/api/models/not-found", json={"name": "x"})
+        assert missing.status_code == 404
+
+
+def test_static_css_owns_hidden_replay_badges(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        css = client.get("/lerobot/static/styles.css")
+
+    assert css.status_code == 200
+    assert ".replay-tag.hidden" in css.text

@@ -286,6 +286,9 @@ def predict_action_chunk(
     joints: Mapping[str, float],
     images_rgb: Mapping[str, np.ndarray],
     chunk_size: int,
+    *,
+    reset: bool = True,
+    allow_sequential: bool = True,
 ) -> ActionChunk:
     """Predict up to ``chunk_size`` actions from one observation.
 
@@ -293,6 +296,11 @@ def predict_action_chunk(
     ``(B, T, A)`` tensor before the postprocessor. Policies without that API,
     or whose chunk result is malformed, fall back to repeated
     ``select_action`` calls and report ``degraded=True``.
+
+    ``reset=False`` keeps a policy that is already executing (rollout) intact:
+    clearing its action queue mid-episode would change the actions it sends.
+    ``allow_sequential=False`` refuses the multi-step fallback, which is far too
+    slow to run alongside a live control loop.
     """
     import torch
 
@@ -309,7 +317,8 @@ def predict_action_chunk(
     device = torch.device(loaded.device if torch.cuda.is_available() or loaded.device == "cpu" else "cpu")
     warnings: list[str] = []
     with torch.inference_mode():
-        loaded.reset()
+        if reset:
+            loaded.reset()
         prepared = prepare_observation_for_inference(
             observation, device, loaded.task, loaded.robot_type
         )
@@ -336,7 +345,10 @@ def predict_action_chunk(
         else:
             warnings.append("policy does not implement predict_action_chunk")
 
-        loaded.reset()
+        if not allow_sequential:
+            raise RuntimeError("; ".join(warnings) or "no action chunk available")
+        if reset:
+            loaded.reset()
         actions = []
         for _ in range(chunk_size):
             action = loaded.policy.select_action(prepared)

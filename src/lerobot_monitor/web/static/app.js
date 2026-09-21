@@ -224,27 +224,217 @@ function mkChart(id) {
 const stateChart = mkChart("chart-state");
 const actionChart = mkChart("chart-action");
 
-function pushChart(chart, scalars) {
+const ROLLOUT_WINDOW_S = 20;
+const PREDICTION_BREAK_COLOR = "#ff5a6a";
+
+function liveTimeScale() {
+  return {
+    type: "linear",
+    display: false,
+    min: 0,
+    ticks: {
+      color: "#85819c",
+      font: { size: 9, family: "IBM Plex Mono" },
+      callback: (value) => `${Number(value).toFixed(1)}s`,
+    },
+    grid: { color: "#171a28" },
+    border: { color: "#2c3148" },
+  };
+}
+
+// Live charts own `$live` (measured values) and `$predictions` (dashed overlays)
+// so Chart.js never has to guess which dataset is which.
+function syncChartDatasets(chart) {
+  const next = (chart.$live || []).concat(chart.$predictions || []);
+  const current = chart.data.datasets;
+  const unchanged = current.length === next.length && next.every((ds, i) => current[i] === ds);
+  if (!unchanged) chart.data.datasets = next;
+}
+
+function pushChart(chart, scalars, timeS = null) {
   if (!chart) return;
   const keys = Object.keys(scalars);
-  while (chart.data.datasets.length < keys.length) {
-    const i = chart.data.datasets.length;
-    chart.data.datasets.push({
-      label: keys[i] || "",
+  const timeAxis = Number.isFinite(timeS);
+  if (chart.$timeAxis !== timeAxis) {
+    chart.$timeAxis = timeAxis;
+    chart.data.labels = [];
+    chart.$live = [];
+    chart.$predictions = [];
+    chart.options.scales.x = timeAxis ? liveTimeScale() : { display: false, type: "category" };
+    syncChartDatasets(chart);
+  }
+  const live = chart.$live || (chart.$live = []);
+  while (live.length < keys.length) {
+    live.push({
+      label: "",
       data: [],
-      borderColor: PAL[i % PAL.length],
+      borderColor: PAL[live.length % PAL.length],
       tension: 0.2,
     });
   }
-  chart.data.datasets.forEach((ds, i) => { if (keys[i]) ds.label = keys[i]; });
-  chart.data.labels.push("");
-  if (chart.data.labels.length > HIST) chart.data.labels.shift();
-  keys.forEach((k, i) => {
-    const ds = chart.data.datasets[i];
-    ds.data.push(scalars[k]);
-    if (ds.data.length > HIST) ds.data.shift();
-  });
+  live.forEach((ds, i) => { if (keys[i]) ds.label = keys[i]; });
+  if (timeAxis) {
+    keys.forEach((k, i) => {
+      const ds = live[i];
+      ds.data.push({ x: Number(timeS), y: Number(scalars[k]) });
+      if (ds.data.length > HIST) ds.data.shift();
+    });
+  } else {
+    chart.data.labels.push("");
+    if (chart.data.labels.length > HIST) chart.data.labels.shift();
+    keys.forEach((k, i) => {
+      const ds = live[i];
+      ds.data.push(scalars[k]);
+      if (ds.data.length > HIST) ds.data.shift();
+    });
+  }
+  syncChartDatasets(chart);
   chart.update("none");
+}
+
+function rolloutPredictionList() {
+  if (!Array.isArray(vizState.rolloutPredictions)) vizState.rolloutPredictions = [];
+  return vizState.rolloutPredictions;
+}
+
+function recordRolloutPrediction(prediction, now) {
+  const actions = prediction && Array.isArray(prediction.actions) ? prediction.actions : [];
+  const start = Number(prediction && prediction.t_s);
+  if (!actions.length || !Number.isFinite(start)) return;
+  const step = Number(prediction.step_s) > 0 ? Number(prediction.step_s) : 1 / 30;
+  const key = String(prediction.id || `${start.toFixed(3)}#${actions.length}`);
+  const list = rolloutPredictionList();
+  if (list.some((chunk) => chunk.key === key)) return;
+  const points = [];
+  actions.forEach((action, index) => {
+    const joints = action && action.joints ? action.joints : action;
+    if (!joints || typeof joints !== "object") return;
+    points.push({ x: start + (index + 1) * step, joints });
+  });
+  if (!points.length) return;
+  const end = points[points.length - 1].x;
+  // A newer chunk replaces the older predictions inside the window it covers.
+  const kept = [];
+  list.forEach((chunk) => {
+    const surviving = chunk.points.filter((point) => point.x < start || point.x > end);
+    if (surviving.length) kept.push({ ...chunk, points: surviving });
+  });
+  kept.push({
+    key,
+    start,
+    end,
+    step,
+    points,
+    strategy: prediction.strategy || "",
+    degraded: !!prediction.degraded,
+    latency_ms: Number(prediction.latency_ms) || 0,
+  });
+  const horizon = now - ROLLOUT_WINDOW_S;
+  vizState.rolloutPredictions = kept
+    .filter((chunk) => chunk.points[chunk.points.length - 1].x > horizon)
+    .slice(-40);
+}
+
+function rolloutOverlaySeries(now) {
+  const chunks = [...rolloutPredictionList()].sort((a, b) => a.start - b.start);
+  const series = new Map();
+  chunks.forEach((chunk) => {
+    chunk.points.forEach((point) => {
+      Object.entries(point.joints || {}).forEach(([name, value]) => {
+        const y = Number(value);
+        if (!Number.isFinite(y)) return;
+        if (!series.has(name)) series.set(name, { points: [], breaks: [] });
+        series.get(name).points.push({ x: point.x, y, step: chunk.step });
+      });
+    });
+  });
+  series.forEach((entry) => {
+    const ordered = entry.points
+      .filter((point) => point.x >= now - ROLLOUT_WINDOW_S)
+      .sort((a, b) => a.x - b.x);
+    const merged = [];
+    let previous = null;
+    ordered.forEach((point) => {
+      if (previous && point.x - previous.x > 2.5 * Math.max(previous.step || 0, point.step || 0)) {
+        merged.push({ x: (previous.x + point.x) / 2, y: null });
+        entry.breaks.push({ x: previous.x, y: previous.y });
+        entry.breaks.push({ x: point.x, y: point.y });
+      }
+      merged.push(point);
+      previous = point;
+    });
+    // A horizon that lapsed without a fresh chunk is a break too.
+    if (previous && Number.isFinite(now) && now - previous.x > 2.5 * (previous.step || 0)) {
+      entry.breaks.push({ x: previous.x, y: previous.y });
+    }
+    entry.points = merged;
+  });
+  return series;
+}
+
+function applyRolloutOverlay(chart, now) {
+  if (!chart || !chart.$timeAxis) return;
+  const colorByName = new Map((chart.$live || []).map((ds) => [ds.label, ds.borderColor]));
+  const names = jointNames();
+  const datasets = [];
+  let overlayEnd = 0;
+  rolloutOverlaySeries(now).forEach((entry, name) => {
+    if (!entry.points.length) return;
+    const color = colorByName.get(name) || PAL[Math.max(0, names.indexOf(name)) % PAL.length];
+    datasets.push({
+      label: `${name} · pred`,
+      data: entry.points,
+      borderColor: color,
+      borderWidth: 1.3,
+      borderDash: [4, 3],
+      pointRadius: 0,
+      tension: 0.15,
+      spanGaps: false,
+      $prediction: true,
+    });
+    entry.points.forEach((point) => {
+      if (Number.isFinite(point.y)) overlayEnd = Math.max(overlayEnd, point.x);
+    });
+    if (entry.breaks.length) {
+      datasets.push({
+        label: `${name} · prediction gap`,
+        data: entry.breaks,
+        borderColor: PREDICTION_BREAK_COLOR,
+        backgroundColor: PREDICTION_BREAK_COLOR,
+        borderWidth: 1.2,
+        pointRadius: 3,
+        pointStyle: "rectRot",
+        showLine: false,
+        $prediction: true,
+      });
+    }
+  });
+  chart.$predictions = datasets;
+  syncChartDatasets(chart);
+  chart.options.scales.x = {
+    ...liveTimeScale(),
+    min: Math.max(0, now - ROLLOUT_WINDOW_S),
+    max: Math.max(now, overlayEnd) + 0.25,
+  };
+  chart.update("none");
+}
+
+function renderRolloutOverlays(now) {
+  applyRolloutOverlay(stateChart, now);
+  applyRolloutOverlay(actionChart, now);
+}
+
+function clearRolloutPredictions() {
+  const hasOverlay = (chart) => !!(chart && (chart.$predictions || []).length);
+  const hasChunks = rolloutPredictionList().length > 0;
+  if (!hasChunks && !hasOverlay(stateChart) && !hasOverlay(actionChart)) return;
+  vizState.rolloutPredictions = [];
+  [stateChart, actionChart].forEach((chart) => {
+    if (!hasOverlay(chart)) return;
+    chart.$predictions = [];
+    syncChartDatasets(chart);
+    chart.update("none");
+  });
 }
 
 function limitsFor(name) {
@@ -395,11 +585,14 @@ function renderMainCameras(list) {
   const streaming = (list || []).filter((c) => c.enabled && c.show_main);
   const ids = streaming.map((c) => String(c.name));
   streaming.forEach((cam) => {
+    const metaText = cam.remote
+      ? `${cam.fps || 0} fps · Blender${cam.connected ? "" : " · offline"}`
+      : `${cam.fps} fps · :${cam.port}`;
     addCamCard(
       String(cam.name),
       cam.label || `cam ${cam.name}`,
       `${BASE}/camera/${encodeURIComponent(cam.name)}`,
-      `${cam.fps} fps · :${cam.port}`,
+      metaText,
     );
   });
   syncCamCards(ids);
@@ -414,7 +607,7 @@ function renderCamMenu(list) {
   camMenu = list || [];
   const root = $("cam-rows");
   if (!root) return;
-  const key = camMenu.map((c) => `${c.name}:${c.label}:${c.enabled}:${c.show_main}:${c.feed_robot}:${c.streaming}:${c.width}x${c.height}:${c.port}:${c.connected}`).join("|");
+  const key = camMenu.map((c) => `${c.name}:${c.label}:${c.enabled}:${c.show_main}:${c.feed_robot}:${c.streaming}:${c.width}x${c.height}:${c.port}:${c.connected}:${c.remote}:${c.url}:${c.error}`).join("|");
   if (key === camMenuKey) return;
   camMenuKey = key;
   const ae = document.activeElement;
@@ -430,15 +623,12 @@ function renderCamMenu(list) {
     card.className = "cam-dev";
     const name = String(cam.name);
     const shown = cam.label || `cam ${name}`;
-    card.innerHTML = `
-      <header>
-        <h3>${shown}</h3>
-        <span class="${cam.streaming ? "on" : "off"}">${cam.streaming ? "stream on" : "local only"}</span>
-      </header>
-      <img class="mini" alt="preview ${shown}" src="${BASE}/camera/${encodeURIComponent(name)}"/>
-      <label>Name
-        <input type="text" data-label="${name}" value="${shown}" placeholder="front / side"/>
-      </label>
+    const remote = Boolean(cam.remote);
+    const active = remote ? Boolean(cam.connected) : Boolean(cam.streaming);
+    const statusText = remote
+      ? (cam.connected ? "Blender live" : "Blender offline")
+      : (cam.streaming ? "stream on" : "local only");
+    const localControls = remote ? "" : `
       <div class="pair">
         <label>Width <input type="number" data-w="${name}" value="${cam.width}" min="16" step="1"/></label>
         <label>Height <input type="number" data-h="${name}" value="${cam.height}" min="16" step="1"/></label>
@@ -449,17 +639,32 @@ function renderCamMenu(list) {
       <label class="check"><input type="checkbox" data-af="${name}" ${cam.autofocus ? "checked" : ""}/> Autofocus</label>
       <label>Focus
         <input type="range" data-focus="${name}" min="${cam.focus_min ?? 0}" max="${cam.focus_max ?? 255}" step="1" value="${cam.focus ?? 0}" ${cam.autofocus ? "disabled" : ""}/>
+      </label>`;
+    const sourceStatus = remote
+      ? `<p class="hw-status ${cam.connected ? "on" : ""}">${cam.connected ? "connected" : "waiting"} · ${cam.url || "no URL"}${cam.error ? ` · ${cam.error}` : ""}</p>`
+      : `<p class="hw-status ${cam.streaming ? "on" : ""}">${cam.streaming ? `http://127.0.0.1:${cam.port}/video` : "network stream off"}</p>`;
+    const actions = remote ? "" : `
+      <div class="row-actions">
+        <button type="button" data-apply="${name}">Apply size</button>
+        <button type="button" data-stream="${name}">${cam.streaming ? "Stop stream" : "Open network stream"}</button>
+      </div>`;
+    card.innerHTML = `
+      <header>
+        <h3>${shown}</h3>
+        <span class="${active ? "on" : "off"}">${statusText}</span>
+      </header>
+      <img class="mini" alt="preview ${shown}" src="${BASE}/camera/${encodeURIComponent(name)}"/>
+      <label>Name
+        <input type="text" data-label="${name}" value="${shown}" placeholder="front / side"/>
       </label>
+      ${localControls}
       <div class="checks">
         <label class="check"><input type="checkbox" data-enabled="${name}" ${cam.enabled ? "checked" : ""}/> Enable</label>
         <label class="check"><input type="checkbox" data-main="${name}" ${cam.show_main ? "checked" : ""} ${cam.enabled ? "" : "disabled"}/> Main view</label>
         <label class="check"><input type="checkbox" data-robot="${name}" ${cam.feed_robot ? "checked" : ""} ${cam.enabled && cam.show_main ? "" : "disabled"}/> Robot input</label>
       </div>
-      <p class="hw-status ${cam.streaming ? "on" : ""}">${cam.streaming ? `http://127.0.0.1:${cam.port}/video` : "network stream off"}</p>
-      <div class="row-actions">
-        <button type="button" data-apply="${name}">Apply size</button>
-        <button type="button" data-stream="${name}">${cam.streaming ? "Stop stream" : "Open network stream"}</button>
-      </div>`;
+      ${sourceStatus}
+      ${actions}`;
     root.appendChild(card);
   });
 }
@@ -654,11 +859,23 @@ function applyStatus(d) {
   renderMainCameras(d.cameras || []);
   renderCamMenu(d.cameras || []);
 
+  // During rollout the charts switch to a time axis so the predicted chunk can be
+  // drawn ahead of "now" and kept afterwards for comparison with the real curve.
+  const rolloutLive = !replayActive && mode === "rollout";
+  const elapsedS = Number(task.elapsed_s) || 0;
   if (d.joints && Object.keys(d.joints).length) {
     updateJoints(d.joints);
-    if (!replayActive) pushChart(stateChart, d.joints);
+    if (!replayActive) pushChart(stateChart, d.joints, rolloutLive ? elapsedS : null);
   }
-  if (!replayActive && d.action && Object.keys(d.action).length) pushChart(actionChart, d.action);
+  if (!replayActive && d.action && Object.keys(d.action).length) {
+    pushChart(actionChart, d.action, rolloutLive ? elapsedS : null);
+  }
+  if (rolloutLive) {
+    recordRolloutPrediction(d.prediction, elapsedS);
+    renderRolloutOverlays(elapsedS);
+  } else {
+    clearRolloutPredictions();
+  }
   if (armReplay && (!robot.connected || mode === "estop")) {
     armReplay = false;
     syncArmToggle();
@@ -962,8 +1179,13 @@ function camerasFlag() {
   if (!list.length) return "";
   const inner = list.map((c) => {
     const key = String(c.label || `cam${c.name}`).replace(/\s+/g, "_");
-    const src = c.streaming ? `http://localhost:${c.port}/video` : String(c.index ?? c.name);
-    return `${key}: {type: opencv, index_or_path: '${src}', width: ${c.width}, height: ${c.height}, fps: 25}`;
+    const src = c.remote
+      ? String(c.url)
+      : c.streaming
+        ? `http://localhost:${c.port}/video`
+        : String(c.index ?? c.name);
+    const fps = Math.round(Number(c.target_fps ?? c.fps ?? 25));
+    return `${key}: {type: opencv, index_or_path: '${src}', width: ${c.width}, height: ${c.height}, fps: ${fps}}`;
   }).join(", ");
   return `{ ${inner} }`;
 }
@@ -1483,6 +1705,10 @@ function appendLibraryNote(li, kind, sourceId, row) {
     input.disabled = true;
     try {
       if (kind === "snapshot") await saveSnapshotNote(sourceId, input.value.trim());
+      else if (kind === "model") {
+        await api(`/api/models/${encodeURIComponent(sourceId)}`, { note: input.value.trim() }, "PUT");
+        await refreshLibrarySection("models");
+      }
       else await saveLibraryOverride(kind, sourceId, { note: input.value.trim() });
     } catch (err) {
       toastError(err);
@@ -1817,7 +2043,8 @@ async function openSnapshot(snapshotId) {
   vizState.previewGeneration = previewRequestGeneration;
   vizState.snapshot = snapshot;
   clearVizChunk();
-  enterReplay();
+  // A snapshot has no episode list, so keep the episode panel out of the way.
+  enterReplay({ showEpisodes: false });
   const stage = $("replay");
   if (stage) stage.classList.add("snapshot-mode");
   const seek = $("replay-seek");
@@ -2035,7 +2262,7 @@ function debugFields() {
     extra: kvPairs("dbg-kv"),
     chunk_size: Number($("dbg-chunk") ? $("dbg-chunk").value : 0) || 16,
     fps: Number($("dbg-fps") ? $("dbg-fps").value : 0) || 30,
-    camera_map: kvPairs("dbg-cam-map"),
+    camera_map: debugCameraMap(),
   };
 }
 
@@ -2047,9 +2274,92 @@ function applyDebugFields(preset) {
   if (preset.chunk_size != null && $("dbg-chunk")) $("dbg-chunk").value = preset.chunk_size;
   if (preset.fps != null && $("dbg-fps")) $("dbg-fps").value = preset.fps;
   if (preset.extra != null) setKvPairs(preset.extra, "dbg-kv", () => {});
-  if (preset.camera_map != null) setKvPairs(preset.camera_map, "dbg-cam-map", () => {});
+  if (preset.camera_map != null) applyDebugCameraMap(preset.camera_map);
   const select = $("dbg-policy");
   if (select && preset.policy_path) select.value = preset.policy_path;
+  renderDebugPanel();
+}
+
+function debugCameraRows() {
+  const host = $("dbg-cam-map");
+  if (!host) return [];
+  return [...host.querySelectorAll(".kv-row")].map((row) => ({
+    row,
+    enabled: Boolean(row.querySelector(".cam-on") && row.querySelector(".cam-on").checked),
+    key: row.querySelector(".kv-k").value.trim(),
+    suffix: row.querySelector(".kv-v").value.trim(),
+  }));
+}
+
+function debugCameraMap() {
+  const map = {};
+  debugCameraRows().forEach((entry) => {
+    if (!entry.enabled || !entry.key) return;
+    map[entry.key] = entry.suffix || `observation.images.${entry.key}`;
+  });
+  return map;
+}
+
+function addDebugCameraRow(key = "", suffix = "", enabled = true) {
+  const host = $("dbg-cam-map");
+  if (!host) return null;
+  const row = document.createElement("div");
+  row.className = "kv-row cam-row";
+  const toggle = document.createElement("input");
+  toggle.type = "checkbox";
+  toggle.className = "cam-on";
+  toggle.checked = enabled;
+  toggle.title = enabled ? "Camera is fed to the model" : "Camera is not fed to the model";
+  toggle.setAttribute("aria-label", "Use camera in inference");
+  const k = document.createElement("input");
+  k.className = "kv-k";
+  k.type = "text";
+  k.placeholder = "camera key";
+  k.value = key;
+  const v = document.createElement("input");
+  v.className = "kv-v";
+  v.type = "text";
+  v.placeholder = "observation.images.<key>";
+  v.value = suffix || (key ? `observation.images.${key}` : "");
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "ghost kv-del";
+  del.textContent = "×";
+  const refresh = () => {
+    toggle.title = toggle.checked ? "Camera is fed to the model" : "Camera is not fed to the model";
+    renderDebugPanel();
+  };
+  toggle.addEventListener("change", refresh);
+  k.addEventListener("input", refresh);
+  v.addEventListener("input", refresh);
+  del.addEventListener("click", () => {
+    row.remove();
+    if (!host.children.length) addDebugCameraRow("", "", true);
+    refresh();
+  });
+  row.append(toggle, k, v, del);
+  host.appendChild(row);
+  return row;
+}
+
+function setDebugCameraRows(entries) {
+  const host = $("dbg-cam-map");
+  if (!host) return;
+  host.innerHTML = "";
+  const rows = (entries || []).filter((entry) => entry && entry.key);
+  rows.forEach((entry) => addDebugCameraRow(entry.key, entry.suffix || "", entry.enabled !== false));
+  if (!rows.length) addDebugCameraRow("", "", true);
+}
+
+function applyDebugCameraMap(map) {
+  const saved = map || {};
+  const source = debugSourceInfo();
+  const keys = [...new Set([...Object.keys(saved), ...((source && source.cameras) || [])])];
+  setDebugCameraRows(keys.map((key) => ({
+    key,
+    suffix: saved[key] || `observation.images.${key}`,
+    enabled: Object.prototype.hasOwnProperty.call(saved, key),
+  })));
 }
 
 function ensureDebugCameraRows(keys) {
@@ -2066,11 +2376,12 @@ function ensureDebugCameraRows(keys) {
     if (placeholder && !placeholder.querySelector(".kv-k").value.trim()) {
       placeholder.querySelector(".kv-k").value = key;
       placeholder.querySelector(".kv-v").value = `observation.images.${key}`;
+      if (placeholder.querySelector(".cam-on")) placeholder.querySelector(".cam-on").checked = true;
       return;
     }
-    addKvRow(key, `observation.images.${key}`, "dbg-cam-map", () => {});
+    addDebugCameraRow(key, `observation.images.${key}`, true);
   });
-  if (!host.children.length) addKvRow("", "", "dbg-cam-map", () => {});
+  if (!host.children.length) addDebugCameraRow("", "", true);
 }
 
 function setDebugStatus(message, isError = false) {
@@ -2092,17 +2403,21 @@ function syncDebugActions() {
 function renderDebugPanel() {
   const source = debugSourceInfo();
   const hasCamera = cameraFrameAvailable();
+  const taskInput = $("dbg-task");
+  if (source && source.task && taskInput && !taskInput.value.trim()) taskInput.value = source.task;
+  if (source) ensureDebugCameraRows(source.cameras);
+  const selectedCameras = Object.keys(debugCameraMap());
   const label = $("dbg-source");
   if (label) {
     if (!source) label.textContent = "source: open an episode or snapshot";
     else if (!hasCamera) label.textContent = `source: ${source.label} · waiting for a camera frame`;
-    else label.textContent = `source: ${source.label} · ${Object.keys(source.joints).length} joints · ${source.cameras.length} cam`;
+    else label.textContent = `source: ${source.label} · ${Object.keys(source.joints).length} joints · ${selectedCameras.length}/${source.cameras.length} cam`;
   }
-  const taskInput = $("dbg-task");
-  if (source && source.task && taskInput && !taskInput.value.trim()) taskInput.value = source.task;
-  if (source) ensureDebugCameraRows(source.cameras);
   const run = $("btn-dbg-run");
-  if (run) run.disabled = !source || !hasCamera;
+  if (run) {
+    run.disabled = !source || !hasCamera || !selectedCameras.length;
+    run.title = selectedCameras.length ? "" : "Select at least one camera input";
+  }
   syncDebugActions();
 }
 
@@ -2111,33 +2426,117 @@ function renderChunkOverlay() {
   else if (replayActive) renderVizChartsFromState();
 }
 
+function buildDebugReference(start, chunkSize, fps) {
+  const series = vizState.series || {};
+  const track = {};
+  jointNames().forEach((name) => {
+    const values = series[`act.${name}`];
+    if (Array.isArray(values) && values.length) {
+      track[name] = values.map((value) => (value == null ? Number.NaN : Number(value)));
+    }
+  });
+  const times = (vizState.times || []).map(Number);
+  if (!times.length || !Object.keys(track).length) return [];
+  const reference = [];
+  for (let index = 0; index < chunkSize; index += 1) {
+    const at = start + (index + 1) / fps;
+    if (at > times[times.length - 1]) break;
+    const sample = sampleJointSeries(times, track, at);
+    if (!sample) return [];
+    reference.push(sample);
+  }
+  return reference;
+}
+
+function formatChunkEvaluation(evaluation) {
+  if (!evaluation) return "";
+  const parts = [`score ${Number(evaluation.score).toFixed(1)}`];
+  parts.push(`MAE ${Number(evaluation.mae).toFixed(4)}`);
+  parts.push(`RMSE ${Number(evaluation.rmse).toFixed(4)}`);
+  parts.push(`DTW ${Number(evaluation.dtw).toFixed(4)}`);
+  return ` · ${parts.join(" · ")}`;
+}
+
+function clearChunkEvaluation() {
+  const host = $("dbg-eval");
+  if (!host) return;
+  host.classList.add("hidden");
+  host.replaceChildren();
+}
+
+function renderChunkEvaluation(evaluation) {
+  const host = $("dbg-eval");
+  if (!host || !evaluation) {
+    clearChunkEvaluation();
+    return;
+  }
+  const metric = (label, value, className = "") => {
+    const item = document.createElement("div");
+    item.className = className || "debug-eval-metric";
+    const name = document.createElement("span");
+    name.className = "debug-eval-label";
+    name.textContent = label;
+    const number = document.createElement("span");
+    number.className = "debug-eval-value";
+    number.textContent = Number(value).toFixed(4);
+    item.append(name, number);
+    return item;
+  };
+  const score = metric("Chunk score", evaluation.score, "debug-eval-score");
+  score.querySelector(".debug-eval-value").textContent = `${Number(evaluation.score).toFixed(1)} / 100`;
+  const note = document.createElement("p");
+  note.className = "debug-eval-note";
+  const coverage = Math.max(0, Math.min(1, Number(evaluation.coverage) || 0));
+  note.textContent = `${evaluation.steps}/${evaluation.predicted_steps} steps scored · ${(coverage * 100).toFixed(0)}% reference coverage`;
+  host.replaceChildren(
+    score,
+    metric("MAE", evaluation.mae),
+    metric("RMSE", evaluation.rmse),
+    metric("DTW", evaluation.dtw),
+    note,
+  );
+  host.classList.remove("hidden");
+}
+
 async function runDebugInference() {
   const source = debugSourceInfo();
   if (!source) throw new Error("open an episode or snapshot first");
   const fields = debugFields();
   if (!fields.policy_path) throw new Error("policy path is required");
-  const frames = stageCameraFrames();
-  if (!frames.length) throw new Error("no camera frame available for inference");
+  const enabledKeys = new Set(Object.keys(fields.camera_map));
+  if (!enabledKeys.size) throw new Error("select at least one camera input");
+  const frames = stageCameraFrames().filter((frame) => enabledKeys.has(frame.key));
+  if (!frames.length) throw new Error("no frame available for the selected cameras");
   clearVizChunk();
   const run = $("btn-dbg-run");
   if (run) run.disabled = true;
+  clearChunkEvaluation();
   setDebugStatus("running inference…");
   try {
+    const reference = buildDebugReference(source.overlayStart, fields.chunk_size, fields.fps);
     const result = await api("/api/debug/infer", {
       ...fields,
       source: source.source,
       joints: source.joints,
       cameras: frames.slice(0, SNAPSHOT_MAX_CAMERAS),
+      reference,
     });
     vizState.chunk = { ...result, start: source.overlayStart };
     syncDebugActions();
     renderChunkOverlay();
     const warnings = (result.warnings || []).join(" · ");
+    const referenceNote = reference.length
+      ? formatChunkEvaluation(result.evaluation)
+      : snapshotActive
+        ? " · no reference command in a snapshot"
+        : " · no reference command for this window";
+    renderChunkEvaluation(reference.length ? result.evaluation : null);
     setDebugStatus(
-      `${result.strategy}${result.degraded ? " · degraded" : ""} · ${result.actions.length} steps · ${Number(result.latency_ms).toFixed(0)} ms${warnings ? ` · ${warnings}` : ""}`,
+      `${result.strategy}${result.degraded ? " · degraded" : ""} · ${result.actions.length} steps · ${Number(result.latency_ms).toFixed(0)} ms${referenceNote}${warnings ? ` · ${warnings}` : ""}`,
     );
     localLog(`debug inference: ${result.strategy} · ${result.actions.length} steps · ${Number(result.latency_ms).toFixed(0)} ms`);
   } catch (err) {
+    clearChunkEvaluation();
     setDebugStatus(err.message || String(err), true);
     throw err;
   } finally {
@@ -2172,7 +2571,7 @@ if ($("dbg-policy")) {
   });
 }
 if ($("dbg-kv") && !$("dbg-kv").children.length) addKvRow("", "", "dbg-kv", () => {});
-if ($("dbg-cam-map") && !$("dbg-cam-map").children.length) addKvRow("", "", "dbg-cam-map", () => {});
+if ($("dbg-cam-map") && !$("dbg-cam-map").children.length) addDebugCameraRow("", "", true);
 
 const EPISODE_ICONS = {
   play: `<svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="8 5 19 12 8 19 8 5" fill="currentColor" stroke="none"/></svg>`,
@@ -2665,9 +3064,11 @@ const vizState = {
   snapshot: null,
   series: {},
   chunk: null,
+  rolloutPredictions: [],
 };
 
 function clearVizChunk() {
+  clearChunkEvaluation();
   if (!vizState.chunk) return;
   vizState.chunk = null;
   syncDebugActions();
@@ -2715,8 +3116,14 @@ function syncArmToggle() {
   if (label) label.textContent = armReplay ? "arm on" : "arm off";
 }
 
-function enterReplay() {
-  openEpisodeSelection();
+function syncModeBadges() {
+  if ($("replay-badge")) $("replay-badge").classList.toggle("hidden", snapshotActive);
+  if ($("snapshot-badge")) $("snapshot-badge").classList.toggle("hidden", !snapshotActive);
+  if ($("btn-snap-edit")) $("btn-snap-edit").classList.toggle("hidden", !snapshotActive);
+}
+
+function enterReplay({ showEpisodes = true } = {}) {
+  setEpisodePanelVisible(showEpisodes);
   replayActive = true;
   replaySeekId = null;
   replayScrubPointerId = null;
@@ -2732,8 +3139,7 @@ function enterReplay() {
     seek.disabled = !vizState.previewReady;
     seek.value = "0";
   }
-  if ($("snapshot-badge")) $("snapshot-badge").classList.toggle("hidden", !snapshotActive);
-  if ($("btn-snap-edit")) $("btn-snap-edit").classList.toggle("hidden", !snapshotActive);
+  syncModeBadges();
   const transport = document.querySelector(".replay-transport");
   if (transport) transport.classList.toggle("hidden", snapshotActive);
   const armToggle = $("viz-arm");
@@ -2780,8 +3186,7 @@ function leaveReplay() {
     stage.classList.add("hidden");
     stage.classList.remove("snapshot-mode");
   }
-  if ($("snapshot-badge")) $("snapshot-badge").classList.add("hidden");
-  if ($("btn-snap-edit")) $("btn-snap-edit").classList.add("hidden");
+  syncModeBadges();
   const cams = $("cameras");
   if (cams) cams.classList.remove("replaying");
   document.querySelectorAll(".chart-wrap").forEach((el) => el.classList.remove("replay"));
@@ -2804,14 +3209,18 @@ function leaveReplay() {
   localLog("replay stopped");
 }
 
-function openEpisodeSelection() {
-  episodeSelectionClosed = false;
+function setEpisodePanelVisible(visible) {
+  episodeSelectionClosed = !visible;
   const episodes = $("episodes");
   const splitter = $("split-ep");
-  if (episodes) episodes.classList.remove("hidden");
-  if (splitter) splitter.classList.remove("hidden");
+  if (episodes) episodes.classList.toggle("hidden", !visible);
+  if (splitter) splitter.classList.toggle("hidden", !visible);
   const main = document.querySelector("main");
-  if (main) main.classList.remove("episodes-closed");
+  if (main) main.classList.toggle("episodes-closed", !visible);
+}
+
+function openEpisodeSelection() {
+  setEpisodePanelVisible(true);
 }
 
 function closeEpisodeSelection() {
@@ -2826,7 +3235,6 @@ function closeEpisodeSelection() {
   episodeLoading = false;
   episodeError = "";
   episodeDrafts.clear();
-  episodeSelectionClosed = true;
   vizState.kind = "";
   vizState.id = "";
   vizState.episode = 0;
@@ -2842,12 +3250,7 @@ function closeEpisodeSelection() {
   clearVizChunk();
   snapshotActive = false;
   activeSnapshot = null;
-  const episodes = $("episodes");
-  const splitter = $("split-ep");
-  if (episodes) episodes.classList.add("hidden");
-  if (splitter) splitter.classList.add("hidden");
-  const main = document.querySelector("main");
-  if (main) main.classList.add("episodes-closed");
+  setEpisodePanelVisible(false);
   renderVideos();
   renderDatasets();
   renderSnapshots();
@@ -3233,6 +3636,10 @@ function toggleVizPlay() {
 
 function fillReplayChart(chart, times, series, prefix, overlay = [], overlayStart = 0) {
   if (!chart) return;
+  // Replay charts own `chart.data.datasets` directly; drop the live-mode caches.
+  chart.$timeAxis = false;
+  chart.$live = [];
+  chart.$predictions = [];
   const keys = Object.keys(series).filter((key) => key.startsWith(prefix));
   const overlaySeries = new Map();
   (overlay || []).forEach((point) => {
@@ -3270,6 +3677,8 @@ function fillReplayChart(chart, times, series, prefix, overlay = [], overlayStar
       borderDash: [4, 3],
       pointRadius: 0,
       tension: 0.15,
+      // Predictions stay out of the legend: the dashed style already says "prediction".
+      $prediction: true,
     });
   });
   const timesEnd = times.length ? Math.max(0, Number(times[times.length - 1]) || 0) : 0;
@@ -3295,7 +3704,15 @@ function fillReplayChart(chart, times, series, prefix, overlay = [], overlayStar
       label: (context) => `${context.dataset.label}: ${Number(context.parsed.y).toFixed(4)}`,
     },
   };
-  chart.options.plugins.legend.display = chart.data.datasets.length > 0;
+  chart.options.plugins.legend = {
+    display: chart.data.datasets.some((dataset) => !dataset.$prediction),
+    labels: {
+      filter: (item) => {
+        const dataset = chart.data.datasets[item.datasetIndex];
+        return !dataset || !dataset.$prediction;
+      },
+    },
+  };
   chart.update("none");
   positionReplayChartCursor(chart);
 }
@@ -3303,6 +3720,9 @@ function fillReplayChart(chart, times, series, prefix, overlay = [], overlayStar
 function resetReplayCharts() {
   [stateChart, actionChart].forEach((chart) => {
     if (!chart) return;
+    chart.$timeAxis = false;
+    chart.$live = [];
+    chart.$predictions = [];
     chart.data.labels = [];
     chart.data.datasets = [];
     chart.options.plugins.legend.display = false;
@@ -3368,7 +3788,10 @@ function stopArmReplayLoop() {
 }
 
 function sampleArmJoints(elapsed) {
-  const { times, track } = vizState.arm;
+  return sampleJointSeries(vizState.arm.times, vizState.arm.track, elapsed);
+}
+
+function sampleJointSeries(times, track, elapsed) {
   const names = Object.keys(track);
   if (!times.length || !names.length || !times.every(Number.isFinite)) return null;
   const lastIndex = times.length - 1;
@@ -3685,27 +4108,300 @@ function renderModels() {
     const source = m.source === "hub" ? "hf cache" : m.source || "local";
     const parts = [m.name, m.policy_type, source].filter(Boolean);
     const label = parts.join("  ·  ");
+    const head = document.createElement("div");
+    head.className = "snap-head";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "lib-row-button";
     button.textContent = label;
     li.title = m.path || m.name;
     button.addEventListener("click", () => {
-      $("pol-path").value = m.path;
+      if (!m.path) {
+        localLog(`model ${m.name} has no weights yet — run Update first`, "error");
+        return;
+      }
+      if ($("pol-path")) $("pol-path").value = m.path;
       if ($("dbg-path")) $("dbg-path").value = m.path;
       persistUi();
     });
-    li.appendChild(button);
+    head.appendChild(button);
+    if (m.managed) {
+      const tools = document.createElement("span");
+      tools.className = "snap-tools";
+      const edit = makeSnapshotIconButton("md-edit", `Edit model ${m.id}`, LIBRARY_EDIT_ICON);
+      edit.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openModelEditor(li, m);
+      });
+      const update = makeSnapshotIconButton("md-update", `Update weights for ${m.id}`, MODEL_REFRESH_ICON);
+      update.addEventListener("click", (event) => {
+        event.stopPropagation();
+        updateModel(m.id);
+      });
+      const remove = makeSnapshotIconButton("md-del", `Remove model ${m.id}`, SNAPSHOT_ICONS.delete);
+      remove.addEventListener("click", (event) => {
+        event.stopPropagation();
+        deleteModel(m.id);
+      });
+      tools.append(edit, update, remove);
+      head.appendChild(tools);
+    }
+    li.appendChild(head);
+    if (m.managed) {
+      const meta = document.createElement("p");
+      meta.className = `model-meta${m.missing ? " warn" : ""}`;
+      const remote = m.remote || m.path || "no remote address";
+      meta.textContent = m.missing ? `${remote} · weights missing` : remote;
+      meta.title = m.path || remote;
+      li.appendChild(meta);
+      appendLibraryNote(li, "model", m.id, m);
+    }
     ol.appendChild(li);
     if (select) {
       const option = document.createElement("option");
       option.value = m.path;
       option.textContent = label;
+      option.disabled = !m.path;
       select.appendChild(option);
     }
   });
   if (select && selected) select.value = selected;
 }
+
+const MODEL_REFRESH_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v4h-4"/></svg>`;
+
+function modelLibraryStatus(message, isError = false) {
+  const status = $("md-status");
+  if (!status) return;
+  status.className = `library-status${isError ? " error" : ""}`;
+  status.textContent = message;
+}
+
+function modelHubStatus(message, isError = false) {
+  const status = $("md-hub-status");
+  if (!status) return;
+  status.className = `library-status${isError ? " error" : ""}`;
+  status.textContent = message;
+}
+
+function openModelEditor(li, model) {
+  const existing = li.querySelector(".model-editor");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+  const editor = document.createElement("div");
+  editor.className = "model-editor";
+  const name = document.createElement("input");
+  name.type = "text";
+  name.value = model.name || "";
+  name.placeholder = "display name";
+  name.setAttribute("aria-label", "Model name");
+  const remote = document.createElement("input");
+  remote.type = "text";
+  remote.value = model.remote || "";
+  remote.placeholder = "org/name, URL, or local path";
+  remote.setAttribute("aria-label", "Model remote address");
+  const revision = document.createElement("input");
+  revision.type = "text";
+  revision.value = model.revision || "";
+  revision.placeholder = "revision / branch (optional)";
+  revision.setAttribute("aria-label", "Model revision");
+  const actions = document.createElement("div");
+  actions.className = "row-actions";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.textContent = "Save";
+  const update = document.createElement("button");
+  update.type = "button";
+  update.className = "ghost";
+  update.textContent = "Update";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "ghost";
+  cancel.textContent = "Cancel";
+  save.addEventListener("click", async () => {
+    try {
+      const saved = await api(`/api/models/${encodeURIComponent(model.id)}`, {
+        name: name.value,
+        remote: remote.value,
+        revision: revision.value,
+      }, "PUT");
+      modelLibraryStatus(saved.warning ? `Saved with warning: ${saved.warning}` : `Saved ${saved.name}`, !!saved.warning);
+      await refreshLibrarySection("models");
+    } catch (err) {
+      modelLibraryStatus(err.message || String(err), true);
+    }
+  });
+  update.addEventListener("click", () => updateModel(model.id));
+  cancel.addEventListener("click", () => editor.remove());
+  actions.append(save, update, cancel);
+  editor.append(name, remote, revision, actions);
+  li.appendChild(editor);
+}
+
+async function addModelFromRemote(remote, name = "", download = true) {
+  const address = String(remote || "").trim();
+  if (!address) throw new Error("enter a model address first");
+  modelLibraryStatus(`adding ${address}…`);
+  try {
+    const saved = await api("/api/models", { remote: address, name, download });
+    modelLibraryStatus(saved.warning ? `Added ${saved.name} — ${saved.warning}` : `Added ${saved.name}`, !!saved.warning);
+    localLog(`model added: ${saved.name} (${saved.remote || saved.path})`);
+    await refreshLibrarySection("models");
+    return saved;
+  } catch (err) {
+    modelLibraryStatus(err.message || String(err), true);
+    throw err;
+  }
+}
+
+async function updateModel(modelId) {
+  modelLibraryStatus(`updating ${modelId}…`);
+  try {
+    const saved = await api(`/api/models/${encodeURIComponent(modelId)}/update`);
+    modelLibraryStatus(`Updated ${saved.name}${saved.warning ? ` — ${saved.warning}` : ""}`, !!saved.warning);
+    await refreshLibrarySection("models");
+  } catch (err) {
+    modelLibraryStatus(err.message || String(err), true);
+  }
+}
+
+async function deleteModel(modelId) {
+  if (!window.confirm(`Remove model ${modelId} from the library?`)) return;
+  try {
+    await api(`/api/models/${encodeURIComponent(modelId)}`, undefined, "DELETE");
+    modelLibraryStatus(`Removed ${modelId}`);
+    await refreshLibrarySection("models");
+  } catch (err) {
+    modelLibraryStatus(err.message || String(err), true);
+  }
+}
+
+async function searchModelHub() {
+  const query = $("md-search") ? $("md-search").value.trim() : "";
+  const list = $("md-hub-list");
+  if (!list) return;
+  list.innerHTML = "";
+  if (!query) {
+    modelHubStatus("Type a query to search the Hugging Face Hub", true);
+    return;
+  }
+  modelHubStatus(`searching “${query}”…`);
+  try {
+    const rows = await fetchJson(`/api/models/search?q=${encodeURIComponent(query)}`);
+    if (!Array.isArray(rows) || !rows.length) {
+      modelHubStatus("No matching model");
+      return;
+    }
+    modelHubStatus(`${rows.length} result${rows.length === 1 ? "" : "s"}`);
+    rows.forEach((row) => {
+      const li = document.createElement("li");
+      li.className = "hub-row";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "lib-row-button";
+      button.textContent = `${row.repo_id}  ·  ${row.downloads} downloads`;
+      button.addEventListener("click", () => {
+        if ($("md-remote")) $("md-remote").value = row.repo_id;
+        if ($("md-name")) $("md-name").value = row.repo_id;
+        addModelFromRemote(row.repo_id, row.repo_id).catch(toastError);
+      });
+      li.appendChild(button);
+      list.appendChild(li);
+    });
+  } catch (err) {
+    modelHubStatus(err.message || String(err), true);
+  }
+}
+
+function modelAddressFromManifest(payload, fallback = "") {
+  if (typeof payload === "string") return payload.trim() || fallback;
+  if (!payload || typeof payload !== "object") return fallback;
+  const keys = ["remote", "repo_id", "model_id", "path", "_name_or_path", "name_or_path", "id", "name"];
+  for (const key of keys) {
+    const value = String(payload[key] || "").trim();
+    if (value) return value;
+  }
+  return fallback;
+}
+
+async function addModelFromDroppedFile(file) {
+  if (!file) return;
+  const nativePath = String(file.path || "").trim();
+  if (nativePath) {
+    await addModelFromRemote(nativePath, file.name || nativePath);
+    return;
+  }
+  const text = await file.text();
+  let address = "";
+  try {
+    address = modelAddressFromManifest(JSON.parse(text));
+  } catch {
+    address = text.trim();
+  }
+  if (!address) {
+    throw new Error("the dropped file has no remote, repo_id, or path field");
+  }
+  if ($("md-remote")) $("md-remote").value = address;
+  const fallbackName = String(file.name || "").replace(/\.(json|txt)$/i, "");
+  await addModelFromRemote(address, fallbackName);
+}
+
+function bindModelDropZone() {
+  const zone = $("md-drop");
+  if (!zone) return;
+  ["dragenter", "dragover"].forEach((name) => {
+    zone.addEventListener(name, (event) => {
+      event.preventDefault();
+      zone.classList.add("drop-active");
+    });
+  });
+  ["dragleave", "drop"].forEach((name) => {
+    zone.addEventListener(name, () => zone.classList.remove("drop-active"));
+  });
+  zone.addEventListener("drop", async (event) => {
+    event.preventDefault();
+    const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+    if (!file) return;
+    try {
+      await addModelFromDroppedFile(file);
+    } catch (err) {
+      modelLibraryStatus(`drop failed: ${err.message || err}`, true);
+    }
+  });
+  zone.addEventListener("keydown", (event) => {
+    if (event.target !== zone) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    const input = $("md-file-input");
+    if (input) input.click();
+  });
+}
+
+bind("btn-md-search", searchModelHub);
+bind("btn-md-file", () => {
+  const input = $("md-file-input");
+  if (input) input.click();
+});
+bind("btn-md-add", () => {
+  const remote = $("md-remote") ? $("md-remote").value : "";
+  const name = $("md-name") ? $("md-name").value : "";
+  addModelFromRemote(remote, name).catch(toastError);
+});
+if ($("md-search")) {
+  $("md-search").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") searchModelHub();
+  });
+}
+if ($("md-file-input")) {
+  $("md-file-input").addEventListener("change", (event) => {
+    const file = event.target.files && event.target.files[0];
+    addModelFromDroppedFile(file).catch((err) => modelLibraryStatus(err.message || String(err), true));
+    event.target.value = "";
+  });
+}
+bindModelDropZone();
 
 const LIBRARY_CONFIG = {
   videos: { path: "/api/videos", group: "lib-videos", list: "vid-list", status: "vid-status", button: "btn-vid-refresh", render: renderVideos },

@@ -28,6 +28,7 @@ class JsonStore:
             "presets": {kind: {} for kind in PRESET_KINDS},
             "episode_overrides": {kind: {} for kind in EPISODE_KINDS},
             "library_overrides": {kind: {} for kind in LIBRARY_KINDS},
+            "models": [],
         }
         self._load()
         self._ensure_default_poses()
@@ -61,6 +62,9 @@ class JsonStore:
                 group = library_overrides.get(kind)
                 if isinstance(group, dict):
                     self._data["library_overrides"][kind] = group
+        models = raw.get("models")
+        if isinstance(models, list):
+            self._data["models"] = [dict(entry) for entry in models if isinstance(entry, dict)]
 
     def _ensure_default_poses(self) -> None:
         pose = self._data["presets"].setdefault("pose", {})
@@ -242,4 +246,41 @@ class JsonStore:
             raise KeyError(kind)
         with self._lock:
             self._data["library_overrides"][kind].pop(str(source_id), None)
+            self._write()
+
+    def models(self) -> list[dict[str, Any]]:
+        """User-registered models; the scan of local caches stays separate."""
+        with self._lock:
+            return [dict(entry) for entry in self._data["models"]]
+
+    def model(self, model_id: str) -> dict[str, Any] | None:
+        key = str(model_id)
+        with self._lock:
+            for entry in self._data["models"]:
+                if str(entry.get("id") or "") == key:
+                    return dict(entry)
+        return None
+
+    def put_model(self, entry: dict[str, Any]) -> dict[str, Any]:
+        key = str(entry.get("id") or "").strip()
+        if not key:
+            raise ValueError("model id is empty")
+        payload = dict(entry)
+        payload["id"] = key
+        with self._lock:
+            for index, saved in enumerate(self._data["models"]):
+                if str(saved.get("id") or "") == key:
+                    self._data["models"][index] = payload
+                    break
+            else:
+                self._data["models"].append(payload)
+            self._write()
+        return dict(payload)
+
+    def delete_model(self, model_id: str) -> None:
+        key = str(model_id)
+        with self._lock:
+            self._data["models"] = [
+                entry for entry in self._data["models"] if str(entry.get("id") or "") != key
+            ]
             self._write()

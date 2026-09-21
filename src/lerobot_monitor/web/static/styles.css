@@ -1060,6 +1060,7 @@ main.episodes-closed {
   margin-bottom: 8px;
   display: block;
 }
+.cam-dev .mini:not([src]) { visibility: hidden; }
 .pair {
   display: grid;
   grid-template-columns: 1fr 1fr;

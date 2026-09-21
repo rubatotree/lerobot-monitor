@@ -14,6 +14,9 @@ let ws;
 let busLive = false;
 let pendingLive = {};
 let liveTimer = null;
+let latestStatus = null;
+let replayResumeOnVisible = false;
+let pageVisible = !document.hidden;
 let camMenu = [];
 let lastPorts = [];
 let lastHwKey = "";
@@ -59,6 +62,68 @@ const MATCH_TOL = {
 };
 
 function $(id) { return document.getElementById(id); }
+
+let mjpegObserver = null;
+
+function deactivateMjpeg(img) {
+  if (!img || !img.hasAttribute("src")) return;
+  img.removeAttribute("src");
+  img.classList.remove("live");
+  const card = img.closest(".cam-card");
+  if (card) card.classList.remove("has-sig");
+}
+
+function activateMjpeg(img) {
+  if (!img || !pageVisible || img.dataset.mjpegVisible !== "1") return;
+  const src = img.dataset.mjpegSrc;
+  if (src && img.getAttribute("src") !== src) img.src = src;
+}
+
+function syncMjpegStreams() {
+  document.querySelectorAll("img[data-mjpeg-src]").forEach((img) => {
+    if (pageVisible && img.dataset.mjpegVisible === "1") activateMjpeg(img);
+    else deactivateMjpeg(img);
+  });
+}
+
+function ensureMjpegObserver() {
+  if (mjpegObserver || typeof IntersectionObserver !== "function") return mjpegObserver;
+  mjpegObserver = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      const img = entry.target;
+      img.dataset.mjpegVisible = entry.isIntersecting ? "1" : "0";
+      if (entry.isIntersecting) activateMjpeg(img);
+      else deactivateMjpeg(img);
+    });
+  }, { threshold: 0.01 });
+  return mjpegObserver;
+}
+
+function observeMjpeg(img) {
+  if (!img || !img.dataset.mjpegSrc) return;
+  const observer = ensureMjpegObserver();
+  if (observer) observer.observe(img);
+  else img.dataset.mjpegVisible = "1";
+  activateMjpeg(img);
+}
+
+const CHART_UPDATE_INTERVAL_MS = 150;
+let chartUpdateTimer = null;
+const pendingChartUpdates = new Set();
+
+function flushChartUpdates() {
+  chartUpdateTimer = null;
+  const charts = [...pendingChartUpdates];
+  pendingChartUpdates.clear();
+  charts.forEach((chart) => chart.update("none"));
+}
+
+function scheduleChartUpdate(chart) {
+  if (!chart || document.hidden) return;
+  pendingChartUpdates.add(chart);
+  if (chartUpdateTimer) return;
+  chartUpdateTimer = setTimeout(flushChartUpdates, CHART_UPDATE_INTERVAL_MS);
+}
 
 function fmt(n, d = 1) {
   if (n == null || Number.isNaN(n)) return "—";
@@ -289,7 +354,7 @@ function pushChart(chart, scalars, timeS = null) {
     });
   }
   syncChartDatasets(chart);
-  chart.update("none");
+  scheduleChartUpdate(chart);
 }
 
 function rolloutPredictionList() {
@@ -416,7 +481,7 @@ function applyRolloutOverlay(chart, now) {
     min: Math.max(0, now - ROLLOUT_WINDOW_S),
     max: Math.max(now, overlayEnd) + 0.25,
   };
-  chart.update("none");
+  scheduleChartUpdate(chart);
 }
 
 function renderRolloutOverlays(now) {
@@ -433,7 +498,7 @@ function clearRolloutPredictions() {
     if (!hasOverlay(chart)) return;
     chart.$predictions = [];
     syncChartDatasets(chart);
-    chart.update("none");
+    scheduleChartUpdate(chart);
   });
 }
 
@@ -557,8 +622,9 @@ function addCamCard(id, label, src, metaText) {
   card.innerHTML = `
     <div class="cam-lbl"><span data-cam-title="${id}">${label}</span><span data-cam-meta="${id}">${metaText || "…"}</span></div>
     <div class="no-sig">No signal</div>
-    <img alt="${label}" src="${src}"/>`;
+    <img alt="${label}"/>`;
   const img = card.querySelector("img");
+  img.dataset.mjpegSrc = src;
   img.addEventListener("load", () => {
     card.classList.add("has-sig");
     img.classList.add("live");
@@ -567,6 +633,7 @@ function addCamCard(id, label, src, metaText) {
   });
   host.appendChild(card);
   camCards[id] = card;
+  observeMjpeg(img);
   setCamGrid(Object.keys(camCards).length || 1);
   return card;
 }
@@ -574,6 +641,10 @@ function addCamCard(id, label, src, metaText) {
 function syncCamCards(ids) {
   Object.keys(camCards).forEach((id) => {
     if (!ids.includes(id)) {
+      if (mjpegObserver) {
+        const img = camCards[id].querySelector("img[data-mjpeg-src]");
+        if (img) mjpegObserver.unobserve(img);
+      }
       camCards[id].remove();
       delete camCards[id];
     }
@@ -613,6 +684,9 @@ function renderCamMenu(list) {
   const ae = document.activeElement;
   const focused = ae && root.contains(ae) && ["INPUT", "TEXTAREA", "SELECT"].includes(ae.tagName);
   if (focused) return;
+  if (mjpegObserver) {
+    root.querySelectorAll("img[data-mjpeg-src]").forEach((img) => mjpegObserver.unobserve(img));
+  }
   root.innerHTML = "";
   if (!camMenu.length) {
     root.innerHTML = `<p class="bus-hint">No devices. Rescan after plugging in a camera.</p>`;
@@ -653,7 +727,7 @@ function renderCamMenu(list) {
         <h3>${shown}</h3>
         <span class="${active ? "on" : "off"}">${statusText}</span>
       </header>
-      <img class="mini" alt="preview ${shown}" src="${BASE}/camera/${encodeURIComponent(name)}"/>
+      <img class="mini" alt="preview ${shown}" data-mjpeg-src="${BASE}/camera/${encodeURIComponent(name)}"/>
       <label>Name
         <input type="text" data-label="${name}" value="${shown}" placeholder="front / side"/>
       </label>
@@ -667,6 +741,7 @@ function renderCamMenu(list) {
       ${actions}`;
     root.appendChild(card);
   });
+  root.querySelectorAll("img[data-mjpeg-src]").forEach(observeMjpeg);
 }
 
 async function applyCamSize(name) {
@@ -893,9 +968,28 @@ function connectWs() {
   };
   ws.onerror = () => { $("ws-dot").className = "dot err"; };
   ws.onmessage = (ev) => {
-    try { applyStatus(JSON.parse(ev.data)); } catch { /* ignore */ }
+    try {
+      const data = JSON.parse(ev.data);
+      latestStatus = data;
+      if (!document.hidden) applyStatus(data);
+    } catch { /* ignore */ }
   };
 }
+
+document.addEventListener("visibilitychange", () => {
+  pageVisible = !document.hidden;
+  syncMjpegStreams();
+  if (!pageVisible) {
+    if (vizState.playing) {
+      replayResumeOnVisible = true;
+      pauseVizVideos();
+    }
+    return;
+  }
+  if (latestStatus) applyStatus(latestStatus);
+  if (replayResumeOnVisible && replayActive) playVizVideos();
+  replayResumeOnVisible = false;
+});
 
 function bind(id, fn) {
   const el = $(id);

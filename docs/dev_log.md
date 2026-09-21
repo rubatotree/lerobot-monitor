@@ -1,5 +1,17 @@
 # Dev log
 
+## 2026-09-21（Monitor 页面 GPU 降载）
+
+- 相机 MJPEG 改为可视区懒加载：主相机与 Hardware 小图只有进入视口且页面可见时才设置
+  `src`；面板折叠、滚出视口、进入 Replay 或页面隐藏时立即移除 `src`，关闭浏览器端持续
+  解码和 MJPEG 连接。
+- 页面隐藏时暂停 Replay 视频与时钟，停止接收状态后的重绘；恢复可见时只应用最新一帧
+  状态，并按原播放状态恢复视频。
+- 实时 Chart.js 更新合并为 150 ms 一次，WebSocket 突发消息不再逐条触发两张 canvas
+  重绘；Replay 拖动仍保留即时更新。
+- Chrome smoke `6/6` 通过：小图懒加载、折叠断开、页面隐藏断开全部流、恢复重连、图表
+  节流且无 console error。
+
 ## 2026-09-21（Disconnect 安全降级）
 
 - 新增 `_can_control_follower()`：只有 follower 已连接、非 E-STOP、无 pending 任务，且

@@ -9,6 +9,7 @@ import queue
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -17,7 +18,7 @@ from .cameras import CameraHub
 from .config import MonitorConfig
 from .leader import LeaderArm
 from .library import DatasetRecorder, VideoLibrary
-from .policy import LoadedPolicy, load_policy, predict_pose
+from .policy import ActionChunk, LoadedPolicy, load_policy, predict_action_chunk, predict_pose
 from .robot import FollowerArm
 from .store import JsonStore
 from .types import JOINT_ORDER, RELAX_POSE, lerp_pose, merge_partial
@@ -28,6 +29,9 @@ _LOG_SKIP_PREFIXES = ("uvicorn.access", "lerobot_monitor")
 # caches. Serializing only output capture still lets two loaders corrupt those
 # globals, including when separate ControlLoop instances exist in one process.
 _POLICY_LOAD_LOCK = threading.Lock()
+# Inference can retain policy state and mutate process-global torch/HF state just
+# like loading. The order is always inference -> load to avoid a lock inversion.
+_POLICY_INFER_LOCK = threading.Lock()
 _UI_LOG_LOCK = threading.Lock()
 _UI_LOG_HANDLERS: set[logging.Handler] = set()
 _UI_LOG_PREVIOUS_ROOT_LEVEL: int | None = None
@@ -164,6 +168,7 @@ class ControlLoop:
         self._policy_interval = 1.0 / max(1.0, self.effective_policy_fps)
         self._next_policy_t = 0.0
         self._policy_cache: dict[tuple[Any, ...], LoadedPolicy] = {}
+        self._debug_lease_token: str | None = None
         self._policy_generation = 0
         self._policy_job: _PolicyLoadJob | None = None
         self._policy_job_lock = threading.Lock()
@@ -204,6 +209,7 @@ class ControlLoop:
 
     def stop(self) -> None:
         self._stop.set()
+        self._clear_debug_lease()
         try:
             thread = self._thread
             if thread is not None:
@@ -267,10 +273,26 @@ class ControlLoop:
     def submit_nowait(self, kind: str, payload: dict[str, Any] | None = None) -> None:
         self._commands.put(Command(kind=kind, payload=payload or {}, reply=None))
 
+    def acquire_debug_lease(self, timeout: float = 8.0) -> dict[str, Any]:
+        """Reserve idle control ownership for one read-only inference request."""
+        return self.submit("debug_lease_acquire", timeout=timeout)
+
+    def release_debug_lease(self, token: str, timeout: float = 8.0) -> dict[str, Any]:
+        """Release a debug lease if it still belongs to ``token``."""
+        return self.submit("debug_lease_release", {"token": str(token)}, timeout=timeout)
+
+    def _clear_debug_lease(self) -> None:
+        self._debug_lease_token = None
+
+    def _require_no_debug_lease(self, action: str) -> None:
+        if self._debug_lease_token is not None:
+            raise RuntimeError(f"cannot {action} while model debug is active")
+
     def request_estop(self) -> dict[str, Any]:
         """Disable torque immediately; do not wait for the control-queue tick."""
         self._estop.set()
         self._cancel.set()
+        self._clear_debug_lease()
         with self._start_lock:
             self._start_generation += 1
         self._apply_estop()
@@ -280,6 +302,7 @@ class ControlLoop:
     def request_stop(self) -> dict[str, Any]:
         """Abort a pending start immediately; queue a real stop if a task is running."""
         self._cancel.set()
+        self._clear_debug_lease()
         with self._start_lock:
             self._start_generation += 1
         self._cancel_policy_load()
@@ -314,6 +337,7 @@ class ControlLoop:
     def _apply_estop(self) -> None:
         first = self.mode != "estop"
         self.mode = "estop"
+        self._clear_debug_lease()
         self.hold_when_idle = False
         self._slew_goal = None
         self._pending_release = None
@@ -339,6 +363,8 @@ class ControlLoop:
             return "estop"
         if self.pending:
             return "loading"
+        if self._debug_lease_token is not None:
+            return "debug"
         if self.mode == "idle" and self.follower.connected:
             return "hold" if self.hold_when_idle else "idle"
         if self.mode == "jogging":
@@ -348,6 +374,8 @@ class ControlLoop:
     def bus_owner(self) -> str:
         if self._estop.is_set() or self.mode == "estop":
             return "estop"
+        if self._debug_lease_token is not None:
+            return "debug"
         if not self.follower.connected:
             return "free"
         return {
@@ -400,21 +428,42 @@ class ControlLoop:
         return (path, device, tuple(sorted(extra.items())))
 
     def _get_or_load_policy(self, path: str, device: str, task: str, extra: dict[str, str]) -> LoadedPolicy:
-        key = self._policy_key(path, device, extra)
-        cached = self._policy_cache.get(key)
-        if cached is not None:
-            cached.task = task or cached.task
-            return cached
-        loaded = load_policy(
-            path,
-            device=device,
-            task=task,
-            robot_type=self.config.robot.type,
-            rename_map=self.config.rollout.rename_map,
-            extra=extra,
-        )
-        self._policy_cache[key] = loaded
-        return loaded
+        with _POLICY_LOAD_LOCK:
+            key = self._policy_key(path, device, extra)
+            cached = self._policy_cache.get(key)
+            if cached is not None:
+                cached.task = task or cached.task
+                return cached
+            loaded = load_policy(
+                path,
+                device=device,
+                task=task,
+                robot_type=self.config.robot.type,
+                rename_map=self.config.rollout.rename_map,
+                extra=extra,
+            )
+            self._policy_cache[key] = loaded
+            return loaded
+
+    def _cached_policy(self, path: str, device: str, extra: dict[str, str]) -> LoadedPolicy | None:
+        with _POLICY_LOAD_LOCK:
+            return self._policy_cache.get(self._policy_key(path, device, extra))
+
+    def infer_action_chunk(
+        self,
+        *,
+        path: str,
+        task: str,
+        device: str,
+        extra: dict[str, str],
+        joints: dict[str, float],
+        images_rgb: dict[str, Any],
+        chunk_size: int,
+    ) -> ActionChunk:
+        """Load or reuse a policy and infer without touching the follower bus."""
+        with _POLICY_INFER_LOCK, self._capture_task_output():
+            loaded = self._get_or_load_policy(path, device, task, extra)
+            return predict_action_chunk(loaded, joints, images_rgb, chunk_size)
 
     def _invalidate_policy_load(self, *, blocking: bool = True) -> bool:
         """Permanently detach the current loader without waiting for its thread."""
@@ -444,7 +493,7 @@ class ControlLoop:
         extra: dict[str, str],
     ) -> None:
         try:
-            with _POLICY_LOAD_LOCK, self._capture_task_output():
+            with _POLICY_INFER_LOCK, self._capture_task_output():
                 loaded = self._get_or_load_policy(path, device, task, extra)
             job.result = loaded
         except Exception as exc:  # noqa: BLE001
@@ -814,6 +863,7 @@ class ControlLoop:
     def _connect_follower(self) -> None:
         try:
             self.follower.connect()
+            self._clear_debug_lease()
             pose = self.follower.get_pose()
             self.joints = dict(pose)
             if not self.latched:
@@ -836,6 +886,7 @@ class ControlLoop:
         self._touch_bus()
 
     def _release_follower(self, reason: str) -> None:
+        self._clear_debug_lease()
         if not self.follower.connected:
             return
         self.follower.disconnect()
@@ -894,7 +945,12 @@ class ControlLoop:
             except queue.Empty:
                 return
             try:
-                if self._estop.is_set() and cmd.kind not in {"resume", "estop", "task_stop"}:
+                if self._estop.is_set() and cmd.kind not in {
+                    "resume",
+                    "estop",
+                    "task_stop",
+                    "debug_lease_release",
+                }:
                     self._reply(cmd, ok=False, error="estop")
                     continue
                 self._handle(cmd)
@@ -906,7 +962,24 @@ class ControlLoop:
     def _handle(self, cmd: Command) -> None:
         kind = cmd.kind
         p = cmd.payload
-        if kind == "connect_robot":
+        if kind == "debug_lease_acquire":
+            if self._debug_lease_token is not None:
+                self._reply(cmd, ok=False, error="model debug is already active")
+            elif self.pending is not None or self.writer is not None:
+                self._reply(cmd, ok=False, error="model debug requires no pending task or recording")
+            elif self.mode != "idle" or not self.follower.connected:
+                self._reply(cmd, ok=False, error="model debug requires an idle connected follower")
+            else:
+                self._debug_lease_token = uuid.uuid4().hex
+                self._reply(cmd, ok=True, token=self._debug_lease_token)
+        elif kind == "debug_lease_release":
+            token = str(p.get("token") or "")
+            released = bool(token and self._debug_lease_token == token)
+            if released:
+                self._clear_debug_lease()
+            self._reply(cmd, ok=True, released=released)
+        elif kind == "connect_robot":
+            self._require_no_debug_lease("connect follower")
             if p.get("port"):
                 self.follower.config.port = str(p["port"])
             if p.get("id"):
@@ -918,6 +991,7 @@ class ControlLoop:
                 self._remember_port("arm", self.follower.config.port)
             self._reply(cmd, ok=self.follower.connected, error=self.follower.error)
         elif kind == "disconnect_robot":
+            self._clear_debug_lease()
             self._close_writer()
             if self.follower.connected:
                 self._pending_release_reply = cmd.reply
@@ -944,6 +1018,7 @@ class ControlLoop:
             self.leader.disconnect()
             self._reply(cmd, ok=True)
         elif kind == "jog":
+            self._require_no_debug_lease("jog")
             if self.pending in {"teleop_start", "record_start", "rollout_start", "capture_start"}:
                 raise RuntimeError(f"cannot jog while {self.pending} is pending")
             if self.mode == "jogging" and bool(p.get("live")):
@@ -1003,6 +1078,7 @@ class ControlLoop:
             self.request_estop()
             self._reply(cmd, ok=True)
         elif kind == "task_stop":
+            self._clear_debug_lease()
             self._invalidate_policy_load()
             self._cancel.clear()
             stopped = self.mode
@@ -1042,6 +1118,7 @@ class ControlLoop:
                 path = self._close_writer()
                 self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
         elif kind == "resume":
+            self._require_no_debug_lease("resume")
             self._estop.clear()
             self._ensure_follower()
             self.follower.enable_torque()
@@ -1053,6 +1130,7 @@ class ControlLoop:
             self.log("info", "torque re-enabled, idle")
             self._reply(cmd, ok=True)
         elif kind == "teleop_start":
+            self._require_no_debug_lease("start teleop")
             start_token = self._start_token(p)
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"stop {self.mode} before starting teleop")
@@ -1099,6 +1177,7 @@ class ControlLoop:
                 self._touch_bus()
             self._reply(cmd, ok=True)
         elif kind == "record_start":
+            self._require_no_debug_lease("start recording")
             start_token = self._start_token(p)
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"stop {self.mode} before starting record")
@@ -1152,6 +1231,7 @@ class ControlLoop:
             self.log("info", f"episode {self.episode_index}")
             self._reply(cmd, ok=True, episode_index=self.episode_index)
         elif kind == "rollout_start":
+            self._require_no_debug_lease("start rollout")
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"stop {self.mode} before starting rollout")
             if self._aborted(cmd, "rollout"):
@@ -1169,7 +1249,7 @@ class ControlLoop:
             self.rollout_extra = {str(k): str(v) for k, v in extra.items() if str(k).strip()}
             device = str(p.get("device") or self.config.rollout.device)
             task = str(p.get("task") or "")
-            cached = self._policy_cache.get(self._policy_key(path, device, self.rollout_extra))
+            cached = self._cached_policy(path, device, self.rollout_extra)
             if cached is not None:
                 self.log("info", f"using cached policy {path}")
                 with self._policy_job_lock:
@@ -1207,6 +1287,7 @@ class ControlLoop:
             self._touch_bus()
             self._reply(cmd, ok=True, path=None if path is None else str(path))
         elif kind == "capture_start":
+            self._require_no_debug_lease("start capture")
             start_token = self._start_token(p)
             if self._aborted(cmd, "capture", start_token):
                 return
@@ -1244,12 +1325,14 @@ class ControlLoop:
                 self._apply_estop()
             return
         if not self.follower.connected:
+            self._clear_debug_lease()
             if self.mode not in {"offline", "estop"}:
                 self.mode = "offline"
             return
         try:
             self.joints = self.follower.get_pose()
         except Exception as exc:  # noqa: BLE001
+            self._clear_debug_lease()
             self.last_error = str(exc)
             self.log("error", f"read failed: {exc}")
             return
@@ -1264,11 +1347,12 @@ class ControlLoop:
             elif self.mode == "rollout":
                 self._tick_rollout()
             elif self.mode == "idle":
-                if self.hold_when_idle and self.latched:
+                if self._debug_lease_token is None and self.hold_when_idle and self.latched:
                     self.follower.send_pose(self.latched)
                     self.action = dict(self.latched)
                 self._maybe_record(self.record_kind or "capture")
         except Exception as exc:  # noqa: BLE001
+            self._clear_debug_lease()
             self.last_error = str(exc)
             self.log("error", f"{self.mode} tick failed: {exc}")
             if self.mode in {"rollout", "record", "teleop"}:

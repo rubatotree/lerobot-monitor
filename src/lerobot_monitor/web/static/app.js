@@ -24,7 +24,11 @@ let selectedVideoId = "";
 let selectedDatasetId = "";
 let videosCache = [];
 let datasetsCache = [];
+let snapshotsCache = [];
 let modelsCache = [];
+let activeSnapshot = null;
+let snapshotActive = false;
+let snapshotCaptureBusy = false;
 let episodeSource = null;
 let episodeRows = [];
 let expandedEpisode = null;
@@ -46,6 +50,7 @@ let replayScrubWasPlaying = false;
 const libraryState = {
   videos: { loading: false, error: "", generation: 0 },
   datasets: { loading: false, error: "", generation: 0 },
+  snapshots: { loading: false, error: "", generation: 0 },
   models: { loading: false, error: "", generation: 0 },
 };
 const MATCH_TOL = {
@@ -367,6 +372,8 @@ function addCamCard(id, label, src, metaText) {
   img.addEventListener("load", () => {
     card.classList.add("has-sig");
     img.classList.add("live");
+    syncSnapshotButton();
+    renderDebugPanel();
   });
   host.appendChild(card);
   camCards[id] = card;
@@ -618,6 +625,7 @@ function applyStatus(d) {
   if (d.task && (d.task.video_id || d.task.session_id)) {
     selectedVideoId = d.task.video_id || d.task.session_id;
   }
+  syncSnapshotButton();
   updateResumeTargetUi();
   setHwStatus("arm-status", robot);
   setHwStatus("leader-status", leader);
@@ -681,7 +689,21 @@ function bind(id, fn) {
   });
 }
 
-let savedPresets = { record: {}, rollout: {}, pose: {} };
+let savedPresets = { record: {}, rollout: {}, pose: {}, debug: {} };
+
+function presetSelectId(kind) {
+  if (kind === "record") return "rec-preset";
+  if (kind === "rollout") return "roll-preset";
+  if (kind === "debug") return "dbg-preset";
+  return "pose-preset";
+}
+
+function presetNameId(kind) {
+  if (kind === "record") return "rec-preset-name";
+  if (kind === "rollout") return "roll-preset-name";
+  if (kind === "debug") return "dbg-preset-name";
+  return "pose-preset-name";
+}
 
 function fillPresetSelect(id, group) {
   const sel = $(id);
@@ -700,6 +722,7 @@ function refreshPresetSelects() {
   fillPresetSelect("rec-preset", savedPresets.record);
   fillPresetSelect("roll-preset", savedPresets.rollout);
   fillPresetSelect("pose-preset", savedPresets.pose);
+  fillPresetSelect("dbg-preset", savedPresets.debug);
 }
 
 function setTaskButton(id, on, label) {
@@ -812,23 +835,28 @@ function applyRecordFields(p) {
   else if (p.resume && p.dataset_id) selectedVideoId = p.dataset_id;
   updateResumeTargetUi();
 }
-function kvPairs() {
+function kvPairs(hostId = "roll-kv") {
   const extra = {};
-  document.querySelectorAll("#roll-kv .kv-row").forEach((row) => {
+  const host = $(hostId);
+  if (!host) return extra;
+  host.querySelectorAll(".kv-row").forEach((row) => {
     const key = row.querySelector(".kv-k").value.trim();
     const value = row.querySelector(".kv-v").value;
     if (key) extra[key] = value;
   });
   return extra;
 }
-function setKvPairs(extra) {
-  const host = $("roll-kv");
+function setKvPairs(extra, hostId = "roll-kv", onChange = persistUi) {
+  const host = $(hostId);
+  if (!host) return;
   host.innerHTML = "";
   const entries = Object.entries(extra || {});
   if (!entries.length) entries.push(["", ""]);
-  entries.forEach(([key, value]) => addKvRow(key, value));
+  entries.forEach(([key, value]) => addKvRow(key, value, hostId, onChange));
 }
-function addKvRow(key = "", value = "") {
+function addKvRow(key = "", value = "", hostId = "roll-kv", onChange = persistUi) {
+  const host = $(hostId);
+  if (!host) return;
   const row = document.createElement("div");
   row.className = "kv-row";
   const k = document.createElement("input");
@@ -845,15 +873,15 @@ function addKvRow(key = "", value = "") {
   del.type = "button";
   del.className = "ghost kv-del";
   del.textContent = "×";
-  k.addEventListener("input", persistUi);
-  v.addEventListener("input", persistUi);
+  k.addEventListener("input", onChange);
+  v.addEventListener("input", onChange);
   del.addEventListener("click", () => {
     row.remove();
-    if (!$("roll-kv").children.length) addKvRow();
-    persistUi();
+    if (!host.children.length) addKvRow("", "", hostId, onChange);
+    onChange();
   });
   row.append(k, v, del);
-  $("roll-kv").appendChild(row);
+  host.appendChild(row);
 }
 function rolloutFields() {
   return {
@@ -1057,7 +1085,8 @@ async function saveNamedPreset(kind, name, payload) {
   await api(`/api/presets/${kind}/${encodeURIComponent(key)}`, payload, "PUT");
   savedPresets[kind][key] = payload;
   refreshPresetSelects();
-  $(kind === "record" ? "rec-preset" : kind === "rollout" ? "roll-preset" : "pose-preset").value = key;
+  const select = $(presetSelectId(kind));
+  if (select) select.value = key;
 }
 async function deleteNamedPreset(kind, name) {
   if (!name) return;
@@ -1084,7 +1113,7 @@ async function duplicateNamedPreset(kind, name) {
   if (!src || !name) throw new Error("select a preset to duplicate");
   const copy = uniquePresetName(kind, name);
   await saveNamedPreset(kind, copy, JSON.parse(JSON.stringify(src)));
-  const nameId = kind === "record" ? "rec-preset-name" : kind === "rollout" ? "roll-preset-name" : "pose-preset-name";
+  const nameId = presetNameId(kind);
   if ($(nameId)) $(nameId).value = copy;
 }
 
@@ -1402,6 +1431,14 @@ async function saveLibraryOverride(kind, sourceId, payload) {
   return saved;
 }
 
+async function saveSnapshotNote(snapshotId, note) {
+  const saved = await saveSnapshotFields(snapshotId, { note });
+  if (snapshotActive && activeSnapshot && activeSnapshot.id === snapshotId && replayActive) {
+    renderSnapshotHeader();
+  }
+  return saved;
+}
+
 function appendLibraryNote(li, kind, sourceId, row) {
   const noteButton = document.createElement("button");
   noteButton.type = "button";
@@ -1445,7 +1482,8 @@ function appendLibraryNote(li, kind, sourceId, row) {
     cancel.disabled = true;
     input.disabled = true;
     try {
-      await saveLibraryOverride(kind, sourceId, { note: input.value.trim() });
+      if (kind === "snapshot") await saveSnapshotNote(sourceId, input.value.trim());
+      else await saveLibraryOverride(kind, sourceId, { note: input.value.trim() });
     } catch (err) {
       toastError(err);
       closeEditor();
@@ -1524,6 +1562,615 @@ function renderDatasets() {
     ol.appendChild(li);
   });
 }
+
+const SNAPSHOT_ICONS = {
+  edit: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg>`,
+  duplicate: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11"/><path d="M5 15V4h11"/></svg>`,
+  delete: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/></svg>`,
+};
+
+function snapshotSourceLabel(snapshot) {
+  if (snapshot.origin === "replay" && snapshot.source) {
+    const parts = [snapshot.source.kind, snapshot.source.id].filter(Boolean);
+    if (snapshot.source.episode != null) parts.push(`ep ${snapshot.source.episode}`);
+    if (snapshot.source.elapsed_s != null) parts.push(`${Number(snapshot.source.elapsed_s).toFixed(2)}s`);
+    return parts.join(" · ") || "replay";
+  }
+  return "hardware";
+}
+
+function snapshotCameraCount(snapshot) {
+  const count = (snapshot.cameras || []).length;
+  return count ? `${count} cam` : "no image";
+}
+
+function makeSnapshotIconButton(className, label, icon) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `ghost icon-btn ${className}`;
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.innerHTML = icon;
+  return button;
+}
+
+function renderSnapshots() {
+  const ol = $("snap-list");
+  if (!ol) return;
+  ol.innerHTML = "";
+  if (!snapshotsCache.length) {
+    const state = libraryState.snapshots;
+    const message = state.loading
+      ? "Loading snapshots…"
+      : state.error ? `Could not load snapshots: ${state.error}` : "No snapshot yet";
+    ol.innerHTML = `<li class="library-message${state.error ? " error" : ""}">${message}</li>`;
+    return;
+  }
+  snapshotsCache.forEach((snapshot) => {
+    const li = document.createElement("li");
+    if (snapshotActive && activeSnapshot && activeSnapshot.id === snapshot.id) li.className = "sel";
+    const head = document.createElement("div");
+    head.className = "snap-head";
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "lib-row-button";
+    open.textContent = `${snapshot.name || snapshot.id}  ·  ${snapshotSourceLabel(snapshot)}  ·  ${snapshotCameraCount(snapshot)}`;
+    open.setAttribute("aria-pressed", String(li.classList.contains("sel")));
+    li.title = snapshot.description || snapshot.id;
+    open.addEventListener("click", () => openSnapshot(snapshot.id));
+    const tools = document.createElement("span");
+    tools.className = "snap-tools";
+    const edit = makeSnapshotIconButton("snap-edit", `Edit snapshot ${snapshot.id}`, SNAPSHOT_ICONS.edit);
+    edit.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openSnapshot(snapshot.id).then(() => openSnapshotEditor()).catch(toastError);
+    });
+    const duplicate = makeSnapshotIconButton("snap-dup", `Duplicate snapshot ${snapshot.id}`, SNAPSHOT_ICONS.duplicate);
+    duplicate.addEventListener("click", (event) => {
+      event.stopPropagation();
+      duplicateSnapshot(snapshot.id);
+    });
+    const remove = makeSnapshotIconButton("snap-del", `Delete snapshot ${snapshot.id}`, SNAPSHOT_ICONS.delete);
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteSnapshot(snapshot.id);
+    });
+    tools.append(edit, duplicate, remove);
+    head.append(open, tools);
+    li.appendChild(head);
+    appendLibraryNote(li, "snapshot", snapshot.id, snapshot);
+    ol.appendChild(li);
+  });
+}
+
+async function saveSnapshotFields(snapshotId, payload) {
+  const saved = await api(`/api/snapshots/${encodeURIComponent(snapshotId)}`, payload, "PUT");
+  const index = snapshotsCache.findIndex((row) => row.id === saved.id);
+  if (index >= 0) snapshotsCache[index] = saved;
+  if (activeSnapshot && activeSnapshot.id === saved.id) {
+    activeSnapshot = saved;
+    if (replayActive) renderSnapshotHeader();
+  }
+  renderSnapshots();
+  return saved;
+}
+
+async function duplicateSnapshot(snapshotId) {
+  const created = await api(`/api/snapshots/${encodeURIComponent(snapshotId)}/duplicate`);
+  await refreshLibrarySection("snapshots");
+  localLog(`snapshot duplicated: ${created.id}`);
+}
+
+async function deleteSnapshot(snapshotId) {
+  if (!window.confirm(`Delete snapshot ${snapshotId}?`)) return;
+  await api(`/api/snapshots/${encodeURIComponent(snapshotId)}`, undefined, "DELETE");
+  if (snapshotActive && activeSnapshot && activeSnapshot.id === snapshotId) closeEpisodeSelection();
+  await refreshLibrarySection("snapshots");
+  localLog(`snapshot deleted: ${snapshotId}`);
+}
+
+function renderSnapshotHeader() {
+  const title = $("replay-title");
+  if (title) {
+    const snapshot = activeSnapshot || {};
+    const name = snapshot.name || snapshot.id || "snapshot";
+    title.textContent = `${name} · ${snapshotSourceLabel(snapshot)}`;
+    title.title = snapshot.description || name;
+  }
+}
+
+function openSnapshotEditor() {
+  const host = $("dbg-snap-editor");
+  const snapshot = activeSnapshot;
+  if (!host || !snapshot) return;
+  host.classList.remove("hidden");
+  host.innerHTML = "";
+  const fields = {};
+  [["name", "Name"], ["task", "Task"]].forEach(([key, label]) => {
+    const row = document.createElement("label");
+    row.textContent = label;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = snapshot[key] || "";
+    input.setAttribute("aria-label", `Snapshot ${key}`);
+    fields[key] = input;
+    row.appendChild(input);
+    host.appendChild(row);
+  });
+  [["note", "Note"], ["description", "Description"]].forEach(([key, label]) => {
+    const row = document.createElement("label");
+    row.textContent = label;
+    const input = document.createElement("textarea");
+    input.rows = key === "note" ? 2 : 3;
+    input.value = snapshot[key] || "";
+    input.setAttribute("aria-label", `Snapshot ${key}`);
+    fields[key] = input;
+    row.appendChild(input);
+    host.appendChild(row);
+  });
+  const actions = document.createElement("div");
+  actions.className = "row-actions";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.textContent = "Save";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "ghost";
+  cancel.textContent = "Close";
+  actions.append(save, cancel);
+  host.appendChild(actions);
+  const close = () => {
+    host.classList.add("hidden");
+    host.innerHTML = "";
+  };
+  cancel.addEventListener("click", close);
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    cancel.disabled = true;
+    try {
+      const payload = {};
+      Object.entries(fields).forEach(([key, input]) => { payload[key] = input.value.trim(); });
+      await saveSnapshotFields(snapshot.id, payload);
+      close();
+    } catch (err) {
+      toastError(err);
+    } finally {
+      save.disabled = false;
+      cancel.disabled = false;
+    }
+  });
+  fields.name.focus();
+}
+
+function snapshotCameraUrl(snapshotId, key) {
+  return `${BASE}/api/snapshots/${encodeURIComponent(snapshotId)}/camera/${encodeURIComponent(key)}`;
+}
+
+function renderSnapshotCams(snapshot) {
+  const host = $("viz-cams");
+  if (!host) return;
+  host.innerHTML = "";
+  const cameras = snapshot.cameras || [];
+  host.classList.toggle("multi", cameras.length > 1);
+  host.classList.toggle("snapshot-view", true);
+  if (!cameras.length) {
+    renderReplayMessage("This snapshot has no camera image.");
+    return;
+  }
+  cameras.forEach((camera) => {
+    const wrap = document.createElement("div");
+    wrap.className = "viz-cam snapshot-cam";
+    const label = document.createElement("span");
+    const size = camera.width && camera.height ? ` · ${camera.width}×${camera.height}` : "";
+    label.textContent = `${camera.key}${size}`;
+    const img = document.createElement("img");
+    img.alt = `snapshot ${camera.key}`;
+    img.addEventListener("load", () => {
+      syncSnapshotButton();
+      renderDebugPanel();
+    });
+    img.src = snapshotCameraUrl(snapshot.id, camera.key);
+    wrap.append(label, img);
+    host.appendChild(wrap);
+  });
+  setReplayStatus("Snapshot");
+}
+
+function snapshotJointHistory(joints, duration, includeFinal) {
+  const names = Object.keys(joints || {});
+  const times = includeFinal && duration > 0 ? [0, duration] : [0];
+  const series = {};
+  names.forEach((name) => {
+    const value = Number(joints[name]);
+    if (!Number.isFinite(value)) return;
+    series[`obs.${name}`] = times.map(() => value);
+  });
+  return { t: times, series };
+}
+
+function renderSnapshotCharts(snapshot) {
+  const overlay = chunkOverlayPoints();
+  const duration = overlay.length ? overlay[overlay.length - 1].x : 0;
+  if (duration > 0) vizState.duration = duration;
+  const history = snapshotJointHistory(snapshot.joints || {}, duration, duration > 0);
+  const hasState = Object.keys(history.series).length > 0;
+  fillReplayChart(stateChart, hasState ? history.t : [], hasState ? history.series : {}, "obs.", [], 0);
+  fillReplayChart(actionChart, [], {}, "act.", overlay, 0);
+}
+
+async function openSnapshot(snapshotId) {
+  const snapshot = await fetchJson(`/api/snapshots/${encodeURIComponent(snapshotId)}`);
+  if (replayActive) leaveReplay();
+  previewRequestGeneration += 1;
+  activeSnapshot = snapshot;
+  snapshotActive = true;
+  vizState.kind = "snapshot";
+  vizState.id = snapshot.id;
+  vizState.episode = 0;
+  vizState.episodes = 1;
+  vizState.duration = 0;
+  vizState.elapsed = 0;
+  vizState.times = [0];
+  vizState.arm = { times: [], track: {} };
+  vizState.previewMeta = "snapshot";
+  vizState.previewReady = true;
+  vizState.previewGeneration = previewRequestGeneration;
+  vizState.snapshot = snapshot;
+  clearVizChunk();
+  enterReplay();
+  const stage = $("replay");
+  if (stage) stage.classList.add("snapshot-mode");
+  const seek = $("replay-seek");
+  if (seek) {
+    seek.disabled = true;
+    seek.value = "0";
+  }
+  if ($("viz-t")) $("viz-t").value = "snapshot";
+  renderSnapshotHeader();
+  renderSnapshotCams(snapshot);
+  renderSnapshotCharts(snapshot);
+  renderSnapshots();
+  renderDebugPanel();
+  localLog(`snapshot opened: ${snapshot.id}`);
+  return snapshot;
+}
+
+const SNAPSHOT_JPEG_QUALITY = 0.85;
+const SNAPSHOT_MAX_CAMERAS = 12;
+
+function mediaFrameDataUrl(media) {
+  if (!media) return "";
+  const width = Number(media.naturalWidth || media.videoWidth || 0);
+  const height = Number(media.naturalHeight || media.videoHeight || 0);
+  if (!width || !height) return "";
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) return "";
+  try {
+    context.drawImage(media, 0, 0, width, height);
+    return canvas.toDataURL("image/jpeg", SNAPSHOT_JPEG_QUALITY);
+  } catch {
+    return "";
+  }
+}
+
+function cameraKeyFromLabel(label) {
+  return String(label || "").split("·")[0].trim();
+}
+
+function replayCameraKeys() {
+  return [...document.querySelectorAll("#viz-cams .viz-cam span")]
+    .map((label) => cameraKeyFromLabel(label.textContent))
+    .filter(Boolean);
+}
+
+function stageCameraFrames() {
+  const frames = [];
+  document.querySelectorAll("#viz-cams .viz-cam").forEach((wrap, index) => {
+    const media = wrap.querySelector("video") || wrap.querySelector("img");
+    const jpeg = mediaFrameDataUrl(media);
+    if (!jpeg) return;
+    const label = wrap.querySelector("span");
+    frames.push({
+      key: cameraKeyFromLabel(label && label.textContent) || `cam${index + 1}`,
+      jpeg_base64: jpeg,
+    });
+  });
+  return frames;
+}
+
+function hardwareCameraFrames() {
+  const frames = [];
+  ((last && last.cameras) || []).forEach((cam) => {
+    if (!cam.enabled || !cam.show_main) return;
+    const card = camCards[String(cam.name)];
+    const jpeg = card ? mediaFrameDataUrl(card.querySelector("img")) : "";
+    if (!jpeg) return;
+    frames.push({ key: String(cam.label || cam.name), jpeg_base64: jpeg });
+  });
+  return frames;
+}
+
+function cameraFrameAvailable() {
+  const media = [...document.querySelectorAll("#viz-cams .viz-cam")]
+    .map((wrap) => wrap.querySelector("video") || wrap.querySelector("img"));
+  return media.some((item) => Number(item && (item.naturalWidth || item.videoWidth)) > 0);
+}
+
+function hardwareCameraAvailable() {
+  return Object.values(camCards).some((card) => {
+    const img = card && card.querySelector("img");
+    return Number(img && img.naturalWidth) > 0;
+  });
+}
+
+function snapshotCaptureAvailable() {
+  if (snapshotActive && activeSnapshot) {
+    return Object.keys(activeSnapshot.joints || {}).length > 0 || cameraFrameAvailable();
+  }
+  if (replayActive && vizState.previewReady) {
+    return !!sampleArmJoints(vizState.elapsed) || cameraFrameAvailable();
+  }
+  if (last && last.joints && Object.keys(last.joints).length) return true;
+  return hardwareCameraAvailable();
+}
+
+function syncSnapshotButton() {
+  const button = $("btn-hdr-snapshot");
+  if (!button) return;
+  const available = snapshotCaptureAvailable();
+  button.disabled = snapshotCaptureBusy || !available;
+  button.classList.toggle("pending", snapshotCaptureBusy);
+  if (snapshotCaptureBusy) {
+    button.title = "Saving snapshot…";
+    return;
+  }
+  const origin = snapshotActive ? "snapshot" : replayActive ? "replay" : "hardware";
+  button.title = available
+    ? `Save the current joints and camera frames as a snapshot (${origin})`
+    : "No joint state or camera frame available to snapshot";
+}
+
+function snapshotCapturePlan() {
+  if (snapshotActive && activeSnapshot) {
+    const joints = { ...(activeSnapshot.joints || {}) };
+    const frames = stageCameraFrames();
+    if (!Object.keys(joints).length && !frames.length) return null;
+    return {
+      origin: "replay",
+      source: { kind: "snapshot", id: activeSnapshot.id },
+      task: activeSnapshot.task || "",
+      joints,
+      frames,
+      name: `snapshot-${activeSnapshot.id}`,
+    };
+  }
+  if (replayActive && vizState.previewReady && vizState.kind) {
+    const elapsed = Math.max(0, Number(vizState.elapsed) || 0);
+    const joints = sampleArmJoints(elapsed) || {};
+    const frames = stageCameraFrames();
+    if (!Object.keys(joints).length && !frames.length) return null;
+    return {
+      origin: "replay",
+      source: {
+        kind: vizState.kind,
+        id: vizState.id,
+        episode: vizState.episode,
+        elapsed_s: Number(elapsed.toFixed(3)),
+      },
+      task: vizState.task || "",
+      joints,
+      frames,
+      name: `replay-${vizState.kind}-ep${vizState.episode}-${elapsed.toFixed(2)}s`,
+    };
+  }
+  const joints = { ...((last && last.joints) || {}) };
+  const frames = hardwareCameraFrames();
+  if (!Object.keys(joints).length && !frames.length) return null;
+  return { origin: "hardware", source: null, task: "", joints, frames, name: "hardware" };
+}
+
+async function captureSnapshot() {
+  if (snapshotCaptureBusy) return;
+  const plan = snapshotCapturePlan();
+  if (!plan) throw new Error("no joint state or camera frame to snapshot");
+  snapshotCaptureBusy = true;
+  syncSnapshotButton();
+  try {
+    const created = await api("/api/snapshots", {
+      name: plan.name,
+      task: plan.task,
+      origin: plan.origin,
+      source: plan.source,
+      joints: plan.joints,
+      cameras: plan.frames.slice(0, SNAPSHOT_MAX_CAMERAS),
+    });
+    await refreshLibrarySection("snapshots");
+    localLog(`snapshot saved: ${created.id} · ${Object.keys(plan.joints).length} joints · ${plan.frames.length} cam`);
+  } finally {
+    snapshotCaptureBusy = false;
+    syncSnapshotButton();
+  }
+}
+
+function debugSourceInfo() {
+  if (snapshotActive && activeSnapshot) {
+    return {
+      label: `snapshot ${activeSnapshot.id}`,
+      source: { kind: "snapshot", id: activeSnapshot.id },
+      task: activeSnapshot.task || "",
+      joints: { ...(activeSnapshot.joints || {}) },
+      cameras: (activeSnapshot.cameras || []).map((camera) => camera.key),
+      overlayStart: 0,
+    };
+  }
+  if (replayActive && vizState.previewReady && vizState.kind) {
+    const elapsed = Math.max(0, Number(vizState.elapsed) || 0);
+    const joints = sampleArmJoints(elapsed);
+    if (!joints) return null;
+    return {
+      label: `${vizState.kind} ${vizState.id} · ep ${vizState.episode} · ${elapsed.toFixed(2)}s`,
+      source: {
+        kind: vizState.kind,
+        id: vizState.id,
+        episode: vizState.episode,
+        elapsed_s: Number(elapsed.toFixed(3)),
+      },
+      task: vizState.task || "",
+      joints,
+      cameras: replayCameraKeys(),
+      overlayStart: elapsed,
+    };
+  }
+  return null;
+}
+
+function debugFields() {
+  return {
+    policy_path: ($("dbg-path") ? $("dbg-path").value : "").trim(),
+    task: $("dbg-task") ? $("dbg-task").value : "",
+    device: ($("dbg-dev") ? $("dbg-dev").value : "").trim() || "cuda",
+    extra: kvPairs("dbg-kv"),
+    chunk_size: Number($("dbg-chunk") ? $("dbg-chunk").value : 0) || 16,
+    fps: Number($("dbg-fps") ? $("dbg-fps").value : 0) || 30,
+    camera_map: kvPairs("dbg-cam-map"),
+  };
+}
+
+function applyDebugFields(preset) {
+  if (!preset) return;
+  if (preset.policy_path != null && $("dbg-path")) $("dbg-path").value = preset.policy_path;
+  if (preset.task != null && $("dbg-task")) $("dbg-task").value = preset.task;
+  if (preset.device != null && $("dbg-dev")) $("dbg-dev").value = preset.device;
+  if (preset.chunk_size != null && $("dbg-chunk")) $("dbg-chunk").value = preset.chunk_size;
+  if (preset.fps != null && $("dbg-fps")) $("dbg-fps").value = preset.fps;
+  if (preset.extra != null) setKvPairs(preset.extra, "dbg-kv", () => {});
+  if (preset.camera_map != null) setKvPairs(preset.camera_map, "dbg-cam-map", () => {});
+  const select = $("dbg-policy");
+  if (select && preset.policy_path) select.value = preset.policy_path;
+}
+
+function ensureDebugCameraRows(keys) {
+  const host = $("dbg-cam-map");
+  if (!host) return;
+  const known = new Set(
+    [...host.querySelectorAll(".kv-k")].map((input) => input.value.trim()).filter(Boolean),
+  );
+  const rows = [...host.querySelectorAll(".kv-row")];
+  const placeholder = rows.length === 1 && !rows[0].querySelector(".kv-k").value.trim() ? rows[0] : null;
+  (keys || []).forEach((key) => {
+    if (!key || known.has(key)) return;
+    known.add(key);
+    if (placeholder && !placeholder.querySelector(".kv-k").value.trim()) {
+      placeholder.querySelector(".kv-k").value = key;
+      placeholder.querySelector(".kv-v").value = `observation.images.${key}`;
+      return;
+    }
+    addKvRow(key, `observation.images.${key}`, "dbg-cam-map", () => {});
+  });
+  if (!host.children.length) addKvRow("", "", "dbg-cam-map", () => {});
+}
+
+function setDebugStatus(message, isError = false) {
+  const status = $("dbg-status");
+  if (!status) return;
+  status.className = `hw-status${isError ? " error" : ""}`;
+  status.textContent = message;
+}
+
+function syncDebugActions() {
+  const send = $("btn-dbg-send");
+  if (!send) return;
+  const actions = vizState.chunk && Array.isArray(vizState.chunk.actions) ? vizState.chunk.actions : [];
+  send.disabled = !actions.length;
+}
+
+function renderDebugPanel() {
+  const source = debugSourceInfo();
+  const hasCamera = cameraFrameAvailable();
+  const label = $("dbg-source");
+  if (label) {
+    if (!source) label.textContent = "source: open an episode or snapshot";
+    else if (!hasCamera) label.textContent = `source: ${source.label} · waiting for a camera frame`;
+    else label.textContent = `source: ${source.label} · ${Object.keys(source.joints).length} joints · ${source.cameras.length} cam`;
+  }
+  const taskInput = $("dbg-task");
+  if (source && source.task && taskInput && !taskInput.value.trim()) taskInput.value = source.task;
+  if (source) ensureDebugCameraRows(source.cameras);
+  const run = $("btn-dbg-run");
+  if (run) run.disabled = !source || !hasCamera;
+  syncDebugActions();
+}
+
+function renderChunkOverlay() {
+  if (snapshotActive && activeSnapshot) renderSnapshotCharts(activeSnapshot);
+  else if (replayActive) renderVizChartsFromState();
+}
+
+async function runDebugInference() {
+  const source = debugSourceInfo();
+  if (!source) throw new Error("open an episode or snapshot first");
+  const fields = debugFields();
+  if (!fields.policy_path) throw new Error("policy path is required");
+  const frames = stageCameraFrames();
+  if (!frames.length) throw new Error("no camera frame available for inference");
+  clearVizChunk();
+  const run = $("btn-dbg-run");
+  if (run) run.disabled = true;
+  setDebugStatus("running inference…");
+  try {
+    const result = await api("/api/debug/infer", {
+      ...fields,
+      source: source.source,
+      joints: source.joints,
+      cameras: frames.slice(0, SNAPSHOT_MAX_CAMERAS),
+    });
+    vizState.chunk = { ...result, start: source.overlayStart };
+    syncDebugActions();
+    renderChunkOverlay();
+    const warnings = (result.warnings || []).join(" · ");
+    setDebugStatus(
+      `${result.strategy}${result.degraded ? " · degraded" : ""} · ${result.actions.length} steps · ${Number(result.latency_ms).toFixed(0)} ms${warnings ? ` · ${warnings}` : ""}`,
+    );
+    localLog(`debug inference: ${result.strategy} · ${result.actions.length} steps · ${Number(result.latency_ms).toFixed(0)} ms`);
+  } catch (err) {
+    setDebugStatus(err.message || String(err), true);
+    throw err;
+  } finally {
+    renderDebugPanel();
+  }
+}
+
+async function sendDebugFirstStep() {
+  const actions = vizState.chunk && vizState.chunk.actions;
+  if (!actions || !actions.length) throw new Error("run inference first");
+  await api("/api/joints", { joints: actions[0].joints, duration_s: 0, live: true });
+  localLog("debug chunk: sent first step to the robot");
+}
+
+bind("btn-hdr-snapshot", captureSnapshot);
+bind("btn-dbg-run", runDebugInference);
+bind("btn-dbg-send", sendDebugFirstStep);
+bind("btn-dbg-kv-add", () => addKvRow("", "", "dbg-kv", () => {}));
+bind("btn-dbg-save", () => saveNamedPreset("debug", $("dbg-preset-name").value || $("dbg-preset").value, debugFields()));
+bind("btn-dbg-load", () => applyDebugFields(savedPresets.debug[$("dbg-preset").value]));
+bind("btn-dbg-dup", () => duplicateNamedPreset("debug", $("dbg-preset").value));
+bind("btn-dbg-del", () => deleteNamedPreset("debug", $("dbg-preset").value));
+if ($("dbg-preset")) {
+  $("dbg-preset").addEventListener("change", () => {
+    $("dbg-preset-name").value = $("dbg-preset").value;
+    applyDebugFields(savedPresets.debug[$("dbg-preset").value]);
+  });
+}
+if ($("dbg-policy")) {
+  $("dbg-policy").addEventListener("change", () => {
+    if ($("dbg-policy").value && $("dbg-path")) $("dbg-path").value = $("dbg-policy").value;
+  });
+}
+if ($("dbg-kv") && !$("dbg-kv").children.length) addKvRow("", "", "dbg-kv", () => {});
+if ($("dbg-cam-map") && !$("dbg-cam-map").children.length) addKvRow("", "", "dbg-cam-map", () => {});
 
 const EPISODE_ICONS = {
   play: `<svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="8 5 19 12 8 19 8 5" fill="currentColor" stroke="none"/></svg>`,
@@ -2008,11 +2655,23 @@ const vizState = {
   previewReady: false,
   previewGeneration: 0,
   title: "",
+  task: "",
   previewMeta: "",
   times: [],
   arm: { times: [], track: {} },
   autoplay: false,
+  snapshot: null,
+  series: {},
+  chunk: null,
 };
+
+function clearVizChunk() {
+  if (!vizState.chunk) return;
+  vizState.chunk = null;
+  syncDebugActions();
+  if (snapshotActive && activeSnapshot) renderSnapshotCharts(activeSnapshot);
+  else if (replayActive) renderVizChartsFromState();
+}
 
 function jointNames() {
   return meta.joints && meta.joints.length ? meta.joints : JOINT_FALLBACK;
@@ -2071,11 +2730,19 @@ function enterReplay() {
     seek.disabled = !vizState.previewReady;
     seek.value = "0";
   }
+  if ($("snapshot-badge")) $("snapshot-badge").classList.toggle("hidden", !snapshotActive);
+  if ($("btn-snap-edit")) $("btn-snap-edit").classList.toggle("hidden", !snapshotActive);
+  const transport = document.querySelector(".replay-transport");
+  if (transport) transport.classList.toggle("hidden", snapshotActive);
+  const armToggle = $("viz-arm");
+  if (armToggle) armToggle.classList.toggle("hidden", snapshotActive);
   if ($("chart-action-title")) $("chart-action-title").textContent = "Control state";
   syncArmToggle();
   syncReplayPlayState();
   syncReplayAvailability();
   renderEpisodes();
+  syncSnapshotButton();
+  renderDebugPanel();
 }
 
 function leaveReplay() {
@@ -2091,11 +2758,28 @@ function leaveReplay() {
   vizState.playing = false;
   vizState.previewReady = false;
   vizState.elapsed = 0;
+  clearVizChunk();
+  snapshotActive = false;
+  activeSnapshot = null;
+  vizState.snapshot = null;
+  const debugEditor = $("dbg-snap-editor");
+  if (debugEditor) {
+    debugEditor.classList.add("hidden");
+    debugEditor.innerHTML = "";
+  }
   vizVideos().forEach((video) => video.pause());
   const host = $("viz-cams");
-  if (host) host.innerHTML = "";
+  if (host) {
+    host.innerHTML = "";
+    host.classList.remove("snapshot-view");
+  }
   const stage = $("replay");
-  if (stage) stage.classList.add("hidden");
+  if (stage) {
+    stage.classList.add("hidden");
+    stage.classList.remove("snapshot-mode");
+  }
+  if ($("snapshot-badge")) $("snapshot-badge").classList.add("hidden");
+  if ($("btn-snap-edit")) $("btn-snap-edit").classList.add("hidden");
   const cams = $("cameras");
   if (cams) cams.classList.remove("replaying");
   document.querySelectorAll(".chart-wrap").forEach((el) => el.classList.remove("replay"));
@@ -2112,6 +2796,9 @@ function leaveReplay() {
   syncReplayPlayState();
   syncReplayAvailability();
   renderEpisodes();
+  renderSnapshots();
+  renderDebugPanel();
+  syncSnapshotButton();
   localLog("replay stopped");
 }
 
@@ -2149,6 +2836,10 @@ function closeEpisodeSelection() {
   vizState.previewReady = false;
   vizState.previewGeneration = 0;
   vizState.arm = { times: [], track: {} };
+  vizState.snapshot = null;
+  clearVizChunk();
+  snapshotActive = false;
+  activeSnapshot = null;
   const episodes = $("episodes");
   const splitter = $("split-ep");
   if (episodes) episodes.classList.add("hidden");
@@ -2157,8 +2848,11 @@ function closeEpisodeSelection() {
   if (main) main.classList.add("episodes-closed");
   renderVideos();
   renderDatasets();
+  renderSnapshots();
   renderEpisodes();
   updateResumeTargetUi();
+  renderDebugPanel();
+  syncSnapshotButton();
 }
 
 function exitReplay() {
@@ -2276,6 +2970,7 @@ function setReplayElapsed(elapsed) {
   vizState.elapsed = Math.min(duration, Math.max(0, Number(elapsed) || 0));
   vizState.clockBaseElapsed = vizState.elapsed;
   vizState.clockStartedAt = performance.now();
+  clearVizChunk();
   syncReplayMedia(vizState.elapsed);
   updateReplayBar(vizState.elapsed, duration);
 }
@@ -2470,6 +3165,8 @@ function renderVizCams(cameras, generation) {
       refreshReplayDuration();
       syncVideoToElapsed(video, vizState.elapsed, vizState.playing);
       updateReplayBar(vizState.elapsed, vizState.duration);
+      syncSnapshotButton();
+      renderDebugPanel();
       if (vizState.autoplay && !vizState.playing) playVizVideos();
     });
     video.addEventListener("timeupdate", onVizTime);
@@ -2532,19 +3229,50 @@ function toggleVizPlay() {
   else pauseVizVideos();
 }
 
-function fillReplayChart(chart, times, series, prefix) {
+function fillReplayChart(chart, times, series, prefix, overlay = [], overlayStart = 0) {
   if (!chart) return;
   const keys = Object.keys(series).filter((key) => key.startsWith(prefix));
+  const overlaySeries = new Map();
+  (overlay || []).forEach((point) => {
+    const x = overlayStart + (Number(point.x) || 0);
+    Object.entries(point.joints || {}).forEach(([name, value]) => {
+      const y = Number(value);
+      if (!Number.isFinite(y)) return;
+      if (!overlaySeries.has(name)) overlaySeries.set(name, []);
+      overlaySeries.get(name).push({ x, y });
+    });
+  });
+  const seriesIndex = new Map(keys.map((key, index) => [key.slice(prefix.length), index]));
+  overlaySeries.forEach((_points, name) => {
+    if (!seriesIndex.has(name)) seriesIndex.set(name, seriesIndex.size);
+  });
   chart.data.labels = [];
-  chart.data.datasets = keys.map((key, i) => ({
-    label: key.slice(prefix.length),
-    data: times.map((time, index) => ({ x: Number(time), y: Number(series[key][index]) })),
-    borderColor: PAL[i % PAL.length],
-    borderWidth: 1.2,
-    pointRadius: 0,
-    tension: 0.15,
-  }));
-  const seriesEnd = times.length ? Math.max(0, Number(times[times.length - 1]) || 0) : 0;
+  chart.data.datasets = [];
+  keys.forEach((key) => {
+    const name = key.slice(prefix.length);
+    chart.data.datasets.push({
+      label: name,
+      data: times.map((time, index) => ({ x: Number(time), y: Number(series[key][index]) })),
+      borderColor: PAL[seriesIndex.get(name) % PAL.length],
+      borderWidth: 1.2,
+      pointRadius: 0,
+      tension: 0.15,
+    });
+  });
+  overlaySeries.forEach((points, name) => {
+    chart.data.datasets.push({
+      label: `${name} · pred`,
+      data: points,
+      borderColor: PAL[seriesIndex.get(name) % PAL.length],
+      borderWidth: 1.3,
+      borderDash: [4, 3],
+      pointRadius: 0,
+      tension: 0.15,
+    });
+  });
+  const timesEnd = times.length ? Math.max(0, Number(times[times.length - 1]) || 0) : 0;
+  const overlayEnd = (overlay || []).reduce((max, point) => Math.max(max, overlayStart + (Number(point.x) || 0)), 0);
+  const seriesEnd = Math.max(timesEnd, overlayEnd);
   const domainMax = Math.max(1, vizState.duration || 0, seriesEnd);
   chart.$replaySeriesEnd = seriesEnd;
   chart.$replayCursorTime = Math.min(domainMax, Math.max(0, vizState.elapsed || 0));
@@ -2565,7 +3293,7 @@ function fillReplayChart(chart, times, series, prefix) {
       label: (context) => `${context.dataset.label}: ${Number(context.parsed.y).toFixed(4)}`,
     },
   };
-  chart.options.plugins.legend.display = keys.length > 0;
+  chart.options.plugins.legend.display = chart.data.datasets.length > 0;
   chart.update("none");
   positionReplayChartCursor(chart);
 }
@@ -2588,8 +3316,32 @@ function resetReplayCharts() {
 function renderVizChart(data) {
   const series = data.series || {};
   const times = (data.t || []).map(Number);
+  vizState.series = series;
+  vizState.times = times;
   fillReplayChart(stateChart, times, series, "obs.");
-  fillReplayChart(actionChart, times, series, "act.");
+  fillReplayChart(actionChart, times, series, "act.", chunkOverlayPoints(), chunkOverlayStart());
+}
+
+function renderVizChartsFromState() {
+  const times = vizState.times || [];
+  const series = vizState.series || {};
+  fillReplayChart(stateChart, times, series, "obs.");
+  fillReplayChart(actionChart, times, series, "act.", chunkOverlayPoints(), chunkOverlayStart());
+}
+
+function chunkOverlayPoints() {
+  const chunk = vizState.chunk;
+  if (!chunk || !Array.isArray(chunk.actions)) return [];
+  const fps = Number(chunk.fps) || 30;
+  return chunk.actions.map((action, index) => ({
+    x: Number(action.t_s) || (index + 1) / fps,
+    joints: action.joints || {},
+  }));
+}
+
+function chunkOverlayStart() {
+  if (!vizState.chunk) return 0;
+  return snapshotActive ? 0 : Number(vizState.chunk.start) || 0;
 }
 
 function armReplayTrack(data) {
@@ -2735,6 +3487,8 @@ async function loadPreview(kind, id, episode, autoplay = false) {
   vizState.times = [];
   vizState.arm = { times: [], track: {} };
   vizState.previewMeta = "";
+  vizState.task = "";
+  clearVizChunk();
   enterReplay();
   resetReplayCharts();
   syncArmToggle();
@@ -2767,6 +3521,7 @@ async function loadPreview(kind, id, episode, autoplay = false) {
   vizState.elapsed = 0;
   vizState.previewMeta = previewMetadataLabel(data);
   vizState.arm = armReplayTrack(data);
+  vizState.task = data.task || "";
   vizState.autoplay = !!autoplay;
   vizState.previewReady = true;
   vizState.previewGeneration = generation;
@@ -2788,6 +3543,8 @@ async function loadPreview(kind, id, episode, autoplay = false) {
   updateReplayBar(0, vizState.duration);
   renderVizChart(data);
   renderVizCams(cameras, generation);
+  renderDebugPanel();
+  syncSnapshotButton();
   if (autoplay) playVizVideos();
   if (autoplay && !cameras.length) localLog("episode has no video; replaying series timeline only");
   return true;
@@ -2912,6 +3669,9 @@ function renderModels() {
   const ol = $("md-list");
   if (!ol) return;
   ol.innerHTML = "";
+  const select = $("dbg-policy");
+  const selected = select ? select.value : "";
+  if (select) select.innerHTML = `<option value="">—</option>`;
   if (!modelsCache.length) {
     const state = libraryState.models;
     const message = state.loading ? "Loading policies…" : state.error ? `Could not load policies: ${state.error}` : "No local policy found";
@@ -2922,23 +3682,33 @@ function renderModels() {
     const li = document.createElement("li");
     const source = m.source === "hub" ? "hf cache" : m.source || "local";
     const parts = [m.name, m.policy_type, source].filter(Boolean);
+    const label = parts.join("  ·  ");
     const button = document.createElement("button");
     button.type = "button";
     button.className = "lib-row-button";
-    button.textContent = parts.join("  ·  ");
+    button.textContent = label;
     li.title = m.path || m.name;
     button.addEventListener("click", () => {
       $("pol-path").value = m.path;
+      if ($("dbg-path")) $("dbg-path").value = m.path;
       persistUi();
     });
     li.appendChild(button);
     ol.appendChild(li);
+    if (select) {
+      const option = document.createElement("option");
+      option.value = m.path;
+      option.textContent = label;
+      select.appendChild(option);
+    }
   });
+  if (select && selected) select.value = selected;
 }
 
 const LIBRARY_CONFIG = {
   videos: { path: "/api/videos", group: "lib-videos", list: "vid-list", status: "vid-status", button: "btn-vid-refresh", render: renderVideos },
   datasets: { path: "/api/datasets", group: "lib-datasets", list: "ds-list", status: "ds-status", button: "btn-ds-refresh", render: renderDatasets },
+  snapshots: { path: "/api/snapshots", group: "lib-snapshots", list: "snap-list", status: "snap-status", button: "btn-snap-refresh", render: renderSnapshots },
   models: { path: "/api/models", group: "lib-models", list: "md-list", status: "md-status", button: "btn-md-refresh", render: renderModels },
 };
 
@@ -2972,6 +3742,7 @@ async function refreshLibrarySection(kind) {
     if (generation !== state.generation) return;
     if (kind === "videos") videosCache = rows;
     else if (kind === "datasets") datasetsCache = rows;
+    else if (kind === "snapshots") snapshotsCache = rows;
     else modelsCache = rows;
   } catch (err) {
     if (generation === state.generation) state.error = err.message || String(err);
@@ -3013,6 +3784,7 @@ function syncEpisodeSource(refreshedKind = "") {
 
 bind("btn-vid-refresh", () => refreshLibrarySection("videos"));
 bind("btn-ds-refresh", () => refreshLibrarySection("datasets"));
+bind("btn-snap-refresh", () => refreshLibrarySection("snapshots"));
 bind("btn-md-refresh", () => refreshLibrarySection("models"));
 
 function fillPortSelect(id, ports, connectedPort, fallback) {

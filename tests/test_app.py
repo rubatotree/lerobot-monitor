@@ -18,6 +18,7 @@ from lerobot_monitor.config import (
     RobotConfig,
     ServerConfig,
 )
+from lerobot_monitor.policy import ActionChunk
 
 
 def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
@@ -596,3 +597,160 @@ def test_snapshot_routes(tmp_path: Path, monkeypatch) -> None:
         deleted = client.delete(f"/lerobot/api/snapshots/{snapshot_id}")
         assert deleted.status_code == 200
         assert client.get(f"/lerobot/api/snapshots/{snapshot_id}").status_code == 404
+
+
+def _debug_config(tmp_path: Path) -> MonitorConfig:
+    return MonitorConfig(
+        store_path=tmp_path / "store.json",
+        server=ServerConfig(port=0, base_path="/lerobot"),
+        robot=RobotConfig(auto_connect=False, port="COM_UNUSED"),
+        cameras=CamerasConfig(probe=False),
+        recording=RecordingConfig(root=tmp_path / "videos"),
+        library=LibraryConfig(
+            videos_root=tmp_path / "videos",
+            snapshots_root=tmp_path / "snapshots",
+            models_roots=[],
+        ),
+    )
+
+
+def _jpeg_base64(width: int = 24, height: int = 16) -> str:
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    ok, encoded = cv2.imencode(".jpg", image)
+    assert ok
+    return base64.b64encode(encoded.tobytes()).decode("ascii")
+
+
+def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+    hub = app.state.hub
+    hub.loop.acquire_debug_lease = MagicMock(return_value={"ok": True, "token": "lease-1"})
+    hub.loop.release_debug_lease = MagicMock(return_value={"ok": True, "released": True})
+    hub.loop.infer_action_chunk = MagicMock(
+        return_value=ActionChunk(
+            actions=[{"gripper": 1.0}, {"gripper": 2.0}],
+            strategy="policy_chunk",
+            degraded=False,
+            warnings=[],
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/lerobot/api/debug/infer",
+            json={
+                "policy_path": "fake/policy",
+                "task": "pick cube",
+                "device": "cpu",
+                "chunk_size": 2,
+                "fps": 10.0,
+                "camera_map": {"front": "observation.images.front"},
+                "source": {"kind": "video", "id": "v1", "episode": 0, "elapsed_s": 1.5},
+                "joints": {"gripper": 0.0},
+                "cameras": [{"key": "front", "jpeg_base64": _jpeg_base64()}],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["strategy"] == "policy_chunk"
+    assert body["degraded"] is False
+    assert body["fps"] == 10.0
+    assert [row["t_s"] for row in body["actions"]] == [0.1, 0.2]
+    assert body["actions"][1]["joints"] == {"gripper": 2.0}
+    assert body["source"]["id"] == "v1"
+    kwargs = hub.loop.infer_action_chunk.call_args.kwargs
+    assert kwargs["path"] == "fake/policy"
+    assert kwargs["device"] == "cpu"
+    assert kwargs["chunk_size"] == 2
+    assert sorted(kwargs["images_rgb"]) == ["front"]
+    assert kwargs["images_rgb"]["front"].shape == (16, 24, 3)
+    hub.loop.release_debug_lease.assert_called_once_with("lease-1")
+
+
+def test_debug_infer_reports_busy_lease_as_conflict(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+    hub = app.state.hub
+    hub.loop.acquire_debug_lease = MagicMock(
+        return_value={"ok": False, "error": "model debug is already active"}
+    )
+    hub.loop.release_debug_lease = MagicMock()
+    hub.loop.infer_action_chunk = MagicMock()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/lerobot/api/debug/infer",
+            json={"policy_path": "fake/policy", "joints": {"gripper": 0.0}},
+        )
+
+    assert response.status_code == 409
+    assert "already active" in response.json()["detail"]
+    hub.loop.infer_action_chunk.assert_not_called()
+    hub.loop.release_debug_lease.assert_not_called()
+
+
+def test_debug_infer_reports_policy_failure_and_still_releases(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+    hub = app.state.hub
+    hub.loop.acquire_debug_lease = MagicMock(return_value={"ok": True, "token": "lease-2"})
+    hub.loop.release_debug_lease = MagicMock(return_value={"ok": True, "released": True})
+    hub.loop.infer_action_chunk = MagicMock(side_effect=RuntimeError("policy not found"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/lerobot/api/debug/infer",
+            json={"policy_path": "missing/policy", "joints": {"gripper": 0.0}},
+        )
+
+    assert response.status_code == 400
+    assert "policy not found" in response.json()["detail"]
+    hub.loop.release_debug_lease.assert_called_once_with("lease-2")
+
+
+def test_debug_infer_rejects_oversized_camera_payload(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+    hub = app.state.hub
+    hub.loop.acquire_debug_lease = MagicMock()
+    hub.loop.infer_action_chunk = MagicMock()
+
+    oversized = "A" * (8 * 1024 * 1024 + 1)
+    with TestClient(app) as client:
+        response = client.post(
+            "/lerobot/api/debug/infer",
+            json={
+                "policy_path": "fake/policy",
+                "joints": {"gripper": 0.0},
+                "cameras": [{"key": "front", "jpeg_base64": oversized}],
+            },
+        )
+
+    assert response.status_code == 413
+    hub.loop.acquire_debug_lease.assert_not_called()
+    hub.loop.infer_action_chunk.assert_not_called()
+
+
+def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        page = client.get("/lerobot/")
+
+    assert page.status_code == 200
+    for marker in (
+        'id="btn-hdr-snapshot"',
+        'id="lib-snapshots"',
+        'id="snap-list"',
+        'id="btn-snap-edit"',
+        'id="dbg-snap-editor"',
+        'data-panel="debug"',
+        'id="btn-dbg-run"',
+        'id="btn-dbg-send"',
+        'id="dbg-cam-map"',
+    ):
+        assert marker in page.text

@@ -249,7 +249,7 @@ Windows 硬件侧采用“单一设备所有者、generation 失效、有界关�
 
 ## 后续里程碑（2026-09-21）：Snapshot 库、可编辑备注与 VLA Model Debug
 
-状态：实施中。
+状态：已完成实现与可运行回归验证；真实硬件与浏览器视觉验证未在本轮执行。
 
 ### 架构动机
 
@@ -304,3 +304,34 @@ rollout、jog、relax 等动作入口互斥。lease 只授予 idle（含 hold）
   action chunk；Model Debug 可保存 preset、映射相机、运行推理并发送首步。
 - `pytest`、`node --check`、`git diff --check` 通过；硬件与浏览器验证边界在
   `docs/dev_log.md` 中明确记录。
+
+### 最终实现与验证
+
+- `SnapshotLibrary` 以 `snapshots_root/<id>/snapshot.json` 为唯一记录，目录名是权威 ID；
+  扫描时忽略 JSON 内旧 ID、跳过损坏目录、校验 ID 与解析路径，并提供相机 JPEG 与
+  `preview.jpg`（首张相机图缩放到宽 ≤ 320）静态文件路由。
+- 快照 API 覆盖创建、列表、读取、编辑、复制、删除与文件服务；相机载荷为 JSON +
+  base64 JPEG，单张 ≤ 8 MiB、相机数 ≤ 12、解码总量 ≤ 48 MiB，超限统一返回 413。
+- `JsonStore.library_overrides` 保存 video/dataset 的 note 与 description，并在
+  `/api/videos`、`/api/datasets`、`/api/episodes` 合并；episode description 以 override
+  优先于数据集自带描述，删除来源时同步清理 override。
+- `ControlLoop` 新增 debug lease：仅在 idle（含 hold）且无 pending 任务时授予 token，
+  `display_mode()` 显示 `debug`，teleop/record/rollout/jog/resume/capture 等入口被拒绝，
+  E-STOP、断连、Stop 与任务切换自动清除；lease 生效时不再发送 hold 位姿。
+- `policy.predict_action_chunk` 优先使用 `policy.predict_action_chunk`（`(B, T, A)`），
+  不支持或返回非法形状时回退逐帧 `select_action` 并标记 `degraded`；两条路径统一
+  postprocess、`observation_to_pose` 映射、输入关节补齐与 `chunk_size` 截断。
+- `POST /api/debug/infer` 返回 `strategy`、`degraded`、`latency_ms`、`fps`、`actions` 与
+  `warnings`；lease 冲突为 409，策略加载或推理失败为 400，推理在 `asyncio.to_thread`
+  中执行并在 `finally` 释放 lease。
+- Web 侧新增顶部快照按钮、Snapshots Library 分组、快照编辑面板与快照查看模式（静态
+  相机图、两点扁平状态线、chunk 图），以及 Model Debug 面板：preset、模型下拉、task、
+  device、extra 参数、chunk_size、fps、相机映射、Run、状态行与 Send first step。
+- action chunk 以同色虚线从当前 elapsed 向右叠加到 command action 图；快照模式从 0 起
+  整段显示；切换 episode、打开 snapshot、拖动时间轴、离开回放或重新 Run 都会清空 chunk。
+- 自动化结果为 `103 passed, 2 skipped`（排除 `test_sim`），并通过 `node --check` 与
+  `git diff --check`；包含 `test_sim` 时为 `126 passed, 2 skipped, 5 failed/errored`，
+  非通过项全部来自当前 venv 缺少 `scservo_sdk`。
+- 未执行真实硬件与浏览器视觉验证：快照抓帧、note/description 行内编辑、chunk overlay
+  与 Send first step 的手动清单仍待在有机械臂与相机的环境确认；`test_sim` 因当前 venv
+  缺少 `scservo_sdk` 无法运行，与本次改动无关。

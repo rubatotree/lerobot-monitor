@@ -106,6 +106,16 @@ class LoadedPolicy:
             self.postprocessor.reset()
 
 
+@dataclass
+class ActionChunk:
+    """One predicted action chunk plus the path used to obtain it."""
+
+    actions: list[dict[str, float]]
+    strategy: str
+    degraded: bool
+    warnings: list[str]
+
+
 def load_policy(
     path: str,
     *,
@@ -225,3 +235,115 @@ def predict_pose(
         merged.update(pose)
         return merged
     return pose
+
+
+def _action_pose(
+    action: Any,
+    loaded: LoadedPolicy,
+    fallback_joints: Mapping[str, float],
+) -> dict[str, float]:
+    """Map one policy action tensor or mapping to a complete joint pose."""
+    from lerobot.policies.utils import make_robot_action
+
+    try:
+        robot_action = make_robot_action(action, loaded.dataset_features)
+    except Exception:
+        if isinstance(action, dict):
+            robot_action = {str(key): float(value) for key, value in action.items()}
+        else:
+            flat = action.squeeze(0).detach().cpu().tolist()
+            robot_action = {
+                key: float(flat[index])
+                for index, key in enumerate(loaded.ordered_action_keys)
+                if index < len(flat)
+            }
+    pose = observation_to_pose(robot_action)
+    merged = {name: float(fallback_joints[name]) for name in JOINT_ORDER if name in fallback_joints}
+    merged.update(pose)
+    return merged
+
+
+def _as_action_chunk_tensor(value: Any) -> Any:
+    """Normalize a policy chunk result to a batched ``(B, T, A)`` tensor."""
+    import torch
+
+    from lerobot.utils.constants import ACTION
+
+    if isinstance(value, Mapping):
+        value = value.get(ACTION, value.get("action"))
+    tensor = torch.as_tensor(value)
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim != 3:
+        raise ValueError(f"expected action chunk shape (B, T, A), got {tuple(tensor.shape)}")
+    if tensor.shape[0] < 1 or tensor.shape[1] < 1 or tensor.shape[2] < 1:
+        raise ValueError(f"action chunk must be non-empty, got {tuple(tensor.shape)}")
+    return tensor
+
+
+def predict_action_chunk(
+    loaded: LoadedPolicy,
+    joints: Mapping[str, float],
+    images_rgb: Mapping[str, np.ndarray],
+    chunk_size: int,
+) -> ActionChunk:
+    """Predict up to ``chunk_size`` actions from one observation.
+
+    The native path calls ``policy.predict_action_chunk`` and expects a
+    ``(B, T, A)`` tensor before the postprocessor. Policies without that API,
+    or whose chunk result is malformed, fall back to repeated
+    ``select_action`` calls and report ``degraded=True``.
+    """
+    import torch
+
+    from lerobot.policies.utils import prepare_observation_for_inference
+    from lerobot.utils.constants import ACTION, OBS_STR
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    state = np.array([float(joints[name]) for name in JOINT_ORDER if name in joints], dtype=np.float32)
+    observation: dict[str, np.ndarray] = {f"{OBS_STR}.state": state}
+    for cam_name, rgb in images_rgb.items():
+        observation[f"{OBS_STR}.images.{cam_name}"] = np.ascontiguousarray(rgb)
+
+    device = torch.device(loaded.device if torch.cuda.is_available() or loaded.device == "cpu" else "cpu")
+    warnings: list[str] = []
+    with torch.inference_mode():
+        loaded.reset()
+        prepared = prepare_observation_for_inference(
+            observation, device, loaded.task, loaded.robot_type
+        )
+        prepared = loaded.preprocessor(prepared)
+        chunk_method = getattr(loaded.policy, "predict_action_chunk", None)
+        if callable(chunk_method):
+            try:
+                raw_chunk = chunk_method(prepared)
+                chunk = _as_action_chunk_tensor(raw_chunk)[:, :chunk_size, :]
+                actions = [
+                    _action_pose(loaded.postprocessor(chunk[:, index, :]), loaded, joints)
+                    for index in range(chunk.shape[1])
+                ]
+                if actions:
+                    return ActionChunk(
+                        actions=actions,
+                        strategy="policy_chunk",
+                        degraded=False,
+                        warnings=warnings,
+                    )
+                warnings.append("policy returned an empty action chunk")
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"native action chunk unavailable: {exc}")
+        else:
+            warnings.append("policy does not implement predict_action_chunk")
+
+        loaded.reset()
+        actions = []
+        for _ in range(chunk_size):
+            action = loaded.policy.select_action(prepared)
+            actions.append(_action_pose(loaded.postprocessor(action), loaded, joints))
+    return ActionChunk(
+        actions=actions,
+        strategy="sequential_select_action",
+        degraded=True,
+        warnings=warnings,
+    )

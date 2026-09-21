@@ -1,4 +1,5 @@
 import logging
+import queue
 import threading
 import time
 from pathlib import Path
@@ -28,6 +29,13 @@ def _loop(tmp_path: Path) -> ControlLoop:
     leader.connected = False
     leader.snapshot.return_value = {"connected": False}
     return ControlLoop(config, cameras, follower, leader)
+
+
+def _dispatch(loop: ControlLoop, kind: str, payload: dict[str, object] | None = None) -> dict:
+    """Run one command synchronously and return the handler reply."""
+    reply: queue.Queue[dict] = queue.Queue(maxsize=1)
+    loop._handle(Command(kind, payload or {}, reply))
+    return reply.get(timeout=1)
 
 
 def test_recorder_resume_is_explicit_and_root_is_honored(tmp_path: Path) -> None:
@@ -148,6 +156,98 @@ def test_jog_is_rejected_while_task_start_is_pending(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="pending"):
         loop._handle(Command("jog", {"joints": {"gripper": 1.0}}))
+
+    loop.follower.send_pose.assert_not_called()
+
+
+def test_debug_lease_requires_idle_connected_follower(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+
+    assert _dispatch(loop, "debug_lease_acquire") == {
+        "ok": False,
+        "error": "model debug requires an idle connected follower",
+    }
+
+    loop.mode = "idle"
+    loop.pending = "rollout_start"
+    assert _dispatch(loop, "debug_lease_acquire")["ok"] is False
+    loop.pending = None
+
+    granted = _dispatch(loop, "debug_lease_acquire")
+    assert granted["ok"] is True
+    assert granted["token"]
+    assert loop.display_mode() == "debug"
+    assert loop.bus_owner() == "debug"
+    assert _dispatch(loop, "debug_lease_acquire")["error"] == "model debug is already active"
+
+
+def test_debug_lease_release_requires_matching_token(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    loop.hold_when_idle = False
+    token = str(_dispatch(loop, "debug_lease_acquire")["token"])
+
+    stale = _dispatch(loop, "debug_lease_release", {"token": "not-the-token"})
+    assert stale == {"ok": True, "released": False}
+    assert loop._debug_lease_token == token
+
+    assert _dispatch(loop, "debug_lease_release", {"token": token}) == {"ok": True, "released": True}
+    assert loop._debug_lease_token is None
+    assert loop.display_mode() == "idle"
+
+
+def test_estop_and_disconnect_clear_debug_lease(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    _dispatch(loop, "debug_lease_acquire")
+
+    loop.request_estop()
+
+    assert loop._debug_lease_token is None
+    assert loop.display_mode() == "estop"
+
+
+def test_serial_loss_clears_debug_lease(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    _dispatch(loop, "debug_lease_acquire")
+    loop.follower.connected = False
+
+    loop._tick()
+
+    assert loop._debug_lease_token is None
+
+
+@pytest.mark.parametrize(
+    "kind,payload",
+    [
+        ("teleop_start", {}),
+        ("record_start", {}),
+        ("rollout_start", {"policy_path": "fake/policy"}),
+        ("jog", {"joints": {"gripper": 1.0}}),
+        ("resume", {}),
+    ],
+)
+def test_debug_lease_blocks_control_commands(tmp_path: Path, kind: str, payload: dict) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    _dispatch(loop, "debug_lease_acquire")
+
+    with pytest.raises(RuntimeError, match="model debug is active"):
+        loop._handle(Command(kind, dict(payload)))
+
+    assert loop.mode == "idle"
+    loop.follower.send_pose.assert_not_called()
+
+
+def test_debug_lease_does_not_hold_pose_while_idle(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    loop.hold_when_idle = True
+    loop.latched = {"gripper": 5.0}
+    _dispatch(loop, "debug_lease_acquire")
+
+    loop._tick()
 
     loop.follower.send_pose.assert_not_called()
 

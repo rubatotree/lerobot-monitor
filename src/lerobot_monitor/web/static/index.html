@@ -54,6 +54,10 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="7 4 20 12 7 20 7 4"/></svg>
         <span class="hdr-lbl">rollout</span>
       </button>
+      <button type="button" id="btn-hdr-snapshot" class="hdr-icon" title="Save the current joints and camera frames as a snapshot">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.2"/></svg>
+        snap
+      </button>
       <button type="button" id="btn-hdr-capture" class="hdr-icon" title="Record main-view cameras">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/></svg>
         rec
@@ -94,6 +98,14 @@
           </div>
           <p id="ds-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="ds-list" class="lib-list" aria-busy="false"></ol>
+        </section>
+        <section class="library-group" id="lib-snapshots" aria-labelledby="lib-snapshots-title">
+          <div class="library-heading">
+            <h3 id="lib-snapshots-title">Snapshots</h3>
+            <button type="button" id="btn-snap-refresh" class="ghost">Refresh</button>
+          </div>
+          <p id="snap-status" class="library-status" role="status" aria-live="polite"></p>
+          <ol id="snap-list" class="lib-list" aria-busy="false"></ol>
         </section>
         <section class="library-group" id="lib-models" aria-labelledby="lib-models-title">
           <div class="library-heading">
@@ -142,11 +154,16 @@
         <header class="replay-bar">
           <div class="replay-info">
             <span class="replay-tag">REPLAY</span>
+            <span id="snapshot-badge" class="replay-tag snapshot hidden">SNAPSHOT</span>
             <span id="replay-title">—</span>
             <span id="replay-status" class="replay-status" role="status" aria-live="polite"></span>
             <button type="button" id="viz-arm" class="ghost arm-toggle" title="Replay actions on robot (off)" aria-label="Replay actions on robot" aria-pressed="false">
               <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="7" width="14" height="11" rx="2"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><path d="M12 7V4"/></svg>
               <span id="viz-arm-label">arm off</span>
+            </button>
+            <button type="button" id="btn-snap-edit" class="ghost arm-toggle hidden" title="Edit snapshot name, task, note and description">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg>
+              <span>edit</span>
             </button>
           </div>
           <div class="replay-transport" role="group" aria-label="Replay transport">
@@ -367,6 +384,59 @@
         <div class="task-block">
           <h3>Cameras</h3>
           <div id="cam-rows"></div>
+        </div>
+        </div>
+        </section>
+
+      <section class="panel" id="debug-panel" data-panel="debug">
+        <button type="button" class="panel-toggle" aria-expanded="true">
+          <h2>Model Debug</h2>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="panel-body">
+        <div class="task-block">
+          <label>Policy
+            <select id="dbg-policy"></select>
+          </label>
+          <label>Path
+            <input id="dbg-path" type="text" placeholder="rubatotree/so101_classify_the_blocks_act_512"/>
+          </label>
+          <label>Instruction
+            <input id="dbg-task" type="text" placeholder="pick up the block"/>
+          </label>
+          <div class="pair">
+            <label>Device
+              <input id="dbg-dev" type="text" value="cuda"/>
+            </label>
+            <label>Chunk
+              <input id="dbg-chunk" type="number" value="16" min="1" max="256" step="1"/>
+            </label>
+          </div>
+          <label>Chunk FPS
+            <input id="dbg-fps" type="number" value="30" min="1" step="1"/>
+          </label>
+          <p class="kv-lbl">Extra params</p>
+          <div id="dbg-kv" class="kv-table"></div>
+          <button type="button" id="btn-dbg-kv-add" class="ghost">Add param</button>
+          <div class="preset-row">
+            <select id="dbg-preset"></select>
+            <input id="dbg-preset-name" type="text" placeholder="preset name"/>
+            <span class="preset-btns">
+              <button type="button" id="btn-dbg-save">Save</button>
+              <button type="button" id="btn-dbg-load" class="ghost">Load</button>
+              <button type="button" id="btn-dbg-dup" class="ghost">Duplicate</button>
+              <button type="button" id="btn-dbg-del" class="ghost">Delete</button>
+            </span>
+          </div>
+          <p class="kv-lbl">Camera map</p>
+          <div id="dbg-cam-map" class="kv-table"></div>
+          <p id="dbg-source" class="bus-hint">source: open an episode or snapshot</p>
+          <div class="row-actions">
+            <button type="button" id="btn-dbg-run">Run inference</button>
+            <button type="button" id="btn-dbg-send" class="ghost" disabled>Send first step</button>
+          </div>
+          <p id="dbg-status" class="hw-status" role="status" aria-live="polite">idle</p>
+          <div id="dbg-snap-editor" class="snap-editor hidden"></div>
         </div>
         </div>
       </section>

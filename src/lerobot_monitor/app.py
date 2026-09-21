@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,7 +24,7 @@ from .preview import (
     lerobot_episode_payload,
     local_episode_payload,
 )
-from .snapshots import SnapshotTooLargeError
+from .snapshots import SnapshotTooLargeError, _decode_camera_payloads
 from .types import JOINT_ORDER
 
 STATIC_DIR = Path(__file__).resolve().parent / "web" / "static"
@@ -132,6 +135,19 @@ class SnapshotUpdateBody(BaseModel):
     origin: str | None = None
     source: dict[str, Any] | None = None
     joints: dict[str, float] | None = None
+
+
+class DebugInferBody(BaseModel):
+    policy_path: str
+    task: str = ""
+    device: str | None = None
+    extra: dict[str, str] = Field(default_factory=dict)
+    chunk_size: int = 16
+    fps: float = 30.0
+    camera_map: dict[str, str] = Field(default_factory=dict)
+    source: dict[str, Any] | None = None
+    joints: dict[str, float] = Field(default_factory=dict)
+    cameras: list[SnapshotCameraBody] = Field(default_factory=list)
 
 
 class AutoRecordBody(BaseModel):
@@ -789,6 +805,80 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.get("/api/models")
     async def list_models() -> list[dict[str, Any]]:
         return await asyncio.to_thread(hub.models)
+
+    @router.post("/api/debug/infer")
+    async def debug_infer(body: DebugInferBody) -> dict[str, Any]:
+        if not body.policy_path.strip():
+            raise HTTPException(400, "policy_path is required")
+        if body.chunk_size <= 0 or body.chunk_size > 256:
+            raise HTTPException(400, "chunk_size must be between 1 and 256")
+        if not math.isfinite(body.fps) or body.fps <= 0:
+            raise HTTPException(400, "fps must be positive")
+
+        try:
+            decoded = await asyncio.to_thread(
+                _decode_camera_payloads,
+                [camera.model_dump() for camera in body.cameras],
+            )
+        except SnapshotTooLargeError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        images_rgb: dict[str, np.ndarray] = {}
+        for key, data in decoded:
+            suffix = str(body.camera_map.get(key, key)).strip()
+            if suffix.startswith("observation.images."):
+                suffix = suffix[len("observation.images.") :]
+            suffix = suffix or key
+            if suffix in images_rgb:
+                raise HTTPException(400, f"duplicate camera observation suffix '{suffix}'")
+            image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                raise HTTPException(400, f"camera '{key}' is not a decodable image")
+            images_rgb[suffix] = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        lease = await asyncio.to_thread(hub.loop.acquire_debug_lease)
+        if not lease.get("ok"):
+            raise HTTPException(409, str(lease.get("error") or "model debug is unavailable"))
+        token = str(lease.get("token") or "")
+        started = time.perf_counter()
+        try:
+            chunk = await asyncio.to_thread(
+                hub.loop.infer_action_chunk,
+                path=body.policy_path,
+                task=body.task,
+                device=str(body.device or hub.config.rollout.device),
+                extra={str(key): str(value) for key, value in body.extra.items()},
+                joints=body.joints,
+                images_rgb=images_rgb,
+                chunk_size=body.chunk_size,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, f"policy inference failed: {exc}") from exc
+        finally:
+            if token:
+                await asyncio.shield(asyncio.to_thread(hub.loop.release_debug_lease, token))
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        actions = [
+            {
+                "t_s": round((index + 1) / body.fps, 6),
+                "joints": joints,
+            }
+            for index, joints in enumerate(chunk.actions)
+        ]
+        return {
+            "ok": True,
+            "source": body.source,
+            "strategy": chunk.strategy,
+            "degraded": chunk.degraded,
+            "fps": body.fps,
+            "latency_ms": round(latency_ms, 3),
+            "actions": actions,
+            "warnings": chunk.warnings,
+        }
 
     @router.get("/api/snapshots")
     async def list_snapshots() -> list[dict[str, Any]]:

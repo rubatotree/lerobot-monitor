@@ -6,6 +6,7 @@ from typing import Any
 
 from .config import LeaderConfig
 from .pathutil import ensure_lerobot_on_path
+from .sim import install_socket_transport
 from .types import observation_to_pose
 
 
@@ -25,6 +26,9 @@ class LeaderArm:
             self.connected = False
             raise RuntimeError(self.error) from exc
 
+        # 与 FollowerArm 同理：socket:// 的分发必须在 FeetechMotorsBus 构造前装好。
+        install_socket_transport()
+
         if self.connected:
             return
         cfg = SO101LeaderConfig(
@@ -33,7 +37,12 @@ class LeaderArm:
             use_degrees=self.config.use_degrees,
         )
         teleop = SO101Leader(cfg)
-        teleop.connect(calibrate=self.config.calibrate)
+        try:
+            teleop.connect(calibrate=self.config.calibrate)
+        except Exception as exc:
+            self.error = str(exc)
+            self.connected = False
+            raise
         self.teleop = teleop
         self.connected = True
         self.error = None

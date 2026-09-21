@@ -8,6 +8,7 @@ from typing import Any
 
 from .config import RobotConfig
 from .pathutil import ensure_lerobot_on_path
+from .sim import install_socket_transport
 from .types import JOINT_ORDER, observation_to_pose, pose_to_action
 
 
@@ -26,6 +27,10 @@ class FollowerArm:
             self.error = f"lerobot not importable: {exc}"
             self.connected = False
             raise RuntimeError(self.error) from exc
+
+        # 必须在构造 SO101Follower 之前——FeetechMotorsBus 在 __init__ 里就把
+        # scs.PortHandler 抓走了。真机串口名会被原样透传，不受影响。
+        install_socket_transport()
 
         if self.connected:
             return

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,12 @@ from pydantic import BaseModel, Field
 
 from .config import MonitorConfig
 from .hub import RuntimeHub
-from .preview import find_lerobot_video, lerobot_episode_payload, local_episode_payload
+from .preview import (
+    find_lerobot_video,
+    lerobot_episode_count,
+    lerobot_episode_payload,
+    local_episode_payload,
+)
 from .types import JOINT_ORDER
 
 STATIC_DIR = Path(__file__).resolve().parent / "web" / "static"
@@ -42,7 +48,10 @@ class RecordStartBody(BaseModel):
     reset_time_s: float | None = None
     num_episodes: int | None = None
     fps: int | None = None
+    action_fps: int | None = None
+    video_fps: int | None = None
     resume: bool = False
+    video_id: str | None = None
     dataset_id: str | None = None
     format: str | None = None
     root: str | None = None
@@ -61,6 +70,9 @@ class RolloutStartBody(BaseModel):
     record: bool | None = None
     auto_record: bool | None = None
     fps: int | None = None
+    policy_fps: int | None = None
+    action_fps: int | None = None
+    video_fps: int | None = None
     extra: dict[str, str] | None = None
     dataset_id: str | None = None
     format: str | None = None
@@ -71,10 +83,21 @@ class DatasetCreateBody(BaseModel):
     task: str = ""
     repo_id: str = ""
     fps: int | None = None
+    action_fps: int | None = None
+    video_fps: int | None = None
 
 
 class ReorderBody(BaseModel):
     order: list[int] = Field(default_factory=list)
+
+
+class EpisodeEditBody(BaseModel):
+    kind: str
+    id: str
+    episode: int
+    name: str | None = None
+    task: str | None = None
+    note: str | None = None
 
 
 class AutoRecordBody(BaseModel):
@@ -83,12 +106,20 @@ class AutoRecordBody(BaseModel):
 
 class CaptureStartBody(BaseModel):
     fps: int | None = None
+    action_fps: int | None = None
+    video_fps: int | None = None
     format: str | None = None
+    video_id: str | None = None
     dataset_id: str | None = None
     resume: bool = False
     task: str = ""
     name: str = ""
+    repo_id: str = ""
+    root: str | None = None
     merge: bool = True
+    video: bool | None = None
+    streaming_encoding: bool | None = None
+    encoder_threads: int | None = None
     auto_record: bool | None = None
 
 
@@ -129,6 +160,7 @@ class UiStateBody(BaseModel):
     hardware: dict[str, Any] | None = None
     auto_record: bool | None = None
     selected_dataset: str | None = None
+    selected_video: str | None = None
 
 
 def _normalize_prefix(base_path: str) -> str:
@@ -140,21 +172,71 @@ def _normalize_prefix(base_path: str) -> str:
     return prefix.rstrip("/")
 
 
+def _json_safe(value: Any) -> Any:
+    """Replace JSON-forbidden floating-point sentinels at the API boundary."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     hub = RuntimeHub(config)
     prefix = _normalize_prefix(config.server.base_path) if apply_prefix else ""
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        hub.start()
-        yield
-        hub.stop()
+        try:
+            hub.start()
+            yield
+        finally:
+            hub.stop()
 
     app = FastAPI(title="LeRobot Monitor", lifespan=lifespan)
     app.state.hub = hub
     app.state.base_path = prefix or _normalize_prefix(config.server.base_path)
 
     router = APIRouter()
+    library_mutation_lock = asyncio.Lock()
+
+    def _recording_rates(payload: dict[str, Any]) -> tuple[int, int]:
+        legacy = payload.get("fps")
+        action_fps = int(
+            payload.get("action_fps")
+            if payload.get("action_fps") is not None
+            else legacy if legacy is not None else config.recording.action_fps
+        )
+        video_fps = int(
+            payload.get("video_fps")
+            if payload.get("video_fps") is not None
+            else legacy if legacy is not None else config.recording.video_fps
+        )
+        if action_fps <= 0 or video_fps <= 0:
+            raise HTTPException(400, "action_fps and video_fps must be positive")
+        control_limit = max(1, int(config.control.fps))
+        if action_fps > control_limit:
+            raise HTTPException(400, f"action_fps={action_fps} exceeds control loop capacity ({control_limit} fps)")
+        if video_fps > control_limit:
+            raise HTTPException(400, f"video_fps={video_fps} exceeds camera sampling capacity ({control_limit} fps)")
+        return action_fps, video_fps
+
+    def _recording_payload(body: BaseModel, *, exclude_none: bool = False) -> dict[str, Any]:
+        payload = body.model_dump(exclude_none=exclude_none)
+        if payload.get("resume"):
+            for field in ("fps", "action_fps", "video_fps"):
+                value = payload.get(field)
+                if value is not None and int(value) <= 0:
+                    raise HTTPException(400, f"{field} must be positive")
+            # Missing values must remain absent so the control loop can inherit
+            # each rate independently from the existing dataset metadata.
+            return payload
+        action_fps, video_fps = _recording_rates(payload)
+        payload["action_fps"] = action_fps
+        payload["video_fps"] = video_fps
+        return payload
 
     @router.get("/")
     async def index() -> FileResponse:
@@ -175,7 +257,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.get("/api/sessions")
     async def sessions() -> list[dict[str, Any]]:
-        return hub.sessions()
+        return await asyncio.to_thread(hub.sessions)
 
     async def _submit(kind: str, payload: dict[str, Any] | None = None, timeout: float = 8.0) -> dict[str, Any]:
         result = await asyncio.to_thread(hub.loop.submit, kind, payload or {}, timeout)
@@ -189,15 +271,19 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         payload: dict[str, Any] | None = None,
         timeout: float = 8.0,
     ) -> dict[str, Any]:
-        hub.loop.note_pending(kind, message)
+        data = dict(payload or {})
+        token = hub.loop.note_pending(kind, message)
+        data["_start_generation"] = token
         try:
-            return await _submit(kind, payload, timeout=timeout)
+            return await _submit(kind, data, timeout=timeout)
         finally:
-            hub.loop.clear_pending()
+            hub.loop.clear_pending(token)
 
     def _enqueue(kind: str, message: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        hub.loop.note_pending(kind, message)
-        hub.loop.submit_nowait(kind, payload or {})
+        data = dict(payload or {})
+        token = hub.loop.note_pending(kind, message)
+        data["_start_generation"] = token
+        hub.loop.submit_nowait(kind, data)
         return {"ok": True, "accepted": True, "kind": kind}
 
     @router.get("/api/ports")
@@ -279,7 +365,12 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.post("/api/teleop/start")
     async def teleop_start(body: CaptureStartBody = CaptureStartBody()) -> dict[str, Any]:
-        return await _submit_logged("teleop_start", "teleop requested", body.model_dump(exclude_none=True), timeout=15.0)
+        return await _submit_logged(
+            "teleop_start",
+            "teleop requested",
+            _recording_payload(body, exclude_none=True),
+            timeout=15.0,
+        )
 
     @router.post("/api/teleop/stop")
     async def teleop_stop() -> dict[str, Any]:
@@ -287,7 +378,12 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.post("/api/record/start")
     async def record_start(body: RecordStartBody) -> dict[str, Any]:
-        return await _submit_logged("record_start", "record requested — opening video session", body.model_dump(), timeout=15.0)
+        return await _submit_logged(
+            "record_start",
+            "record requested — opening video session",
+            _recording_payload(body),
+            timeout=15.0,
+        )
 
     @router.post("/api/record/stop")
     async def record_stop() -> dict[str, Any]:
@@ -300,7 +396,14 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.post("/api/rollout/start")
     async def rollout_start(body: RolloutStartBody) -> dict[str, Any]:
         path = body.policy_path or "(no policy)"
-        return _enqueue("rollout_start", f"rollout requested — loading {path}", body.model_dump())
+        payload = body.model_dump()
+        if payload.get("policy_fps") is None:
+            payload["policy_fps"] = (
+                payload["fps"] if payload.get("fps") is not None else hub.config.rollout.default_fps
+            )
+        if int(payload["policy_fps"]) <= 0:
+            raise HTTPException(400, "policy_fps must be positive")
+        return _enqueue("rollout_start", f"rollout requested — loading {path}", payload)
 
     @router.post("/api/rollout/stop")
     async def rollout_stop() -> dict[str, Any]:
@@ -308,7 +411,12 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.post("/api/capture/start")
     async def capture_start(body: CaptureStartBody = CaptureStartBody()) -> dict[str, Any]:
-        return await _submit_logged("capture_start", "video capture requested", body.model_dump(exclude_none=True), timeout=15.0)
+        return await _submit_logged(
+            "capture_start",
+            "video capture requested",
+            _recording_payload(body, exclude_none=True),
+            timeout=15.0,
+        )
 
     @router.post("/api/capture/stop")
     async def capture_stop() -> dict[str, Any]:
@@ -318,56 +426,128 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     async def auto_record(body: AutoRecordBody) -> dict[str, Any]:
         return await _submit("auto_record", {"enabled": body.enabled})
 
+    def _episode_item(
+        kind: str,
+        source_id: str,
+        index: int,
+        *,
+        playable: bool,
+        row: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        item: dict[str, Any] = {
+            "index": int(index),
+            "name": "",
+            "task": "",
+            "note": "",
+            "playable": bool(playable),
+        }
+        if row:
+            item["has_video"] = bool(row.get("videos"))
+        saved = hub.store.episode_overrides(kind, source_id).get(str(int(index)))
+        if saved:
+            for key in ("name", "task", "note"):
+                if saved.get(key) is not None:
+                    item[key] = str(saved[key])
+        return item
+
+    def _merge_episode_overrides(kind: str, source_id: str, episodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            _episode_item(kind, source_id, int(row.get("index", i)), playable=True, row=row)
+            for i, row in enumerate(episodes)
+        ]
+
     @router.get("/api/videos")
     async def list_videos() -> list[dict[str, Any]]:
-        return hub.videos.list()
+        rows = await asyncio.to_thread(hub.videos.list)
+        for row in rows:
+            row["episodes"] = _merge_episode_overrides("video", row["id"], row.get("episodes") or [])
+        return rows
 
     @router.post("/api/videos")
     async def create_video(body: DatasetCreateBody) -> dict[str, Any]:
-        fps = body.fps if body.fps is not None else hub.config.recording.fps
-        return hub.videos.create(body.name, fps=fps, task=body.task, repo_id=body.repo_id)
+        payload = body.model_dump(exclude_none=True)
+        action_fps, video_fps = _recording_rates(payload)
+        async with library_mutation_lock:
+            return await asyncio.to_thread(
+                hub.videos.create,
+                body.name,
+                fps=action_fps,
+                action_fps=action_fps,
+                video_fps=video_fps,
+                task=body.task,
+                repo_id=body.repo_id,
+            )
 
     @router.get("/api/videos/{video_id}")
     async def get_video(video_id: str) -> dict[str, Any]:
         try:
-            return hub.videos.get(video_id)
+            row = await asyncio.to_thread(hub.videos.get, video_id)
         except FileNotFoundError:
             raise HTTPException(404, f"unknown video '{video_id}'") from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        row["episodes"] = _merge_episode_overrides("video", video_id, row.get("episodes") or [])
+        return row
 
     @router.delete("/api/videos/{video_id}")
     async def delete_video(video_id: str) -> dict[str, Any]:
+        if not hub.loop.recording_mutation_lock.acquire(blocking=False):
+            raise HTTPException(409, "cannot edit datasets while recording is active")
         try:
-            hub.videos.delete(video_id)
+            await asyncio.to_thread(hub.videos.delete, video_id)
+            await asyncio.to_thread(hub.store.delete_episode_overrides, "video", video_id)
         except FileNotFoundError:
             raise HTTPException(404, f"unknown video '{video_id}'") from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        finally:
+            hub.loop.recording_mutation_lock.release()
         return {"ok": True}
 
     @router.delete("/api/videos/{video_id}/episodes/{index}")
     async def delete_video_episode(video_id: str, index: int) -> dict[str, Any]:
+        if not hub.loop.recording_mutation_lock.acquire(blocking=False):
+            raise HTTPException(409, "cannot edit datasets while recording is active")
         try:
-            return hub.videos.delete_episode(video_id, index)
+            result = await asyncio.to_thread(hub.videos.delete_episode, video_id, index)
+            await asyncio.to_thread(
+                hub.store.remap_episode_overrides,
+                "video",
+                video_id,
+                result.get("episode_index_map") or {},
+            )
+            return result
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        finally:
+            hub.loop.recording_mutation_lock.release()
 
     @router.post("/api/videos/{video_id}/episodes/reorder")
     async def reorder_video_episodes(video_id: str, body: ReorderBody) -> dict[str, Any]:
+        if not hub.loop.recording_mutation_lock.acquire(blocking=False):
+            raise HTTPException(409, "cannot edit datasets while recording is active")
         try:
-            return hub.videos.reorder(video_id, body.order)
+            result = await asyncio.to_thread(hub.videos.reorder, video_id, body.order)
+            await asyncio.to_thread(
+                hub.store.remap_episode_overrides,
+                "video",
+                video_id,
+                result.get("episode_index_map") or {},
+            )
+            return result
         except FileNotFoundError:
             raise HTTPException(404, f"unknown video '{video_id}'") from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        finally:
+            hub.loop.recording_mutation_lock.release()
 
     @router.get("/api/videos/{video_id}/episodes/{index}/video/{cam}")
     async def video_episode_file(video_id: str, index: int, cam: str) -> FileResponse:
         try:
-            path = hub.videos.episode_video(video_id, index, cam)
+            path = await asyncio.to_thread(hub.videos.episode_video, video_id, index, cam)
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
         except ValueError as exc:
@@ -377,7 +557,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.get("/api/videos/{video_id}/episodes/{index}/preview")
     async def video_episode_preview(video_id: str, index: int) -> FileResponse:
         try:
-            path = hub.videos.episode_preview(video_id, index)
+            path = await asyncio.to_thread(hub.videos.episode_preview, video_id, index)
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
         except ValueError as exc:
@@ -386,27 +566,132 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.get("/api/datasets")
     async def list_datasets() -> list[dict[str, Any]]:
-        return hub.hf_datasets()
+        return await asyncio.to_thread(hub.hf_datasets)
+
+    def _episode_source(kind: str, source_id: str) -> tuple[dict[str, Any], int, bool]:
+        """Resolve a library entry to (row, episode count, playable)."""
+        if kind == "video":
+            meta = hub.videos.get(source_id)
+            return meta, len(meta.get("episodes") or []), True
+        if kind != "dataset":
+            raise ValueError(f"unknown episode source kind '{kind}'")
+        row = hub.resolve_dataset(source_id)
+        return row, lerobot_episode_count(Path(row["path"])), bool(row.get("playable"))
+
+    @router.get("/api/episodes")
+    async def list_episodes(kind: str, id: str) -> dict[str, Any]:
+        try:
+            row, count, playable = await asyncio.to_thread(_episode_source, kind, id)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        if kind == "video":
+            episodes = [
+                _episode_item("video", id, int(ep.get("index", i)), playable=True, row=ep)
+                for i, ep in enumerate(row.get("episodes") or [])
+            ]
+            title = row.get("name") or row.get("repo_id") or id
+            subtitle = row.get("task") or row.get("repo_id") or "Local recording"
+            description = row.get("description") or ""
+        else:
+            has_video = bool(row.get("has_video"))
+            episodes = [
+                _episode_item("dataset", id, index, playable=playable, row={"videos": has_video})
+                for index in range(count)
+            ]
+            title = row.get("title") or row.get("repo_id") or row.get("name") or id
+            fallback_bits = [str(row.get("source") or "dataset")]
+            if row.get("fps"):
+                fallback_bits.append(f"{row['fps']} fps")
+            fallback_bits.append(f"{count} episodes")
+            subtitle = row.get("subtitle") or row.get("task") or " · ".join(fallback_bits)
+            description = row.get("description") or ""
+        source = {
+            "title": str(title),
+            "subtitle": str(subtitle) if isinstance(subtitle, str) else "",
+            "description": str(description) if isinstance(description, str) else "",
+        }
+        return {
+            "kind": kind,
+            "id": id,
+            "title": title,
+            "source": source,
+            "playable": playable,
+            "has_video": any(bool(item.get("has_video")) for item in episodes),
+            "episodes": episodes,
+        }
+
+    @router.put("/api/episodes")
+    async def edit_episode(body: EpisodeEditBody) -> dict[str, Any]:
+        if not hub.loop.recording_mutation_lock.acquire(blocking=False):
+            raise HTTPException(409, "cannot edit datasets while recording is active")
+        try:
+            try:
+                row, count, playable = await asyncio.to_thread(_episode_source, body.kind, body.id)
+            except FileNotFoundError as exc:
+                raise HTTPException(404, str(exc)) from None
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from None
+            if body.episode < 0 or body.episode >= count:
+                raise HTTPException(404, f"episode {body.episode} not found")
+            payload = {
+                key: value
+                for key, value in (("name", body.name), ("task", body.task), ("note", body.note))
+                if value is not None
+            }
+            try:
+                await asyncio.to_thread(
+                    hub.store.save_episode_override,
+                    body.kind,
+                    body.id,
+                    body.episode,
+                    payload,
+                )
+            except (KeyError, ValueError) as exc:
+                raise HTTPException(400, str(exc)) from exc
+            return _episode_item(
+                body.kind,
+                body.id,
+                body.episode,
+                playable=playable,
+                row=row if body.kind == "video" else None,
+            )
+        finally:
+            hub.loop.recording_mutation_lock.release()
 
     @router.get("/api/preview")
     async def preview(kind: str, id: str, episode: int = 0) -> dict[str, Any]:
-        try:
+        def load_preview() -> dict[str, Any]:
             if kind == "video":
                 meta = hub.videos.get(id)
-                payload = local_episode_payload(Path(meta["path"]), episode)
-                payload["episodes"] = len(meta.get("episodes") or [])
-                payload["title"] = meta.get("name") or id
-                payload["id"] = id
-                payload["kind"] = "video"
-                return payload
-            row = hub.resolve_dataset(id)
-            root = Path(row["path"])
-            payload = lerobot_episode_payload(root, episode)
-            payload["title"] = row.get("repo_id") or id
-            payload["id"] = id
-            payload["path"] = str(root)
-            payload["kind"] = "dataset"
-            return payload
+                loaded = local_episode_payload(Path(meta["path"]), episode)
+                loaded["episodes"] = len(meta.get("episodes") or [])
+                loaded["title"] = meta.get("name") or id
+                loaded["id"] = id
+                loaded["kind"] = "video"
+                loaded["action_fps"] = meta.get("action_fps") or meta.get("fps")
+                loaded["video_fps"] = meta.get("video_fps") or meta.get("fps")
+            else:
+                row = hub.resolve_dataset(id)
+                root = Path(row["path"])
+                loaded = lerobot_episode_payload(root, episode)
+                loaded["title"] = row.get("repo_id") or id
+                loaded["id"] = id
+                loaded["path"] = str(root)
+                loaded["kind"] = "dataset"
+                loaded["action_fps"] = row.get("action_fps") or row.get("fps")
+                loaded["video_fps"] = row.get("video_fps") or row.get("fps")
+            saved = hub.store.episode_overrides(loaded["kind"], id).get(str(int(episode))) or {}
+            loaded["episode_name"] = str(saved.get("name") or "")
+            loaded["episode_note"] = str(saved.get("note") or "")
+            if saved.get("task"):
+                loaded["task"] = str(saved["task"])
+            loaded["task"] = loaded.get("task") or ""
+            return loaded
+
+        try:
+            return _json_safe(await asyncio.to_thread(load_preview))
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
         except ValueError as exc:
@@ -414,12 +699,14 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.get("/api/preview/file")
     async def preview_file(kind: str, id: str, episode: int, cam: str) -> FileResponse:
-        try:
+        def resolve_preview_file() -> Path:
             if kind == "video":
-                path = hub.videos.episode_video(id, episode, cam)
-            else:
-                row = hub.resolve_dataset(id)
-                path = find_lerobot_video(Path(row["path"]), episode, cam)
+                return hub.videos.episode_video(id, episode, cam)
+            row = hub.resolve_dataset(id)
+            return find_lerobot_video(Path(row["path"]), episode, cam)
+
+        try:
+            path = await asyncio.to_thread(resolve_preview_file)
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
         except ValueError as exc:
@@ -428,7 +715,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.get("/api/models")
     async def list_models() -> list[dict[str, Any]]:
-        return hub.models()
+        return await asyncio.to_thread(hub.models)
 
     @router.get("/api/cameras")
     async def list_cameras() -> list[dict[str, Any]]:
@@ -480,7 +767,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.put("/api/presets/{kind}/{name}")
     async def save_preset(kind: str, name: str, body: dict[str, Any]) -> dict[str, Any]:
         try:
-            saved = hub.store.put_preset(kind, name, body)
+            saved = await asyncio.to_thread(hub.store.put_preset, kind, name, body)
         except (KeyError, ValueError) as exc:
             raise HTTPException(400, str(exc)) from exc
         return saved
@@ -488,7 +775,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.delete("/api/presets/{kind}/{name}")
     async def delete_preset(kind: str, name: str) -> dict[str, Any]:
         try:
-            hub.store.delete_preset(kind, name)
+            await asyncio.to_thread(hub.store.delete_preset, kind, name)
         except (KeyError, ValueError) as exc:
             raise HTTPException(400, str(exc)) from exc
         return {"ok": True}
@@ -502,7 +789,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         current = hub.store.ui()
         data = body.model_dump(exclude_none=True)
         current.update(data)
-        return hub.store.save_ui(current)
+        return await asyncio.to_thread(hub.store.save_ui, current)
 
     @router.post("/api/cameras/{name}/stream")
     async def set_camera_stream(name: str, body: CameraStreamBody) -> dict[str, Any]:
@@ -516,18 +803,29 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.get("/camera/{name}")
     async def camera_mjpeg(name: str) -> StreamingResponse:
         try:
-            hub.cameras.get(name)
+            camera = hub.cameras.get(name)
         except KeyError:
             raise HTTPException(404, f"unknown camera '{name}'") from None
 
         async def generate():
-            while True:
-                jpeg = hub.cameras.latest_jpeg(name)
-                if jpeg:
-                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
-                else:
-                    yield b"--frame\r\n\r\n"
-                await asyncio.sleep(1.0 / 25.0)
+            try:
+                while True:
+                    jpeg = camera.latest_jpeg()
+                    if not jpeg:
+                        await asyncio.sleep(1.0 / 25.0)
+                        continue
+                    yield (
+                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                        + str(len(jpeg)).encode("ascii")
+                        + b"\r\n\r\n"
+                        + jpeg
+                        + b"\r\n"
+                    )
+                    await asyncio.sleep(1.0 / 25.0)
+            finally:
+                # No per-client camera resource exists; this finally block makes
+                # generator finalization explicit while preserving cancellation.
+                pass
 
         return StreamingResponse(
             generate(),
@@ -537,8 +835,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.websocket("/ws")
     async def ws_status(ws: WebSocket) -> None:
-        await ws.accept()
         try:
+            await ws.accept()
             while True:
                 await ws.send_json(hub.snapshot())
                 await asyncio.sleep(0.1)

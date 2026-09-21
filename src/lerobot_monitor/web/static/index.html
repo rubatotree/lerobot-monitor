@@ -11,21 +11,29 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <span id="ws-dot" class="dot" title="WebSocket"></span>
-      <h1>LeRobot Monitor</h1>
-      <span id="mode-pill" class="pill idle">offline</span>
-      <span class="hdr-stat">bus <b id="st-bus">free</b></span>
-      <span class="hdr-stat">mode <b id="st-mode">offline</b></span>
-      <span class="hdr-stat">F <b id="st-robot">—</b></span>
-      <span class="hdr-stat">L <b id="st-leader">—</b></span>
-      <span class="hdr-stat" id="st-env" title="python / torch">env —</span>
-      <span class="hdr-stat" id="st-elapsed">—</span>
-      <span class="hdr-stat" id="st-episode">—</span>
-      <div class="prog hdr-prog"><div id="prog-fill"></div></div>
+  <header class="topbar">
+    <div class="header-summary">
+      <div class="brand">
+        <span id="ws-dot" class="dot" title="WebSocket"></span>
+        <h1>LeRobot Monitor</h1>
+        <span id="mode-pill" class="pill idle">offline</span>
+      </div>
+      <div class="header-status" aria-label="System status">
+        <span class="hdr-stat">bus <b id="st-bus">free</b></span>
+        <span class="hdr-stat">mode <b id="st-mode">offline</b></span>
+        <span class="hdr-stat">F <b id="st-robot">—</b></span>
+        <span class="hdr-stat">L <b id="st-leader">—</b></span>
+        <span class="hdr-stat" id="st-env" title="python / torch">env —</span>
+        <span class="hdr-stat" id="st-elapsed">—</span>
+        <span class="hdr-stat" id="st-episode">—</span>
+      </div>
+      <div class="header-meta">
+        <span id="fps">0.0 Hz</span>
+        <span id="clock">00:00:00</span>
+      </div>
     </div>
-    <div class="header-actions">
+    <div class="header-controls">
+      <div class="header-actions">
       <button type="button" id="btn-hdr-scan" class="hdr-icon" title="Scan serial and cameras">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.3M21 12a9 9 0 0 1-15.5 6.3"/><polyline points="3 5 3 12 10 12"/><polyline points="21 19 21 12 14 12"/></svg>
         scan
@@ -58,57 +66,105 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1" fill="currentColor" stroke="none"/></svg>
         stop
       </button>
+      </div>
       <button type="button" id="btn-hdr-estop" class="hdr-estop" title="Emergency stop">E-STOP</button>
-    </div>
-    <div class="header-meta">
-      <span id="fps"> 0.0 Hz</span>
-      <span id="clock">00:00:00</span>
     </div>
   </header>
 
   <main>
     <aside id="library" data-panel="library">
-      <button type="button" class="panel-toggle" aria-expanded="true">
+      <button type="button" class="panel-toggle" aria-expanded="true" aria-label="Toggle Library">
+        <span class="library-rail-icon" aria-hidden="true">▤</span>
         <h2>Library</h2>
         <span class="chevron" aria-hidden="true">▾</span>
       </button>
       <div class="panel-body">
-        <h3>Videos</h3>
-        <div class="row-actions">
-          <button type="button" id="btn-vid-refresh" class="ghost">Refresh</button>
-        </div>
-        <ol id="vid-list" class="lib-list"></ol>
-        <div id="viz" class="viz hidden">
-          <p class="hw-status" id="viz-title">—</p>
-          <div class="viz-nav">
-            <button type="button" id="viz-prev" class="ghost">◀</button>
-            <input id="viz-ep" type="number" min="0" value="0"/>
-            <span id="viz-ep-max">/ 0</span>
-            <button type="button" id="viz-next" class="ghost">▶</button>
-            <button type="button" id="viz-play" class="ghost">play</button>
+        <section class="library-group" id="lib-videos" aria-labelledby="lib-videos-title">
+          <div class="library-heading">
+            <h3 id="lib-videos-title">Videos</h3>
+            <button type="button" id="btn-vid-refresh" class="ghost">Refresh</button>
           </div>
-          <div id="viz-cams" class="viz-cams"></div>
-          <input id="viz-seek" type="range" min="0" max="1000" value="0" step="1"/>
-          <div class="viz-meta"><span id="viz-t">0.00s</span></div>
-          <canvas id="viz-chart"></canvas>
-        </div>
-        <div id="vid-detail" class="ds-detail hidden">
-          <ol id="ep-list" class="lib-list"></ol>
-        </div>
-        <h3>Datasets</h3>
-        <div class="row-actions">
-          <button type="button" id="btn-ds-refresh" class="ghost">Scan cache</button>
-        </div>
-        <ol id="ds-list" class="lib-list"></ol>
-        <h3>Models</h3>
-        <div class="row-actions">
-          <button type="button" id="btn-md-refresh" class="ghost">Rescan</button>
-        </div>
-        <ol id="md-list" class="lib-list"></ol>
+          <p id="vid-status" class="library-status" role="status" aria-live="polite"></p>
+          <ol id="vid-list" class="lib-list" aria-busy="false"></ol>
+        </section>
+        <section class="library-group" id="lib-datasets" aria-labelledby="lib-datasets-title">
+          <div class="library-heading">
+            <h3 id="lib-datasets-title">Datasets</h3>
+            <button type="button" id="btn-ds-refresh" class="ghost">Scan cache</button>
+          </div>
+          <p id="ds-status" class="library-status" role="status" aria-live="polite"></p>
+          <ol id="ds-list" class="lib-list" aria-busy="false"></ol>
+        </section>
+        <section class="library-group" id="lib-models" aria-labelledby="lib-models-title">
+          <div class="library-heading">
+            <h3 id="lib-models-title">Models</h3>
+            <button type="button" id="btn-md-refresh" class="ghost">Rescan</button>
+          </div>
+          <p id="md-status" class="library-status" role="status" aria-live="polite"></p>
+          <ol id="md-list" class="lib-list" aria-busy="false"></ol>
+        </section>
       </div>
     </aside>
     <div id="split-lib" class="split col" role="separator" aria-orientation="vertical"></div>
-    <section id="cameras" aria-label="cameras"></section>
+    <aside id="episodes" class="hidden" aria-label="episodes">
+      <div id="viz" class="viz hidden">
+        <p id="viz-title">—</p>
+        <div class="viz-nav">
+          <button type="button" id="viz-prev" class="ghost icon-btn" title="Previous episode" aria-label="Previous episode">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="15 6 9 12 15 18"/></svg>
+          </button>
+          <input id="viz-ep" type="number" min="0" value="0" aria-label="Episode index"/>
+          <span id="viz-ep-max">/ 0</span>
+          <button type="button" id="viz-next" class="ghost icon-btn" title="Next episode" aria-label="Next episode">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="9 6 15 12 9 18"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="vid-detail" class="ds-detail hidden">
+        <header class="episode-source-header">
+          <div class="episode-source-copy">
+            <h2 id="ep-title">—</h2>
+            <p id="ep-subtitle" class="episode-source-subtitle" hidden></p>
+            <p id="ep-description" class="episode-source-description" hidden></p>
+          </div>
+          <button type="button" id="btn-ep-close" class="ghost icon-btn" aria-label="Close episode selection" title="Close episode selection">×</button>
+        </header>
+        <ol id="ep-list" class="lib-list"></ol>
+      </div>
+    </aside>
+    <div id="split-ep" class="split col hidden" role="separator" aria-orientation="vertical"></div>
+    <section id="cameras" aria-label="cameras">
+      <div id="camera-empty" class="camera-empty" role="status">
+        <strong>No camera in the main view</strong>
+        <span>Scan for devices, then enable a camera and its Main view option under Hardware.</span>
+      </div>
+      <div id="replay" class="hidden">
+        <header class="replay-bar">
+          <div class="replay-info">
+            <span class="replay-tag">REPLAY</span>
+            <span id="replay-title">—</span>
+            <span id="replay-status" class="replay-status" role="status" aria-live="polite"></span>
+            <button type="button" id="viz-arm" class="ghost arm-toggle" title="Replay actions on robot (off)" aria-label="Replay actions on robot" aria-pressed="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="7" width="14" height="11" rx="2"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><path d="M12 7V4"/></svg>
+              <span id="viz-arm-label">arm off</span>
+            </button>
+          </div>
+          <div class="replay-transport" role="group" aria-label="Replay transport">
+            <button type="button" id="viz-play" class="ghost icon-btn" title="Play" aria-label="Play">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="8 5 19 12 8 19 8 5" fill="currentColor" stroke="none"/></svg>
+            </button>
+            <button type="button" id="viz-restart" class="ghost icon-btn" title="Back to start" aria-label="Back to start">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.3-5.7"/><polyline points="4 4 4 10 10 10"/></svg>
+            </button>
+            <label class="sr-only" for="replay-seek">Replay timeline</label>
+            <input id="replay-seek" type="range" min="0" max="1000" value="0" step="1" aria-describedby="viz-t" disabled/>
+            <output id="viz-t" for="replay-seek" aria-live="off">0.00s / 0.00s</output>
+            <button type="button" id="viz-exit" class="ghost replay-exit">EXIT</button>
+          </div>
+        </header>
+        <div id="viz-cams" class="viz-cams"></div>
+      </div>
+    </section>
     <div id="split-v" class="split col" role="separator" aria-orientation="vertical"></div>
     <aside id="side">
       <section class="panel" id="joint-panel" data-panel="joints">
@@ -173,23 +229,36 @@
             </label>
           </div>
           <div class="pair">
-            <label>FPS
-              <input id="rec-fps" type="number" value="15" min="1" step="1"/>
+            <label>Action FPS
+              <input id="rec-action-fps" type="number" value="15" min="1" step="1"/>
             </label>
-            <label>Format
+            <label>Video FPS
+              <input id="rec-video-fps" type="number" value="30" min="1" step="1"/>
+            </label>
+          </div>
+          <label>Format
               <select id="rec-format">
                 <option value="mp4">mp4</option>
                 <option value="avi">avi</option>
               </select>
-            </label>
-          </div>
+          </label>
           <label>Save path
             <input id="rec-root" type="text" placeholder="data/datasets"/>
           </label>
+          <div id="record-destination" class="record-destination" role="status" aria-live="polite">
+            Destination: data/datasets/&lt;session&gt;
+          </div>
           <label class="check">
             <input type="checkbox" id="chk-rec-resume"/>
             Continue recording
           </label>
+          <div class="resume-target" id="resume-target" role="status" aria-live="polite">
+            <span id="resume-target-text">Resume target: none</span>
+            <div class="row-actions">
+              <button type="button" id="btn-rec-use-video" class="ghost" disabled>Use browsed video</button>
+              <button type="button" id="btn-rec-clear-video" class="ghost" disabled>Clear</button>
+            </div>
+          </div>
           <label class="check">
             <input type="checkbox" id="chk-rec-video" checked/>
             Video
@@ -231,7 +300,7 @@
             <label>Duration s
               <input id="pol-dur" type="number" value="60" min="0" step="1"/>
             </label>
-            <label>FPS
+            <label>Policy FPS
               <input id="pol-fps" type="number" value="15" min="1" step="1"/>
             </label>
           </div>
@@ -316,7 +385,7 @@
       </div>
       <div class="chart-wrap panel" data-panel="chart-action">
         <button type="button" class="panel-toggle" aria-expanded="true">
-          <h2>Commanded action</h2>
+          <h2 id="chart-action-title">Commanded action</h2>
           <span class="chevron" aria-hidden="true">▾</span>
         </button>
         <div class="panel-body">

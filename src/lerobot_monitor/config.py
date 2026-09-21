@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ServerConfig(BaseModel):
@@ -55,6 +55,8 @@ class ControlConfig(BaseModel):
 class RecordingConfig(BaseModel):
     root: Path = Path("data/videos")
     fps: int = 15
+    action_fps: int = 15
+    video_fps: int = 30
     default_episode_time_s: float = 20.0
     default_reset_time_s: float = 5.0
     default_num_episodes: int = 50
@@ -63,6 +65,22 @@ class RecordingConfig(BaseModel):
     streaming_encoding: bool = True
     encoder_threads: int = 2
     video: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_fps_sets_both_rates(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "fps" not in value:
+            return value
+        data = dict(value)
+        data.setdefault("action_fps", data["fps"])
+        data.setdefault("video_fps", data["fps"])
+        return data
+
+    @model_validator(mode="after")
+    def validate_rates(self) -> "RecordingConfig":
+        if self.fps <= 0 or self.action_fps <= 0 or self.video_fps <= 0:
+            raise ValueError("recording fps, action_fps, and video_fps must be positive")
+        return self
 
 
 class LibraryConfig(BaseModel):

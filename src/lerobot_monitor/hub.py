@@ -49,8 +49,16 @@ class RuntimeHub:
         self.loop.start()
 
     def stop(self) -> None:
-        self.loop.stop()
-        self.cameras.stop()
+        try:
+            self.loop.stop()
+        except BaseException as loop_error:
+            try:
+                self.cameras.stop()
+            except BaseException as camera_error:
+                loop_error.add_note(f"camera shutdown also failed: {camera_error}")
+            raise
+        else:
+            self.cameras.stop()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -86,6 +94,8 @@ class RuntimeHub:
             },
             "recording": {
                 "fps": self.config.recording.fps,
+                "action_fps": self.config.recording.action_fps,
+                "video_fps": self.config.recording.video_fps,
                 "default_episode_time_s": self.config.recording.default_episode_time_s,
                 "default_reset_time_s": self.config.recording.default_reset_time_s,
                 "default_num_episodes": self.config.recording.default_num_episodes,

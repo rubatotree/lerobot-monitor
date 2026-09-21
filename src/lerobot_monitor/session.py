@@ -68,11 +68,12 @@ def video_copies(elapsed_s: float, fps: float, frames_written: int) -> int:
 
     OpenCV VideoWriter plays at the fps given at open. If we insert fewer unique
     captures than that rate, the file runs fast. Duplicate the latest image to
-    fill the timeline; never drop below one frame, and cap a stall at 5s.
+    fill the timeline. Calls made before the next target slot legitimately
+    return zero; a later call fills the complete elapsed gap.
     """
     rate = max(1.0, float(fps))
-    desired = max(int(frames_written) + 1, int(elapsed_s * rate + 0.5))
-    return max(1, min(desired - int(frames_written), int(rate * 5)))
+    desired = max(0, int(max(0.0, elapsed_s) * rate + 0.5))
+    return max(0, desired - int(frames_written))
 
 
 def open_video_writer(path: Path, fps: float, size: tuple[int, int], fmt: str = "mp4") -> cv2.VideoWriter:
@@ -81,7 +82,10 @@ def open_video_writer(path: Path, fps: float, size: tuple[int, int], fmt: str = 
     if fmt == "avi":
         codes = ("XVID", "MJPG")
     else:
-        codes = ("avc1", "H264", "mp4v")
+        # mp4v is bundled by common OpenCV wheels. Trying external H.264 first
+        # can be slow and some Windows builds leak codec diagnostics into other
+        # open file handles before falling back successfully.
+        codes = ("mp4v", "avc1", "H264")
     last_error = ""
     for code in codes:
         writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*code), float(fps), size)
@@ -100,21 +104,39 @@ class EpisodeWriter:
         folder: Path,
         *,
         index: int,
-        fps: int,
+        fps: int | None = None,
+        action_fps: int | None = None,
+        video_fps: int | None = None,
         video_format: str = "mp4",
         merge: bool = True,
+        video: bool = True,
         kind: str = "record",
     ) -> None:
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
-        (self.folder / "videos").mkdir(exist_ok=True)
         self.index = int(index)
-        self.fps = max(1, int(fps))
+        legacy_fps = int(fps) if fps is not None else None
+        self.action_fps = int(action_fps if action_fps is not None else legacy_fps if legacy_fps is not None else 15)
+        self.video_fps = int(
+            video_fps
+            if video_fps is not None
+            else legacy_fps if legacy_fps is not None else self.action_fps
+        )
+        if self.action_fps <= 0 or self.video_fps <= 0:
+            raise ValueError("action_fps and video_fps must be positive")
+        self.fps = self.action_fps
         self.video_format = video_format
         self.merge = merge
+        self.video = bool(video)
+        if self.video:
+            (self.folder / "videos").mkdir(exist_ok=True)
         self.kind = kind
         self.closed = False
-        self.frames = 0
+        self.action_frames = 0
+        self.video_frames = 0
+        self.requested_video_frames = 0
+        self.frames = 0  # Compatibility alias for action samples.
+        self._last_action_elapsed = 0.0
         self._ext = ".avi" if video_format == "avi" else ".mp4"
         self._csv_path = self.folder / "joints.csv"
         self._csv_file = self._csv_path.open("w", newline="", encoding="utf-8")
@@ -127,6 +149,9 @@ class EpisodeWriter:
         self._writer.writeheader()
         self._videos: dict[str, cv2.VideoWriter] = {}
         self._video_size: dict[str, tuple[int, int]] = {}
+        self._video_frames: dict[str, int] = {}
+        self._video_start_frame: dict[str, int] = {}
+        self._last_video_frame: dict[str, np.ndarray] = {}
         self._t0 = time.perf_counter()
         self._lock = threading.Lock()
 
@@ -136,10 +161,119 @@ class EpisodeWriter:
             return self._videos[key]
         h, w = bgr.shape[:2]
         path = self.folder / "videos" / f"{key}{self._ext}"
-        writer = open_video_writer(path, self.fps, (w, h), self.video_format)
+        writer = open_video_writer(path, self.video_fps, (w, h), self.video_format)
         self._videos[key] = writer
         self._video_size[key] = (w, h)
+        self._video_frames[key] = 0
         return writer
+
+    def _write_video_until(self, name: str, bgr: np.ndarray, target_frames: int) -> None:
+        """Extend one stream to the episode timeline using its current frame."""
+        key = safe_cam_name(name)
+        writer = self._ensure_video(key, bgr)
+        width, height = self._video_size[key]
+        if (bgr.shape[1], bgr.shape[0]) != (width, height):
+            bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA)
+        frame = np.ascontiguousarray(bgr)
+        missing = max(0, int(target_frames) - self._video_frames[key])
+        for _ in range(missing):
+            writer.write(frame)
+        self._video_frames[key] += missing
+        # Camera adapters commonly reuse their buffers, so retain an owned copy
+        # for future dropout padding.
+        self._last_video_frame[key] = frame.copy()
+
+    def _elapsed(self, elapsed_s: float | None) -> float:
+        return max(0.0, time.perf_counter() - self._t0 if elapsed_s is None else float(elapsed_s))
+
+    def add_action(
+        self,
+        observation: Mapping[str, float],
+        action: Mapping[str, float] | None,
+        *,
+        kind: str | None = None,
+        frame_index: int | None = None,
+        elapsed_s: float | None = None,
+    ) -> None:
+        """Append one real control sample; missed action deadlines are never synthesized."""
+        if self.closed:
+            return
+        elapsed = self._elapsed(elapsed_s)
+        row: dict[str, Any] = {
+            "t": f"{elapsed:.4f}",
+            "frame": self.action_frames if frame_index is None else frame_index,
+            "episode": self.index,
+            "kind": kind or self.kind,
+        }
+        for name in JOINT_ORDER:
+            row[f"obs.{name}"] = f"{float(observation.get(name, float('nan'))):.4f}"
+            act_val = (action or {}).get(name, float("nan"))
+            row[f"act.{name}"] = f"{float(act_val):.4f}"
+        with self._lock:
+            self._writer.writerow(row)
+            self._csv_file.flush()
+            self.action_frames += 1
+            self.frames = self.action_frames
+            self._last_action_elapsed = max(self._last_action_elapsed, elapsed)
+
+    def add_video(self, images_bgr: Mapping[str, np.ndarray], *, elapsed_s: float | None = None) -> None:
+        """Advance camera streams to the elapsed-time target without rewriting history."""
+        if self.closed:
+            return
+        if not self.video:
+            return
+        elapsed = self._elapsed(elapsed_s)
+        target_frames = max(0, int(elapsed * self.video_fps + 0.5))
+        if images_bgr:
+            target_frames = max(1, target_frames)
+        self.requested_video_frames = max(self.requested_video_frames, target_frames)
+        with self._lock:
+            labeled = {safe_cam_name(k): v for k, v in images_bgr.items() if v is not None}
+            current_frames = dict(labeled)
+            merged = mosaic_bgr(labeled) if self.merge else None
+            if merged is not None:
+                current_frames["merged"] = merged
+
+            preview = merged if merged is not None else (next(iter(labeled.values())) if labeled else None)
+            preview_path = self.folder / "preview.jpg"
+            if preview is not None and not preview_path.is_file():
+                cv2.imwrite(str(preview_path), preview)
+
+            max_catchup = max(1, self.video_fps)
+            for name, frame in current_frames.items():
+                key = safe_cam_name(name)
+                if key not in self._videos:
+                    # Record a stream offset instead of synchronously cloning
+                    # its first frame over the entire pre-camera history.
+                    self._ensure_video(key, frame)
+                    self._video_start_frame[key] = max(0, target_frames - 1)
+                absolute_end = self._video_start_frame[key] + self._video_frames[key]
+                bounded_end = min(target_frames, absolute_end + max_catchup)
+                if bounded_end > absolute_end:
+                    last_frame = self._last_video_frame.get(key)
+                    if bounded_end < target_frames and last_frame is not None:
+                        # This tick is still catching up: never place a fresh
+                        # image into a historical slot. Drop it until the
+                        # stream reaches the current target; the old frame is
+                        # the only valid source for the missing interval.
+                        self._write_video_until(key, last_frame, bounded_end - self._video_start_frame[key])
+                    else:
+                        historical_end = max(absolute_end, bounded_end - 1)
+                        if last_frame is not None:
+                            self._write_video_until(key, last_frame, historical_end - self._video_start_frame[key])
+                        self._write_video_until(key, frame, bounded_end - self._video_start_frame[key])
+                else:
+                    width, height = self._video_size[key]
+                    if (frame.shape[1], frame.shape[0]) != (width, height):
+                        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+                    self._last_video_frame[key] = np.ascontiguousarray(frame).copy()
+            for name, last_frame in tuple(self._last_video_frame.items()):
+                if name in current_frames:
+                    continue
+                absolute_end = self._video_start_frame[name] + self._video_frames[name]
+                bounded_end = min(target_frames, absolute_end + max_catchup)
+                self._write_video_until(name, last_frame, bounded_end - self._video_start_frame[name])
+            self.video_frames = max(self._video_frames.values(), default=0)
 
     def add_frame(
         self,
@@ -150,48 +284,15 @@ class EpisodeWriter:
         kind: str | None = None,
         frame_index: int | None = None,
     ) -> None:
-        if self.closed:
-            return
-        row: dict[str, Any] = {
-            "t": f"{time.perf_counter() - self._t0:.4f}",
-            "frame": self.frames if frame_index is None else frame_index,
-            "episode": self.index,
-            "kind": kind or self.kind,
-        }
-        for name in JOINT_ORDER:
-            row[f"obs.{name}"] = f"{float(observation.get(name, float('nan'))):.4f}"
-            act_val = (action or {}).get(name, float("nan"))
-            row[f"act.{name}"] = f"{float(act_val):.4f}"
-        labeled = {safe_cam_name(k): v for k, v in images_bgr.items() if v is not None}
-        merged = mosaic_bgr(labeled) if self.merge else None
-        elapsed = time.perf_counter() - self._t0
-        copies = video_copies(elapsed, self.fps, self.frames)
-        with self._lock:
-            self._writer.writerow(row)
-            self._csv_file.flush()
-            resized: dict[str, np.ndarray] = {}
-            for cam, bgr in labeled.items():
-                writer = self._ensure_video(cam, bgr)
-                w, h = self._video_size[cam]
-                if (bgr.shape[1], bgr.shape[0]) != (w, h):
-                    bgr = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
-                resized[cam] = bgr
-            merged_frame = merged
-            if merged is not None:
-                writer = self._ensure_video("merged", merged)
-                w, h = self._video_size["merged"]
-                if (merged.shape[1], merged.shape[0]) != (w, h):
-                    merged_frame = cv2.resize(merged, (w, h), interpolation=cv2.INTER_AREA)
-            if self.frames == 0:
-                preview = merged_frame if merged_frame is not None else (next(iter(resized.values())) if resized else None)
-                if preview is not None:
-                    cv2.imwrite(str(self.folder / "preview.jpg"), preview)
-            for _ in range(copies):
-                for cam, bgr in resized.items():
-                    self._videos[cam].write(bgr)
-                if merged_frame is not None:
-                    self._videos["merged"].write(merged_frame)
-            self.frames += copies
+        elapsed = self._elapsed(None)
+        self.add_action(
+            observation,
+            action,
+            kind=kind,
+            frame_index=frame_index,
+            elapsed_s=elapsed,
+        )
+        self.add_video(images_bgr, elapsed_s=elapsed)
 
     def close(self) -> dict[str, Any]:
         if self.closed:
@@ -211,12 +312,40 @@ class EpisodeWriter:
         folder = self.folder / "videos"
         if folder.is_dir():
             videos = sorted(p.name for p in folder.iterdir() if p.is_file())
-        wall_s = max(0.0, time.perf_counter() - self._t0)
+        duration_s = max(
+            self._last_action_elapsed,
+            self.action_frames / self.action_fps,
+            max(
+                (self._video_start_frame.get(name, 0) + count) / self.video_fps
+                for name, count in self._video_frames.items()
+            )
+            if self._video_frames
+            else 0.0,
+        )
         return {
             "index": self.index,
-            "frames": self.frames,
-            "wall_s": round(wall_s, 3),
-            "fps": self.fps,
+            "frames": self.action_frames,
+            "action_frames": self.action_frames,
+            "video_frames": self.video_frames,
+            "requested_video_frames": self.requested_video_frames,
+            "effective_video_frames": max(
+                (self._video_start_frame.get(name, 0) + count for name, count in self._video_frames.items()),
+                default=0,
+            ),
+            "actual_video_frames": self.video_frames,
+            "per_camera_video_frames": dict(sorted(self._video_frames.items())),
+            "video_start_frames": dict(sorted(self._video_start_frame.items())),
+            "duration_s": round(duration_s, 4),
+            "wall_s": round(duration_s, 3),
+            "fps": self.action_fps,
+            "action_fps": self.action_fps,
+            "video_fps": self.video_fps,
+            "requested_video_fps": self.video_fps,
+            "encoded_video_fps": self.video_fps if self._video_frames else 0,
+            "effective_encoding_fps": self.video_fps if self._video_frames else 0,
+            # Compatibility alias for the container playback rate.
+            "effective_video_fps": self.video_fps if self._videos or self._video_frames else 0,
+            "video": self.video,
             "dir": self.folder.name,
             "videos": videos,
             "preview": "preview.jpg" if (self.folder / "preview.jpg").is_file() else None,
@@ -317,7 +446,9 @@ class SessionWriter:
         labeled = {safe_cam_name(k): v for k, v in images_bgr.items() if v is not None}
         merged = mosaic_bgr(labeled) if self.merge else None
         elapsed = time.perf_counter() - self._t0
-        copies = video_copies(elapsed, self.fps, self.frame_index)
+        # SessionWriter is the legacy coupled API: each call historically
+        # produced at least one video frame.
+        copies = max(1, video_copies(elapsed, self.fps, self.frame_index))
         with self._lock:
             self._writer.writerow(row)
             self._csv_file.flush()

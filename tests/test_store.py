@@ -31,3 +31,31 @@ def test_camera_settings_merge(tmp_path: Path) -> None:
     assert saved["label"] == "front"
     assert saved["show_main"] is True
     assert saved["feed_robot"] is True
+
+
+def test_episode_overrides_roundtrip(tmp_path: Path) -> None:
+    store = JsonStore(tmp_path / "store.json")
+    store.save_episode_override("video", "blocks_2026", 3, {"name": "grasp", "note": "slipped once"})
+    store.save_episode_override("video", "blocks_2026", 3, {"task": "sort blocks"})
+    store.save_episode_override("dataset", "user/so101", 0, {"name": "first"})
+    again = JsonStore(tmp_path / "store.json")
+    assert again.episode_overrides("video", "blocks_2026")["3"] == {
+        "name": "grasp",
+        "note": "slipped once",
+        "task": "sort blocks",
+    }
+    assert again.episode_overrides("dataset", "user/so101")["0"]["name"] == "first"
+    assert again.episode_overrides("video", "missing") == {}
+
+
+def test_episode_overrides_remap_and_delete(tmp_path: Path) -> None:
+    store = JsonStore(tmp_path / "store.json")
+    for index, name in enumerate(("zero", "one", "two")):
+        store.save_episode_override("video", "session", index, {"name": name})
+
+    remapped = store.remap_episode_overrides("video", "session", {0: 2, 2: 0})
+    assert remapped == {"2": {"name": "zero"}, "0": {"name": "two"}}
+    assert "1" not in store.episode_overrides("video", "session")
+
+    store.delete_episode_overrides("video", "session")
+    assert store.episode_overrides("video", "session") == {}

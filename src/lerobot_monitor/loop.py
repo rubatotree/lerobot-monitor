@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import queue
 import sys
 import threading
@@ -23,6 +24,14 @@ from .types import JOINT_ORDER, RELAX_POSE, lerp_pose, merge_partial
 
 logger = logging.getLogger(__name__)
 _LOG_SKIP_PREFIXES = ("uvicorn.access", "lerobot_monitor")
+# Policy construction mutates process-global stdout, environment, and HF/torch
+# caches. Serializing only output capture still lets two loaders corrupt those
+# globals, including when separate ControlLoop instances exist in one process.
+_POLICY_LOAD_LOCK = threading.Lock()
+_UI_LOG_LOCK = threading.Lock()
+_UI_LOG_HANDLERS: set[logging.Handler] = set()
+_UI_LOG_PREVIOUS_ROOT_LEVEL: int | None = None
+_UI_LOG_CHANGED_ROOT_LEVEL = False
 
 
 class _UiLogHandler(logging.Handler):
@@ -36,13 +45,16 @@ class _UiLogHandler(logging.Handler):
         if any(record.name.startswith(prefix) for prefix in _LOG_SKIP_PREFIXES):
             return
         try:
-            message = record.getMessage().strip()
+            # Formatter.format() appends exc_info/stack_info; getMessage() loses
+            # the traceback that is most useful for diagnosing Windows failures.
+            message = self.format(record).strip()
         except Exception:
+            self.handleError(record)
             return
         if not message:
             return
         level = "error" if record.levelno >= logging.ERROR else "info"
-        self.loop.log(level, f"[{record.name}] {message}", echo=False)
+        self.loop.log(level, message, echo=False)
 
 
 class _StdioToLog:
@@ -85,6 +97,17 @@ class Command:
     reply: queue.Queue[dict[str, Any]] | None = None
 
 
+@dataclass
+class _PolicyLoadJob:
+    """One rollout load attempt; only the current generation may consume it."""
+
+    generation: int
+    payload: dict[str, Any]
+    thread: threading.Thread | None = None
+    result: LoadedPolicy | None = None
+    error: str | None = None
+
+
 class ControlLoop:
     def __init__(
         self,
@@ -119,6 +142,7 @@ class ControlLoop:
         self.writer: DatasetRecorder | None = None
         self.record_kind: str | None = None
         self.episode_index = 0
+        self.recording_start_index = 0
         self.episode_t0 = 0.0
         self.episode_time_s = config.recording.default_episode_time_s
         self.reset_time_s = config.recording.default_reset_time_s
@@ -135,18 +159,26 @@ class ControlLoop:
         self.task_deadline: float | None = None
         self.loaded_policy: LoadedPolicy | None = None
         self.rollout_task = ""
+        self.policy_fps = float(config.rollout.default_fps)
+        self.effective_policy_fps = min(self.policy_fps, float(config.control.fps))
+        self._policy_interval = 1.0 / max(1.0, self.effective_policy_fps)
+        self._next_policy_t = 0.0
         self._policy_cache: dict[tuple[Any, ...], LoadedPolicy] = {}
-        self._policy_job: threading.Thread | None = None
-        self._policy_result: LoadedPolicy | None = None
-        self._policy_error: str | None = None
-        self._rollout_payload: dict[str, Any] | None = None
+        self._policy_generation = 0
+        self._policy_job: _PolicyLoadJob | None = None
+        self._policy_job_lock = threading.Lock()
+        self._start_generation = 0
+        self._start_lock = threading.Lock()
+        self.recording_mutation_lock = threading.Lock()
         self.library = VideoLibrary(config.videos_root())
 
         self._commands: queue.Queue[Command] = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._record_interval = 1.0 / max(1, config.recording.fps)
-        self._last_record_t = 0.0
+        self._action_interval = 1.0 / max(1, config.recording.action_fps)
+        self._video_interval = 1.0 / max(1, config.recording.video_fps)
+        self._next_action_t = 0.0
+        self._next_video_t = 0.0
         self._last_bus_use = 0.0
         self._pending_release: str | None = None
         self._pending_release_reply: queue.Queue[dict[str, Any]] | None = None
@@ -159,22 +191,70 @@ class ControlLoop:
         self._stop.clear()
         if self._ui_log_handler is None:
             handler = _UiLogHandler(self)
-            handler.setFormatter(logging.Formatter("%(message)s"))
-            logging.getLogger().addHandler(handler)
-            logging.getLogger().setLevel(logging.INFO)
+            handler.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+            self._attach_ui_log_handler(handler)
             self._ui_log_handler = handler
         self._thread = threading.Thread(target=self._run, name="control-loop", daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except BaseException:
+            self._thread = None
+            self._detach_ui_log_handler()
+            raise
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=10.0)
-            self._thread = None
-        self._close_writer()
-        if self.follower.connected:
-            self.follower.disconnect()
-        self.leader.disconnect()
+        try:
+            thread = self._thread
+            if thread is not None:
+                thread.join(timeout=10.0)
+                if not thread.is_alive():
+                    self._thread = None
+            try:
+                self._close_writer()
+            finally:
+                try:
+                    if self.follower.connected:
+                        self.follower.disconnect()
+                finally:
+                    self.leader.disconnect()
+        finally:
+            self._detach_ui_log_handler()
+
+    def _attach_ui_log_handler(self, handler: logging.Handler) -> None:
+        global _UI_LOG_CHANGED_ROOT_LEVEL, _UI_LOG_PREVIOUS_ROOT_LEVEL
+
+        root = logging.getLogger()
+        with _UI_LOG_LOCK:
+            if not _UI_LOG_HANDLERS:
+                _UI_LOG_PREVIOUS_ROOT_LEVEL = root.level
+                _UI_LOG_CHANGED_ROOT_LEVEL = root.level > logging.INFO
+                if _UI_LOG_CHANGED_ROOT_LEVEL:
+                    root.setLevel(logging.INFO)
+            root.addHandler(handler)
+            _UI_LOG_HANDLERS.add(handler)
+
+    def _detach_ui_log_handler(self) -> None:
+        global _UI_LOG_CHANGED_ROOT_LEVEL, _UI_LOG_PREVIOUS_ROOT_LEVEL
+
+        handler = self._ui_log_handler
+        if handler is None:
+            return
+        root = logging.getLogger()
+        with _UI_LOG_LOCK:
+            # Remove this exact instance only; other ControlLoops may be active.
+            root.removeHandler(handler)
+            _UI_LOG_HANDLERS.discard(handler)
+            self._ui_log_handler = None
+            if not _UI_LOG_HANDLERS:
+                if (
+                    _UI_LOG_CHANGED_ROOT_LEVEL
+                    and _UI_LOG_PREVIOUS_ROOT_LEVEL is not None
+                    and root.level == logging.INFO
+                ):
+                    root.setLevel(_UI_LOG_PREVIOUS_ROOT_LEVEL)
+                _UI_LOG_PREVIOUS_ROOT_LEVEL = None
+                _UI_LOG_CHANGED_ROOT_LEVEL = False
 
     def submit(self, kind: str, payload: dict[str, Any] | None = None, timeout: float = 8.0) -> dict[str, Any]:
         reply: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
@@ -189,14 +269,20 @@ class ControlLoop:
 
     def request_estop(self) -> dict[str, Any]:
         """Disable torque immediately; do not wait for the control-queue tick."""
-        self._cancel.set()
         self._estop.set()
+        self._cancel.set()
+        with self._start_lock:
+            self._start_generation += 1
         self._apply_estop()
+        self._invalidate_policy_load(blocking=False)
         return {"ok": True}
 
     def request_stop(self) -> dict[str, Any]:
         """Abort a pending start immediately; queue a real stop if a task is running."""
         self._cancel.set()
+        with self._start_lock:
+            self._start_generation += 1
+        self._cancel_policy_load()
         pending = self.pending
         self.pending = None
         self.log("info", "stop requested")
@@ -208,8 +294,17 @@ class ControlLoop:
             self.on_snapshot(self.snapshot())
         return {"ok": True, "pending": pending, "mode": self.mode}
 
-    def _aborted(self, cmd: Command, label: str) -> bool:
-        if not self._cancel.is_set():
+    def _start_token(self, payload: dict[str, Any]) -> int:
+        token = payload.get("_start_generation")
+        return self._start_generation if token is None else int(token)
+
+    def _start_cancelled(self, token: int) -> bool:
+        return self._cancel.is_set() or self._estop.is_set() or token != self._start_generation
+
+    def _aborted(self, cmd: Command, label: str, token: int | None = None) -> bool:
+        if not self._cancel.is_set() and not self._estop.is_set() and (
+            token is None or token == self._start_generation
+        ):
             return False
         self.pending = None
         self.log("info", f"{label} cancelled")
@@ -223,10 +318,6 @@ class ControlLoop:
         self._slew_goal = None
         self._pending_release = None
         try:
-            self._close_writer()
-        except Exception as exc:  # noqa: BLE001
-            self.log("error", f"E-STOP session: {exc}")
-        try:
             if self.follower.connected:
                 self.follower.disable_torque()
                 self._release_follower("estop")
@@ -236,6 +327,10 @@ class ControlLoop:
                 self.follower.disable_torque()
             except Exception:
                 pass
+        try:
+            self._close_writer()
+        except Exception as exc:  # noqa: BLE001
+            self.log("error", f"E-STOP session: {exc}")
         if first:
             self.log("error", "E-STOP — torque disabled, serial released")
 
@@ -321,18 +416,46 @@ class ControlLoop:
         self._policy_cache[key] = loaded
         return loaded
 
-    def _policy_worker(self, path: str, device: str, task: str, extra: dict[str, str]) -> None:
+    def _invalidate_policy_load(self, *, blocking: bool = True) -> bool:
+        """Permanently detach the current loader without waiting for its thread."""
+        acquired = self._policy_job_lock.acquire(blocking=blocking)
+        if not acquired:
+            return False
         try:
-            with self._capture_task_output():
-                loaded = self._get_or_load_policy(path, device, task, extra)
-            self._policy_result = loaded
-            self._policy_error = None
-        except Exception as exc:  # noqa: BLE001
-            self._policy_result = None
-            self._policy_error = str(exc)
-            self.log("error", f"policy load failed: {exc}")
+            self._policy_generation += 1
+            self._policy_job = None
+        finally:
+            self._policy_job_lock.release()
+        return True
 
-    def _begin_rollout(self, loaded: LoadedPolicy, payload: dict[str, Any], path: str) -> None:
+    def _cancel_policy_load(self) -> None:
+        """Linearize cancellation against rollout activation and first action."""
+        self._cancel.set()
+        with self._policy_job_lock:
+            self._policy_generation += 1
+            self._policy_job = None
+
+    def _policy_worker(
+        self,
+        job: _PolicyLoadJob,
+        path: str,
+        device: str,
+        task: str,
+        extra: dict[str, str],
+    ) -> None:
+        try:
+            with _POLICY_LOAD_LOCK, self._capture_task_output():
+                loaded = self._get_or_load_policy(path, device, task, extra)
+            job.result = loaded
+        except Exception as exc:  # noqa: BLE001
+            job.error = str(exc)
+
+    def _begin_rollout(self, loaded: LoadedPolicy, payload: dict[str, Any], path: str) -> bool:
+        start_token = self._start_token(payload)
+        if self._start_cancelled(start_token):
+            self.pending = None
+            self.log("info", "rollout cancelled")
+            return False
         loaded.reset()
         loaded.task = str(payload.get("task") or loaded.task)
         self.loaded_policy = loaded
@@ -340,54 +463,82 @@ class ControlLoop:
         duration = float(payload.get("duration_s") or self.config.rollout.default_duration_s)
         self.task_t0 = time.perf_counter()
         self.task_deadline = None if duration <= 0 else self.task_t0 + duration
+        self.policy_fps, self.effective_policy_fps = self._policy_rates(payload)
+        self._policy_interval = 1.0 / self.effective_policy_fps
+        self._next_policy_t = self.task_t0
         if payload.get("auto_record") is not None:
             self.auto_record = bool(payload.get("auto_record"))
         want_record = bool(payload.get("record")) if payload.get("record") is not None else self.auto_record
+        recorder: DatasetRecorder | None = None
         if want_record:
-            self._close_writer()
             rec_payload = dict(payload)
+            # Rollout `fps` is the legacy policy/inference frequency, never a
+            # recording-rate alias. Recording uses only explicit dual rates or
+            # RecordingConfig defaults.
+            rec_payload.pop("fps", None)
+            rec_payload.pop("policy_fps", None)
             rec_payload.setdefault("task", self.rollout_task)
             rec_payload.setdefault("name", Path(path).name or "rollout")
-            self.writer = self._open_recorder("rollout", rec_payload)
-            self.record_kind = "rollout"
-            self.episode_t0 = self.task_t0
-        self.pending = None
-        self.mode = "rollout"
+            recorder = self._open_recorder("rollout", rec_payload)
+        with self._start_lock:
+            cancelled = self._start_cancelled(start_token)
+            if not cancelled:
+                if recorder is not None:
+                    self._publish_recorder(recorder, "rollout")
+                    self.episode_t0 = self.task_t0
+                self.pending = None
+                self.mode = "rollout"
+        if cancelled:
+            if recorder is not None:
+                recorder.close()
+            self.pending = None
+            self.log("info", "rollout cancelled")
+            return False
         self._touch_bus()
         self.log("info", f"rollout started ({loaded.policy.__class__.__name__})")
+        return True
 
     def _complete_rollout_load(self) -> None:
-        if self._rollout_payload is None:
-            return
-        if self._policy_job is not None and self._policy_job.is_alive():
-            return
-        payload = self._rollout_payload
-        self._rollout_payload = None
-        self._policy_job = None
-        if self._cancel.is_set():
+        with self._policy_job_lock:
+            job = self._policy_job
+            if job is None or job.thread is None or job.thread.is_alive():
+                return
+            if job.generation != self._policy_generation:
+                self._policy_job = None
+                return
+            self._policy_job = None
+        if self._cancel.is_set() or self._estop.is_set():
             self.pending = None
             self.log("info", "rollout cancelled")
             return
-        if self._policy_error:
+        if job.error:
             self.pending = None
-            self.last_error = self._policy_error
+            self.last_error = job.error
+            self.log("error", f"policy load failed: {job.error}")
             return
-        if self._policy_result is None:
+        if job.result is None:
             self.pending = None
             return
-        path = str(payload.get("policy_path") or "")
-        self._begin_rollout(self._policy_result, payload, path)
+        path = str(job.payload.get("policy_path") or "")
+        self._begin_rollout(job.result, job.payload, path)
 
-    def note_pending(self, kind: str, message: str) -> None:
+    def note_pending(self, kind: str, message: str) -> int:
         """Log and mark a task requested before the control thread picks it up."""
-        self._cancel.clear()
-        self.pending = kind
+        with self._start_lock:
+            self._start_generation += 1
+            token = self._start_generation
+            self._cancel.clear()
+            self.pending = kind
         self.log("info", message)
         if self.on_snapshot is not None:
             self.on_snapshot(self.snapshot())
+        return token
 
-    def clear_pending(self) -> None:
-        self.pending = None
+    def clear_pending(self, token: int | None = None) -> None:
+        with self._start_lock:
+            if token is not None and token != self._start_generation:
+                return
+            self.pending = None
         if self.on_snapshot is not None:
             self.on_snapshot(self.snapshot())
 
@@ -425,6 +576,8 @@ class ControlLoop:
                 "video_id": None if self.writer is None else self.writer.session_id,
                 "num_episodes": self.num_episodes if self.writer else None,
                 "policy_path": None if self.loaded_policy is None else self.loaded_policy.path,
+                "policy_fps": self.policy_fps if self.loaded_policy is not None else None,
+                "effective_policy_fps": self.effective_policy_fps if self.loaded_policy is not None else None,
                 "task": self.rollout_task,
                 "message": self.last_error,
             },
@@ -438,22 +591,118 @@ class ControlLoop:
     def _close_writer(self) -> Path | None:
         if self.writer is None:
             return None
-        path = self.writer.close()
-        self.log("info", f"dataset saved: {path}")
+        writer = self.writer
         self.writer = None
         self.record_kind = None
+        path = writer.close()
+        self.log("info", f"dataset saved: {path}")
         return path
 
+    def _publish_recorder(self, recorder: DatasetRecorder, kind: str) -> None:
+        self.writer = recorder
+        self.record_kind = kind
+        self.selected_dataset_id = recorder.dataset_id
+        self.episode_index = recorder.episode_index
+        self.recording_start_index = recorder.episode_index
+        self._action_interval = 1.0 / recorder.action_fps
+        self._video_interval = 1.0 / recorder.video_fps
+        self._reset_recording_deadlines()
+
+    def _reset_recording_deadlines(self, now: float | None = None) -> None:
+        start = time.perf_counter() if now is None else float(now)
+        self._next_action_t = start
+        self._next_video_t = start
+
+    @staticmethod
+    def _advance_deadline(deadline: float, interval: float, now: float) -> float:
+        # The epsilon prevents a decimal deadline such as 0.35 from remaining
+        # due because its binary quotient is represented as 6.999999999.
+        missed = max(1, math.floor((now - deadline) / interval + 1e-9) + 1)
+        return deadline + missed * interval
+
+    def _recording_rates(self, payload: dict[str, Any]) -> tuple[int, int]:
+        legacy = payload.get("fps")
+        action_fps = int(
+            payload.get("action_fps")
+            if payload.get("action_fps") is not None
+            else legacy if legacy is not None else self.config.recording.action_fps
+        )
+        video_fps = int(
+            payload.get("video_fps")
+            if payload.get("video_fps") is not None
+            else legacy if legacy is not None else self.config.recording.video_fps
+        )
+        if action_fps <= 0 or video_fps <= 0:
+            raise ValueError("action_fps and video_fps must be positive")
+        control_limit = max(1, int(self.config.control.fps))
+        if action_fps > control_limit:
+            raise ValueError(f"action_fps={action_fps} exceeds control loop capacity ({control_limit} fps)")
+        if video_fps > control_limit:
+            raise ValueError(f"video_fps={video_fps} exceeds camera sampling capacity ({control_limit} fps)")
+        return action_fps, video_fps
+
+    def _policy_rates(self, payload: dict[str, Any]) -> tuple[float, float]:
+        legacy = payload.get("fps")
+        requested = float(
+            payload.get("policy_fps")
+            if payload.get("policy_fps") is not None
+            else legacy if legacy is not None else self.config.rollout.default_fps
+        )
+        if not math.isfinite(requested) or requested <= 0:
+            raise ValueError("policy_fps must be positive")
+        control_limit = max(1.0, float(self.config.control.fps))
+        return requested, min(requested, control_limit)
+
     def _open_recorder(self, kind: str, payload: dict[str, Any] | None = None) -> DatasetRecorder:
-        p = payload or {}
-        fps = int(p.get("fps") or self.config.recording.fps)
-        self._record_interval = 1.0 / max(1, fps)
+        self.recording_mutation_lock.acquire()
+        try:
+            recorder = self._open_recorder_unlocked(kind, payload)
+            recorder._on_close = self.recording_mutation_lock.release
+            return recorder
+        except BaseException:
+            self.recording_mutation_lock.release()
+            raise
+
+    def _open_recorder_unlocked(self, kind: str, payload: dict[str, Any] | None = None) -> DatasetRecorder:
+        p = dict(payload or {})
+        resume = bool(p.get("resume", False))
+        dataset_id = str(p.get("video_id") or p.get("dataset_id") or "").strip()
+        library = self.library
+        requested_root = str(p.get("root") or "").strip()
+        if requested_root:
+            output_root = Path(requested_root).expanduser().resolve()
+            if output_root.exists() and not output_root.is_dir():
+                raise ValueError("recording root must be a directory")
+            library = VideoLibrary(output_root)
+        root: Path | None = None
+        existing: dict[str, Any] = {}
+        if resume:
+            if not dataset_id:
+                raise ValueError("resume requires video_id or dataset_id")
+            try:
+                existing = library.get(dataset_id)
+            except ValueError as exc:
+                raise ValueError(f"invalid resume target '{dataset_id}'") from exc
+            except FileNotFoundError:
+                raise FileNotFoundError(f"resume target '{dataset_id}' does not exist")
+            root = Path(existing["path"])
+            if p.get("action_fps") is None and p.get("fps") is None:
+                p["action_fps"] = existing.get("action_fps") or existing.get("fps")
+            if p.get("video_fps") is None and p.get("fps") is None:
+                p["video_fps"] = existing.get("video_fps") or existing.get("fps")
+            stored_format = str(existing.get("format") or self.config.recording.video_format)
+            if p.get("format") is not None and str(p["format"]) != stored_format:
+                raise ValueError(
+                    f"resume format mismatch: dataset uses {stored_format}; requested {p['format']}"
+                )
+            p["format"] = stored_format
+
+        action_fps, video_fps = self._recording_rates(p)
         video_format = str(p.get("format") or self.config.recording.video_format)
         merge = bool(p["merge"] if p.get("merge") is not None else self.config.recording.merge)
-        dataset_id = str(p.get("video_id") or p.get("dataset_id") or self.selected_dataset_id or "").strip()
         extra = {
-            "task": p.get("task") or "",
-            "repo_id": p.get("repo_id") or "",
+            "task": p.get("task") or existing.get("task") or "",
+            "repo_id": p.get("repo_id") or existing.get("repo_id") or "",
             "kind": kind,
             "format": video_format,
             "streaming_encoding": bool(
@@ -466,20 +715,19 @@ class ControlLoop:
                 if p.get("encoder_threads") is not None
                 else self.config.recording.encoder_threads
             ),
-            "video": bool(p["video"] if p.get("video") is not None else self.config.recording.video),
+            "video": bool(
+                p["video"]
+                if p.get("video") is not None
+                else existing.get("video", self.config.recording.video)
+            ),
+            "action_fps": action_fps,
+            "video_fps": video_fps,
         }
-        root: Path | None = None
-        if dataset_id:
-            try:
-                candidate = self.library._dataset_dir(dataset_id)
-            except ValueError:
-                candidate = None
-            if candidate is not None and (candidate / "meta.json").is_file():
-                root = candidate
         if root is not None:
             recorder = DatasetRecorder(
                 root,
-                fps=fps,
+                action_fps=action_fps,
+                video_fps=video_fps,
                 kind=kind,
                 extra_meta=extra,
                 resume=True,
@@ -487,44 +735,51 @@ class ControlLoop:
                 merge=merge,
             )
         else:
-            created = self.library.create(
+            created = library.create(
                 str(p.get("name") or p.get("repo_id") or p.get("task") or kind),
-                fps=fps,
+                fps=action_fps,
+                action_fps=action_fps,
+                video_fps=video_fps,
                 task=str(p.get("task") or ""),
                 repo_id=str(p.get("repo_id") or ""),
                 extra=extra,
             )
             recorder = DatasetRecorder(
                 Path(created["path"]),
-                fps=fps,
+                action_fps=action_fps,
+                video_fps=video_fps,
                 kind=kind,
                 extra_meta=extra,
                 resume=False,
                 video_format=video_format,
                 merge=merge,
             )
-        self.selected_dataset_id = recorder.dataset_id
-        self.episode_index = recorder.episode_index
-        self._last_record_t = 0.0
         return recorder
 
     def _maybe_record(self, kind: str) -> None:
         if self.writer is None:
             return
         now = time.perf_counter()
-        if now - self._last_record_t < self._record_interval:
+        action_due = now >= self._next_action_t
+        video_due = now >= self._next_video_t
+        if not action_due and not video_due:
             return
-        self._last_record_t = now
-        images = self.cameras.latest_main_bgr_map()
-        if not images:
-            images = self.cameras.latest_bgr_map()
-        self.writer.add_frame(
-            self.joints,
-            self.action or self.latched,
-            images,
-            episode_index=self.episode_index,
-            kind=kind,
-        )
+        if action_due:
+            self.writer.add_action(
+                self.joints,
+                self.action or self.latched,
+                episode_index=self.episode_index,
+                kind=kind,
+            )
+            self._next_action_t = self._advance_deadline(self._next_action_t, self._action_interval, now)
+        if video_due:
+            images: dict[str, Any] = {}
+            if self.writer.video:
+                images = self.cameras.latest_main_bgr_map()
+                if not images:
+                    images = self.cameras.latest_bgr_map()
+            self.writer.add_video(images, episode_index=self.episode_index)
+            self._next_video_t = self._advance_deadline(self._next_video_t, self._video_interval, now)
 
     def _run(self) -> None:
         if self.config.robot.auto_connect:
@@ -689,6 +944,10 @@ class ControlLoop:
             self.leader.disconnect()
             self._reply(cmd, ok=True)
         elif kind == "jog":
+            if self.pending in {"teleop_start", "record_start", "rollout_start", "capture_start"}:
+                raise RuntimeError(f"cannot jog while {self.pending} is pending")
+            if self.mode == "jogging" and bool(p.get("live")):
+                raise RuntimeError("cannot live jog while a jog or relax motion is running")
             self._ensure_follower()
             self._pending_release = None
             if self.mode in {"teleop", "record", "rollout"}:
@@ -744,6 +1003,7 @@ class ControlLoop:
             self.request_estop()
             self._reply(cmd, ok=True)
         elif kind == "task_stop":
+            self._invalidate_policy_load()
             self._cancel.clear()
             stopped = self.mode
             if stopped == "teleop":
@@ -793,24 +1053,40 @@ class ControlLoop:
             self.log("info", "torque re-enabled, idle")
             self._reply(cmd, ok=True)
         elif kind == "teleop_start":
+            start_token = self._start_token(p)
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"stop {self.mode} before starting teleop")
-            if self._aborted(cmd, "teleop"):
+            if self._aborted(cmd, "teleop", start_token):
                 return
             self._ensure_follower()
-            if self._aborted(cmd, "teleop"):
+            if self._aborted(cmd, "teleop", start_token):
                 return
             if not self.leader.connected:
                 self.leader.connect()
+            if self._aborted(cmd, "teleop", start_token):
+                return
             if p.get("auto_record") is not None:
                 self.auto_record = bool(p.get("auto_record"))
-            self.mode = "teleop"
-            self.task_t0 = time.perf_counter()
-            self._touch_bus()
+            task_t0 = time.perf_counter()
+            recorder: DatasetRecorder | None = None
             if self.auto_record and self.writer is None:
-                self.writer = self._open_recorder("teleop", p)
-                self.record_kind = "teleop"
-                self.episode_t0 = self.task_t0
+                recorder = self._open_recorder("teleop", p)
+            with self._start_lock:
+                cancelled = self._start_cancelled(start_token)
+                if not cancelled:
+                    self.mode = "teleop"
+                    self.task_t0 = task_t0
+                    if recorder is not None:
+                        self._publish_recorder(recorder, "teleop")
+                        self.episode_t0 = task_t0
+            if cancelled:
+                if recorder is not None:
+                    recorder.close()
+                self.pending = None
+                self.log("info", "teleop cancelled")
+                self._reply(cmd, ok=True, cancelled=True)
+                return
+            self._touch_bus()
             self.log("info", "teleop started")
             self._reply(cmd, ok=True, session_id=None if self.writer is None else self.writer.session_id)
         elif kind == "teleop_stop":
@@ -823,15 +1099,18 @@ class ControlLoop:
                 self._touch_bus()
             self._reply(cmd, ok=True)
         elif kind == "record_start":
+            start_token = self._start_token(p)
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"stop {self.mode} before starting record")
-            if self._aborted(cmd, "record"):
+            if self._aborted(cmd, "record", start_token):
                 return
             self._ensure_follower()
-            if self._aborted(cmd, "record"):
+            if self._aborted(cmd, "record", start_token):
                 return
             if not self.leader.connected:
                 self.leader.connect()
+            if self._aborted(cmd, "record", start_token):
+                return
             self._close_writer()
             self.episode_time_s = float(p.get("episode_time_s") or self.config.recording.default_episode_time_s)
             self.reset_time_s = float(
@@ -839,11 +1118,21 @@ class ControlLoop:
             )
             self.num_episodes = int(p.get("num_episodes") or self.config.recording.default_num_episodes)
             self._resetting = False
-            self.writer = self._open_recorder("record", p)
-            self.record_kind = "record"
-            self.mode = "record"
-            self.task_t0 = time.perf_counter()
-            self.episode_t0 = self.task_t0
+            recorder = self._open_recorder("record", p)
+            task_t0 = time.perf_counter()
+            with self._start_lock:
+                cancelled = self._start_cancelled(start_token)
+                if not cancelled:
+                    self._publish_recorder(recorder, "record")
+                    self.mode = "record"
+                    self.task_t0 = task_t0
+                    self.episode_t0 = task_t0
+            if cancelled:
+                recorder.close()
+                self.pending = None
+                self.log("info", "record cancelled")
+                self._reply(cmd, ok=True, cancelled=True)
+                return
             self._touch_bus()
             self.log("info", f"recording {self.writer.session_id} ep {self.episode_index}")
             self._reply(cmd, ok=True, session_id=self.writer.session_id, dataset_id=self.selected_dataset_id)
@@ -855,9 +1144,11 @@ class ControlLoop:
         elif kind == "record_next":
             if self.writer is None:
                 raise RuntimeError("not recording")
+            self.writer.finish_episode(self.episode_index)
             self._resetting = False
             self.episode_index += 1
             self.episode_t0 = time.perf_counter()
+            self._reset_recording_deadlines(self.episode_t0)
             self.log("info", f"episode {self.episode_index}")
             self._reply(cmd, ok=True, episode_index=self.episode_index)
         elif kind == "rollout_start":
@@ -865,14 +1156,15 @@ class ControlLoop:
                 raise RuntimeError(f"stop {self.mode} before starting rollout")
             if self._aborted(cmd, "rollout"):
                 return
-            if self._policy_job is not None and self._policy_job.is_alive():
-                raise RuntimeError("policy is already loading")
             self._ensure_follower()
             if self._aborted(cmd, "rollout"):
                 return
             path = str(p.get("policy_path") or "")
             if not path:
                 raise ValueError("policy_path is required")
+            requested_policy_fps, effective_policy_fps = self._policy_rates(p)
+            p["policy_fps"] = requested_policy_fps
+            p["effective_policy_fps"] = effective_policy_fps
             extra = p.get("extra") or {}
             self.rollout_extra = {str(k): str(v) for k, v in extra.items() if str(k).strip()}
             device = str(p.get("device") or self.config.rollout.device)
@@ -880,22 +1172,33 @@ class ControlLoop:
             cached = self._policy_cache.get(self._policy_key(path, device, self.rollout_extra))
             if cached is not None:
                 self.log("info", f"using cached policy {path}")
-                self._begin_rollout(cached, p, path)
-                self._reply(cmd, ok=True, session_id=None if self.writer is None else self.writer.session_id)
+                with self._policy_job_lock:
+                    self._policy_generation += 1
+                    self._policy_job = None
+                started = self._begin_rollout(cached, p, path)
+                self._reply(
+                    cmd,
+                    ok=True,
+                    cancelled=not started,
+                    session_id=None if self.writer is None else self.writer.session_id,
+                )
                 return
             self.log("info", f"loading policy {path} (background, local cache first)")
-            self._policy_error = None
-            self._policy_result = None
-            self._rollout_payload = dict(p)
-            self._policy_job = threading.Thread(
-                target=self._policy_worker,
-                args=(path, device, task, self.rollout_extra),
-                daemon=True,
-                name="policy-load",
-            )
-            self._policy_job.start()
+            with self._policy_job_lock:
+                self._policy_generation += 1
+                job = _PolicyLoadJob(generation=self._policy_generation, payload=dict(p))
+                thread = threading.Thread(
+                    target=self._policy_worker,
+                    args=(job, path, device, task, self.rollout_extra),
+                    daemon=True,
+                    name="policy-load",
+                )
+                job.thread = thread
+                self._policy_job = job
+            thread.start()
             self._reply(cmd, ok=True, accepted=True)
         elif kind == "rollout_stop":
+            self._invalidate_policy_load()
             path = self._close_writer()
             self.loaded_policy = None
             self.mode = "idle" if self.follower.connected else "offline"
@@ -904,14 +1207,24 @@ class ControlLoop:
             self._touch_bus()
             self._reply(cmd, ok=True, path=None if path is None else str(path))
         elif kind == "capture_start":
-            if self._aborted(cmd, "capture"):
+            start_token = self._start_token(p)
+            if self._aborted(cmd, "capture", start_token):
                 return
             if self.writer is not None:
                 self._reply(cmd, ok=True, session_id=self.writer.session_id, already=True)
                 return
-            self.writer = self._open_recorder(str(p.get("kind") or self.mode or "capture"), p)
-            self.record_kind = self.writer.kind
-            self.episode_t0 = time.perf_counter()
+            recorder = self._open_recorder(str(p.get("kind") or self.mode or "capture"), p)
+            with self._start_lock:
+                cancelled = self._start_cancelled(start_token)
+                if not cancelled:
+                    self._publish_recorder(recorder, recorder.kind)
+                    self.episode_t0 = time.perf_counter()
+            if cancelled:
+                recorder.close()
+                self.pending = None
+                self.log("info", "capture cancelled")
+                self._reply(cmd, ok=True, cancelled=True)
+                return
             self.log("info", f"capture {self.writer.session_id}")
             self._reply(cmd, ok=True, session_id=self.writer.session_id, dataset_id=self.selected_dataset_id)
         elif kind == "capture_stop":
@@ -995,11 +1308,14 @@ class ControlLoop:
                 self._resetting = False
                 self.episode_index += 1
                 self.episode_t0 = now
+                self._reset_recording_deadlines(now)
                 self.log("info", f"episode {self.episode_index}")
             return
         self._maybe_record("record")
         if now - self.episode_t0 >= self.episode_time_s:
-            finished = self.episode_index + 1
+            finished = self.episode_index - self.recording_start_index + 1
+            if self.writer is not None:
+                self.writer.finish_episode(self.episode_index)
             if finished >= self.num_episodes:
                 self.log("info", f"reached {self.num_episodes} episodes")
                 self._close_writer()
@@ -1012,22 +1328,28 @@ class ControlLoop:
             else:
                 self.episode_index += 1
                 self.episode_t0 = now
+                self._reset_recording_deadlines(now)
                 self.log("info", f"episode {self.episode_index}")
 
     def _tick_rollout(self) -> None:
-        if self.loaded_policy is None:
+        if self._cancel.is_set() or self.loaded_policy is None:
             self.mode = "idle"
             return
-        if self.task_deadline is not None and time.perf_counter() >= self.task_deadline:
+        now = time.perf_counter()
+        if self.task_deadline is not None and now >= self.task_deadline:
             self.log("info", "rollout duration reached")
             self._close_writer()
             self.loaded_policy = None
             self.mode = "idle"
             self.latched = dict(self.joints)
             return
+        if now < self._next_policy_t:
+            self._maybe_record("rollout")
+            return
+        self._next_policy_t = self._advance_deadline(self._next_policy_t, self._policy_interval, now)
         images = self.cameras.latest_rgb_map()
         pose = predict_pose(self.loaded_policy, self.joints, images)
-        if self._estop.is_set():
+        if self._cancel.is_set() or self._estop.is_set() or self.mode != "rollout":
             return
         self.follower.send_pose(pose)
         self.action = dict(pose)

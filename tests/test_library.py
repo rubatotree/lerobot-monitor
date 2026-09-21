@@ -1,8 +1,16 @@
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from lerobot_monitor.library import VideoLibrary, DatasetRecorder, list_hf_datasets
+from lerobot_monitor.library import (
+    DatasetRecorder,
+    VideoLibrary,
+    list_hf_datasets,
+    list_local_models,
+)
 from lerobot_monitor.session import mosaic_bgr
 from lerobot_monitor.types import JOINT_ORDER
 
@@ -31,14 +39,140 @@ def test_dataset_create_record_reorder_delete(tmp_path: Path) -> None:
     assert preview.is_file()
     video = lib.episode_video(created["id"], 0, "merged")
     assert video.is_file()
-    lib.reorder(created["id"], [1, 0])
+    reordered = lib.reorder(created["id"], [1, 0])
+    assert reordered["episode_index_map"] == {"1": 0, "0": 1}
     again = lib.get(created["id"])
     assert [e["index"] for e in again["episodes"]] == [0, 1]
-    lib.delete_episode(created["id"], 0)
+    deleted = lib.delete_episode(created["id"], 0)
+    assert deleted["episode_index_map"] == {"1": 0}
     leftover = lib.get(created["id"])
     assert len(leftover["episodes"]) == 1
     lib.delete(created["id"])
     assert lib.list() == []
+
+
+def test_recorder_resume_skips_uncommitted_episode_directories(tmp_path: Path) -> None:
+    root = tmp_path / "videos" / "session"
+    residue = root / "episodes" / "000007"
+    residue.mkdir(parents=True)
+    marker = residue / "crash-residue.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    (root / "meta.json").write_text(
+        '{"episodes": [{"index": 2}], "frames": 3}\n',
+        encoding="utf-8",
+    )
+
+    recorder = DatasetRecorder(root, fps=5, kind="record", resume=True, merge=False)
+    assert recorder.episode_index == 8
+    recorder.add_frame({"gripper": 1.0}, {"gripper": 2.0}, {})
+    recorder.close()
+
+    assert marker.read_text(encoding="utf-8") == "preserve"
+    assert (root / "episodes" / "000008" / "joints.csv").is_file()
+
+
+def test_recorder_video_false_writes_only_csv_and_meta(tmp_path: Path, monkeypatch) -> None:
+    from lerobot_monitor import session as session_module
+
+    def fail_open(*args, **kwargs):
+        raise AssertionError("video writer must not be opened")
+
+    monkeypatch.setattr(session_module, "open_video_writer", fail_open)
+    root = tmp_path / "videos" / "no_media"
+    recorder = DatasetRecorder(
+        root,
+        fps=5,
+        kind="record",
+        extra_meta={"video": False},
+        merge=True,
+    )
+    frame = np.zeros((8, 10, 3), dtype=np.uint8)
+    recorder.add_frame({}, None, {"front": frame})
+    recorder.add_frame({}, None, {"front": frame})
+    recorder.close()
+
+    episode = root / "episodes" / "000000"
+    assert (episode / "joints.csv").read_text(encoding="utf-8").count("\n") == 3
+    assert not (episode / "videos").exists()
+    assert not (episode / "preview.jpg").exists()
+    saved = VideoLibrary(root.parent).get(root.name)
+    assert saved["video"] is False
+    assert saved["frames"] == 2
+    assert saved["episodes"][0]["video"] is False
+    assert saved["episodes"][0]["videos"] == []
+    assert saved["episodes"][0]["preview"] is None
+
+
+def test_recorder_dual_rate_metadata_and_explicit_episode_finish(tmp_path: Path, monkeypatch) -> None:
+    from lerobot_monitor import session as session_module
+
+    class FakeVideoWriter:
+        def write(self, frame: np.ndarray) -> None:
+            pass
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(session_module, "open_video_writer", lambda *args, **kwargs: FakeVideoWriter())
+    root = tmp_path / "videos" / "dual"
+    recorder = DatasetRecorder(root, action_fps=2, video_fps=4, kind="record", merge=False)
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    recorder.add_action({}, None, episode_index=0, elapsed_s=0.0)
+    recorder.add_video({"front": frame}, episode_index=0, elapsed_s=0.25)
+    first = recorder.finish_episode(0)
+    assert first is not None
+    recorder.add_action({}, None, episode_index=1, elapsed_s=0.0)
+    recorder.add_video({"front": frame}, episode_index=1, elapsed_s=0.25)
+    recorder.close()
+
+    saved = VideoLibrary(root.parent).get(root.name)
+    assert saved["fps"] == saved["action_fps"] == 2
+    assert saved["video_fps"] == 4
+    assert saved["frames"] == saved["action_frames"] == 2
+    assert saved["video_frames"] == 2
+    assert saved["per_camera_video_frames"] == {"front": 2}
+    assert len(saved["episodes"]) == 2
+    assert all(episode["action_frames"] == 1 for episode in saved["episodes"])
+
+
+def test_recorder_resume_rejects_frame_rate_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "videos" / "resume"
+    recorder = DatasetRecorder(root, action_fps=10, video_fps=20, kind="record")
+    recorder.close()
+
+    with pytest.raises(ValueError, match="frame-rate mismatch"):
+        DatasetRecorder(root, action_fps=10, video_fps=15, kind="record", resume=True)
+
+
+def test_recorder_root_duration_uses_sparse_action_timestamps(tmp_path: Path) -> None:
+    root = tmp_path / "videos" / "sparse"
+    recorder = DatasetRecorder(root, action_fps=15, video_fps=30, kind="record", video=False)
+    recorder.add_action({}, None, elapsed_s=0.0)
+    recorder.add_action({}, None, elapsed_s=10.0)
+    recorder.close()
+
+    saved = VideoLibrary(root.parent).get(root.name)
+    assert saved["duration_s"] == pytest.approx(10.0)
+    assert saved["episodes"][0]["duration_s"] == pytest.approx(10.0)
+
+
+def test_video_library_create_is_atomic_across_instances(tmp_path: Path, monkeypatch) -> None:
+    from lerobot_monitor import library as library_module
+
+    monkeypatch.setattr(library_module, "_utc_stamp", lambda: "20260921_120000")
+    root = tmp_path / "videos"
+
+    def create_one(index: int) -> dict[str, object]:
+        return VideoLibrary(root).create("blocks", extra={"worker": index})
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        rows = list(pool.map(create_one, range(24)))
+
+    ids = [str(row["id"]) for row in rows]
+    assert len(set(ids)) == len(ids)
+    for row in rows:
+        saved = VideoLibrary(root).get(str(row["id"]))
+        assert saved["worker"] == row["worker"]
 
 
 def test_list_hf_datasets_hub_and_lerobot(tmp_path: Path, monkeypatch) -> None:
@@ -52,7 +186,14 @@ def test_list_hf_datasets_hub_and_lerobot(tmp_path: Path, monkeypatch) -> None:
     (home / "meta" / "info.json").write_text('{"fps": 10, "total_episodes": 2}\n', encoding="utf-8")
     extra = tmp_path / "extra" / "local_ds"
     (extra / "meta").mkdir(parents=True)
-    (extra / "meta" / "info.json").write_text('{"fps": 12, "total_episodes": 1}\n', encoding="utf-8")
+    (extra / "meta" / "info.json").write_text(
+        '{"fps": 12, "total_episodes": 1, "title": "Local Robot", "description": "Demo set"}\n',
+        encoding="utf-8",
+    )
+    (extra / "meta" / "tasks.jsonl").write_text(
+        'not-json\n{"task_index": 0, "task": "Pick cube"}\n',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("HF_HOME", str(hf))
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
     monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
@@ -61,6 +202,10 @@ def test_list_hf_datasets_hub_and_lerobot(tmp_path: Path, monkeypatch) -> None:
     assert ids.count("user/blocks") == 1
     assert "user/toy" in ids
     assert "local_ds" in ids
+    local = next(row for row in rows if row["repo_id"] == "local_ds")
+    assert local["title"] == "Local Robot"
+    assert local["subtitle"] == "Pick cube"
+    assert local["description"] == "Demo set"
 
 
 def test_list_hf_datasets_dedupes_same_repo(tmp_path: Path, monkeypatch) -> None:
@@ -85,3 +230,72 @@ def test_list_hf_datasets_dedupes_same_repo(tmp_path: Path, monkeypatch) -> None
     assert len(matches) == 1
     assert matches[0]["playable"] is True
     assert matches[0]["source"] == "lerobot"
+
+
+def _isolate_hf_home(tmp_path: Path, monkeypatch) -> Path:
+    hf = tmp_path / "hf"
+    hf.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HF_HOME", str(hf))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    monkeypatch.delenv("LEROBOT_HOME", raising=False)
+    return hf
+
+
+def _write_policy(path: Path, weight: str = "model.safetensors") -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(
+        '{"type": "act", "input_features": {"observation.state": {}}, "output_features": {"action": {}}}\n',
+        encoding="utf-8",
+    )
+    (path / weight).write_bytes(b"x")
+
+
+def test_list_local_models_scans_hub_and_roots(tmp_path: Path, monkeypatch) -> None:
+    hf = _isolate_hf_home(tmp_path, monkeypatch)
+    _write_policy(hf / "hub" / "models--user--act" / "snapshots" / "rev1")
+    local = tmp_path / "models" / "my_act"
+    _write_policy(local)
+    checkpoint = tmp_path / "models" / "run" / "checkpoints" / "100000" / "pretrained_model"
+    _write_policy(checkpoint)
+    rows = list_local_models([tmp_path / "models"])
+    by_name = {row["name"]: row for row in rows}
+    assert set(by_name) == {"user/act", "my_act", "100000"}
+    assert by_name["user/act"]["source"] == "hub"
+    assert by_name["user/act"]["repo_id"] == "user/act"
+    assert by_name["user/act"]["policy_type"] == "act"
+    assert by_name["user/act"]["path"].endswith(str(Path("snapshots") / "rev1"))
+    assert by_name["my_act"]["source"] == "local"
+    assert by_name["my_act"]["path"] == str(local)
+    assert by_name["100000"]["path"] == str(checkpoint)
+
+
+def test_list_local_models_uses_newest_snapshot(tmp_path: Path, monkeypatch) -> None:
+    hf = _isolate_hf_home(tmp_path, monkeypatch)
+    repo = hf / "hub" / "models--user--act"
+    old = repo / "snapshots" / "old"
+    new = repo / "snapshots" / "new"
+    _write_policy(old)
+    _write_policy(new)
+    os.utime(old, (1_600_000_000, 1_600_000_000))
+    os.utime(new, (1_700_000_000, 1_700_000_000))
+    rows = list_local_models([])
+    assert len(rows) == 1
+    assert rows[0]["path"].endswith(str(Path("snapshots") / "new"))
+
+
+def test_list_local_models_skips_dir_without_weights(tmp_path: Path, monkeypatch) -> None:
+    _isolate_hf_home(tmp_path, monkeypatch)
+    bare = tmp_path / "models" / "config_only"
+    bare.mkdir(parents=True)
+    (bare / "config.json").write_text("{}", encoding="utf-8")
+    assert list_local_models([tmp_path / "models"]) == []
+
+
+def test_list_local_models_skips_generic_hf_model(tmp_path: Path, monkeypatch) -> None:
+    hf = _isolate_hf_home(tmp_path, monkeypatch)
+    generic = hf / "hub" / "models--openai--gpt2" / "snapshots" / "rev1"
+    generic.mkdir(parents=True)
+    (generic / "config.json").write_text('{"model_type": "gpt2"}\n', encoding="utf-8")
+    (generic / "model.safetensors").write_bytes(b"x")
+    assert list_local_models([]) == []

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from lerobot_monitor.config import MonitorConfig
+from lerobot_monitor.config import MonitorConfig, RecordingConfig
 
 
 def test_default_config() -> None:
@@ -17,3 +17,10 @@ def test_load_yaml(tmp_path: Path) -> None:
     cfg = MonitorConfig.load(path)
     assert cfg.server.port == 9999
     assert cfg.robot.port == "COM9"
+
+
+def test_recording_rates_default_and_legacy_fps() -> None:
+    current = RecordingConfig()
+    assert (current.action_fps, current.video_fps) == (15, 30)
+    legacy = RecordingConfig(fps=12)
+    assert (legacy.action_fps, legacy.video_fps) == (12, 12)

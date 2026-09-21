@@ -6,10 +6,11 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .session import EpisodeWriter, mosaic_bgr, safe_cam_name
 
@@ -35,9 +36,25 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_name = handle.name
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        Path(tmp_name).replace(path)
+    finally:
+        if tmp_name is not None:
+            Path(tmp_name).unlink(missing_ok=True)
 
 
 def episode_dir(root: Path, index: int) -> Path:
@@ -51,51 +68,148 @@ class DatasetRecorder:
         self,
         root: Path,
         *,
-        fps: int,
+        fps: int | None = None,
+        action_fps: int | None = None,
+        video_fps: int | None = None,
         kind: str,
         extra_meta: dict[str, Any] | None = None,
         resume: bool = False,
-        video_format: str = "mp4",
+        video_format: str | None = None,
         merge: bool = True,
+        video: bool | None = None,
+        on_close: Callable[[], None] | None = None,
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.fps = max(1, int(fps))
+        meta_path = self.root / "meta.json"
+        meta = _read_json(meta_path) if resume and meta_path.is_file() else {}
+        legacy_fps = int(fps) if fps is not None else None
+        requested_action_fps = int(
+            action_fps
+            if action_fps is not None
+            else legacy_fps
+            if legacy_fps is not None
+            else meta.get("action_fps") or meta.get("fps") or 15
+        )
+        requested_video_fps = int(
+            video_fps
+            if video_fps is not None
+            else legacy_fps
+            if legacy_fps is not None
+            else meta.get("video_fps") or meta.get("fps") or requested_action_fps
+        )
+        self.action_fps = requested_action_fps
+        self.video_fps = requested_video_fps
+        if self.action_fps <= 0 or self.video_fps <= 0:
+            raise ValueError("action_fps and video_fps must be positive")
+        self.fps = self.action_fps
         self.kind = kind
-        self.video_format = video_format
+        explicit_video_format = video_format is not None
+        stored_video_format = str(meta.get("format") or "")
+        self.video_format = str(video_format or stored_video_format or "mp4")
         self.merge = merge
         self.dataset_id = self.root.name
         self.session_id = self.dataset_id
         self.dir = self.root
         self.closed = False
-        self.frame_index = 0
+        self.action_frames = 0
+        self.video_frames = 0
+        self.frame_index = 0  # Compatibility alias for action samples.
         self.episode_index = 0
         self._lock = threading.Lock()
+        self._on_close = on_close
         self._episode: EpisodeWriter | None = None
-        meta_path = self.root / "meta.json"
-        meta = _read_json(meta_path) if resume and meta_path.is_file() else {}
+        if resume and meta:
+            stored_action_fps = int(meta.get("action_fps") or meta.get("fps") or self.action_fps)
+            stored_video_fps = int(meta.get("video_fps") or meta.get("fps") or self.video_fps)
+            if stored_action_fps != self.action_fps or stored_video_fps != self.video_fps:
+                raise ValueError(
+                    "resume frame-rate mismatch: "
+                    f"dataset uses action_fps={stored_action_fps}, video_fps={stored_video_fps}; "
+                    f"requested action_fps={self.action_fps}, video_fps={self.video_fps}"
+                )
+            if explicit_video_format and stored_video_format and stored_video_format != self.video_format:
+                raise ValueError(
+                    f"resume format mismatch: dataset uses {stored_video_format}; requested {self.video_format}"
+                )
+        configured_video = (extra_meta or {}).get("video")
+        if video is None:
+            configured_video = meta.get("video", True) if configured_video is None else configured_video
+            video = bool(configured_video)
+        self.video = bool(video)
         episodes = list(meta.get("episodes") or [])
-        if resume and episodes:
-            self.episode_index = max(int(e.get("index", i)) for i, e in enumerate(episodes)) + 1
-            self.frame_index = int(meta.get("frames") or 0)
+        if resume:
+            recorded_indices = [int(e.get("index", i)) for i, e in enumerate(episodes)]
+            episodes_root = self.root / "episodes"
+            if episodes_root.is_dir():
+                for child in episodes_root.iterdir():
+                    if child.is_dir() and child.name.isdigit():
+                        recorded_indices.append(int(child.name))
+            if recorded_indices:
+                self.episode_index = max(recorded_indices) + 1
+            self.action_frames = int(meta.get("action_frames") or meta.get("frames") or 0)
+            self.video_frames = int(
+                meta.get("video_frames")
+                or sum(int(episode.get("video_frames") or episode.get("frames") or 0) for episode in episodes)
+            )
+            self.frame_index = self.action_frames
         self.meta: dict[str, Any] = {
             "id": self.dataset_id,
             "kind": kind,
-            "fps": self.fps,
-            "format": video_format,
+            "fps": self.action_fps,
+            "action_fps": self.action_fps,
+            "video_fps": self.video_fps,
+            "format": self.video_format,
             "created_utc": meta.get("created_utc") or datetime.now(timezone.utc).isoformat(),
             "episodes": episodes,
-            "frames": self.frame_index,
+            "frames": self.action_frames,
+            "action_frames": self.action_frames,
+            "video_frames": self.video_frames,
             **(extra_meta or {}),
         }
+        self.meta["video"] = self.video
         if not resume:
             self.meta["episodes"] = []
             self.episode_index = 0
+            self.action_frames = 0
+            self.video_frames = 0
             self.frame_index = 0
         self._write_meta()
 
     def _write_meta(self) -> None:
-        self.meta["frames"] = self.frame_index
+        for field in ("camera_samples", "camera_sample_durations_s", "actual_camera_fps"):
+            self.meta.pop(field, None)
+        self.frame_index = self.action_frames
+        self.meta["fps"] = self.action_fps
+        self.meta["frames"] = self.action_frames
+        self.meta["action_fps"] = self.action_fps
+        self.meta["video_fps"] = self.video_fps
+        self.meta["action_frames"] = self.action_frames
+        self.meta["video_frames"] = self.video_frames
+        per_camera: dict[str, int] = {}
+        requested_video_frames = 0
+        effective_video_frames = 0
+        for episode in self.meta.get("episodes") or []:
+            for field in ("camera_samples", "camera_sample_durations_s", "actual_camera_fps"):
+                episode.pop(field, None)
+            requested_video_frames += int(episode.get("requested_video_frames") or 0)
+            effective_video_frames += int(episode.get("effective_video_frames") or 0)
+            for name, count in (episode.get("per_camera_video_frames") or {}).items():
+                per_camera[str(name)] = per_camera.get(str(name), 0) + int(count)
+        self.meta["requested_video_frames"] = requested_video_frames
+        self.meta["effective_video_frames"] = effective_video_frames
+        self.meta["actual_video_frames"] = self.video_frames
+        self.meta["per_camera_video_frames"] = dict(sorted(per_camera.items()))
+        self.meta["requested_action_fps"] = self.action_fps
+        self.meta["requested_video_fps"] = self.video_fps
+        self.meta["effective_action_fps"] = self.action_fps
+        self.meta["effective_video_fps"] = self.video_fps if per_camera else 0
+        self.meta["encoded_video_fps"] = self.video_fps if per_camera else 0
+        self.meta["effective_encoding_fps"] = self.video_fps if per_camera else 0
+        self.meta["duration_s"] = round(
+            sum(float(episode.get("duration_s") or 0.0) for episode in self.meta.get("episodes") or []),
+            4,
+        )
         self.meta["updated_utc"] = datetime.now(timezone.utc).isoformat()
         _write_json(self.root / "meta.json", self.meta)
 
@@ -108,9 +222,11 @@ class DatasetRecorder:
         self._episode = EpisodeWriter(
             episode_dir(self.root, index),
             index=index,
-            fps=self.fps,
+            action_fps=self.action_fps,
+            video_fps=self.video_fps,
             video_format=self.video_format,
             merge=self.merge,
+            video=self.video,
             kind=self.kind,
         )
         self.episode_index = index
@@ -137,21 +253,85 @@ class DatasetRecorder:
         index = self.episode_index if episode_index is None else int(episode_index)
         with self._lock:
             writer = self._ensure_episode(index)
+            previous_video_frames = writer.video_frames
             writer.add_frame(observation, action, images_bgr, kind=kind or self.kind, frame_index=self.frame_index)
-            self.frame_index += 1
+            self.action_frames += 1
+            self.video_frames += writer.video_frames - previous_video_frames
+            self.frame_index = self.action_frames
+
+    def add_action(
+        self,
+        observation: dict[str, float],
+        action: dict[str, float] | None,
+        *,
+        episode_index: int | None = None,
+        kind: str | None = None,
+        elapsed_s: float | None = None,
+    ) -> None:
+        if self.closed:
+            return
+        index = self.episode_index if episode_index is None else int(episode_index)
+        with self._lock:
+            writer = self._ensure_episode(index)
+            writer.add_action(
+                observation,
+                action,
+                kind=kind or self.kind,
+                frame_index=self.action_frames,
+                elapsed_s=elapsed_s,
+            )
+            self.action_frames += 1
+            self.frame_index = self.action_frames
+
+    def add_video(
+        self,
+        images_bgr: dict[str, Any],
+        *,
+        episode_index: int | None = None,
+        elapsed_s: float | None = None,
+    ) -> None:
+        if self.closed:
+            return
+        index = self.episode_index if episode_index is None else int(episode_index)
+        with self._lock:
+            writer = self._ensure_episode(index)
+            previous_video_frames = writer.video_frames
+            writer.add_video(images_bgr, elapsed_s=elapsed_s)
+            self.video_frames += writer.video_frames - previous_video_frames
+
+    def finish_episode(self, index: int | None = None) -> dict[str, Any] | None:
+        """Commit the active episode before a reset or explicit transition."""
+        if self.closed:
+            return None
+        with self._lock:
+            if self._episode is None:
+                return None
+            if index is not None and self._episode.index != int(index):
+                raise ValueError(f"active episode is {self._episode.index}, not {int(index)}")
+            info = self._episode.close()
+            self._remember_episode(info)
+            self._episode = None
+            return info
 
     def close(self) -> Path:
         if self.closed:
             return self.root
-        with self._lock:
-            if self._episode is not None:
-                info = self._episode.close()
-                self._remember_episode(info)
-                self._episode = None
-            self.meta["frames"] = self.frame_index
-            self.meta["closed_utc"] = datetime.now(timezone.utc).isoformat()
-            self._write_meta()
+        try:
+            with self._lock:
+                if self.closed:
+                    return self.root
+                if self._episode is not None:
+                    info = self._episode.close()
+                    self._remember_episode(info)
+                    self._episode = None
+                self.meta["frames"] = self.action_frames
+                self.meta["closed_utc"] = datetime.now(timezone.utc).isoformat()
+                self._write_meta()
+        finally:
             self.closed = True
+            on_close, self._on_close = self._on_close, None
+            if on_close is not None:
+                on_close()
         return self.root
 
 
@@ -175,31 +355,44 @@ class VideoLibrary:
         name: str,
         *,
         fps: int = 15,
+        action_fps: int | None = None,
+        video_fps: int | None = None,
         task: str = "",
         repo_id: str = "",
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        resolved_action_fps = int(action_fps if action_fps is not None else fps)
+        resolved_video_fps = int(video_fps if video_fps is not None else fps)
+        if resolved_action_fps <= 0 or resolved_video_fps <= 0:
+            raise ValueError("action_fps and video_fps must be positive")
         self.root.mkdir(parents=True, exist_ok=True)
         base = slugify(name or repo_id or task or "dataset")
-        dataset_id = f"{base}_{_utc_stamp()}"
-        path = self.root / dataset_id
-        n = 1
-        while path.exists():
-            n += 1
-            path = self.root / f"{dataset_id}_{n}"
-            dataset_id = path.name
+        base_id = f"{base}_{_utc_stamp()}"
+        suffix = 1
+        while True:
+            dataset_id = base_id if suffix == 1 else f"{base_id}_{suffix}"
+            path = self.root / dataset_id
+            try:
+                path.mkdir(exist_ok=False)
+                break
+            except FileExistsError:
+                suffix += 1
         meta = {
             "id": dataset_id,
             "name": name or base,
             "task": task,
             "repo_id": repo_id,
-            "fps": int(fps),
+            "fps": resolved_action_fps,
+            "action_fps": resolved_action_fps,
+            "video_fps": resolved_video_fps,
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "episodes": [],
             "frames": 0,
+            "action_frames": 0,
+            "video_frames": 0,
+            "duration_s": 0.0,
             **(extra or {}),
         }
-        path.mkdir(parents=True, exist_ok=True)
         (path / "episodes").mkdir(exist_ok=True)
         _write_json(path / "meta.json", meta)
         meta["path"] = str(path)
@@ -255,40 +448,51 @@ class VideoLibrary:
         path = self._dataset_dir(dataset_id)
         if not path.exists():
             raise FileNotFoundError(dataset_id)
-        shutil.rmtree(path)
+        with self._lock:
+            shutil.rmtree(path)
 
     def delete_episode(self, dataset_id: str, index: int) -> dict[str, Any]:
         path = self._dataset_dir(dataset_id)
         target = episode_dir(path, index)
         if not target.exists():
             raise FileNotFoundError(f"episode {index}")
-        shutil.rmtree(target)
-        return self._reindex(path)
+        with self._lock:
+            current = [int(e["index"]) for e in self._episodes(path)]
+            shutil.rmtree(target)
+            mapping = {old_index: new_index for new_index, old_index in enumerate(i for i in current if i != index)}
+            result = self._reindex(path)
+        result["episode_index_map"] = {str(old): new for old, new in mapping.items()}
+        return result
 
     def reorder(self, dataset_id: str, order: list[int]) -> dict[str, Any]:
         path = self._dataset_dir(dataset_id)
         current = [int(e["index"]) for e in self._episodes(path)]
         if sorted(order) != sorted(current):
             raise ValueError("order must list every episode index exactly once")
-        tmp_root = path / ".reorder_tmp"
-        if tmp_root.exists():
-            shutil.rmtree(tmp_root)
-        tmp_root.mkdir()
-        mapping: list[tuple[int, int]] = []
-        for new_index, old_index in enumerate(order):
-            src = episode_dir(path, old_index)
-            dst = tmp_root / f"{new_index:06d}"
-            if src.exists():
-                shutil.move(str(src), str(dst))
-            mapping.append((old_index, new_index))
-        ep_root = path / "episodes"
-        if ep_root.exists():
-            shutil.rmtree(ep_root)
-        shutil.move(str(tmp_root), str(ep_root))
-        return self._reindex(path)
+        with self._lock:
+            tmp_root = path / ".reorder_tmp"
+            if tmp_root.exists():
+                shutil.rmtree(tmp_root)
+            tmp_root.mkdir()
+            mapping: dict[int, int] = {}
+            for new_index, old_index in enumerate(order):
+                src = episode_dir(path, old_index)
+                dst = tmp_root / f"{new_index:06d}"
+                if src.exists():
+                    shutil.move(str(src), str(dst))
+                mapping[old_index] = new_index
+            ep_root = path / "episodes"
+            if ep_root.exists():
+                shutil.rmtree(ep_root)
+            shutil.move(str(tmp_root), str(ep_root))
+            result = self._reindex(path)
+        result["episode_index_map"] = {str(old): new for old, new in mapping.items()}
+        return result
 
     def _reindex(self, path: Path) -> dict[str, Any]:
         meta = _read_json(path / "meta.json")
+        for field in ("camera_samples", "camera_sample_durations_s", "actual_camera_fps"):
+            meta.pop(field, None)
         episodes: list[dict[str, Any]] = []
         ep_root = path / "episodes"
         if ep_root.is_dir():
@@ -297,14 +501,36 @@ class VideoLibrary:
                 dest = episode_dir(path, new_index)
                 if child != dest:
                     child.rename(dest)
-                info = {"index": new_index, "dir": dest.name}
+                episode_meta_path = dest / "meta.json"
+                info = _read_json(episode_meta_path)
+                for field in ("camera_samples", "camera_sample_durations_s", "actual_camera_fps"):
+                    info.pop(field, None)
+                info.update({"index": new_index, "dir": dest.name})
                 preview = dest / "preview.jpg"
                 if preview.is_file():
                     info["preview"] = preview.name
                 videos = sorted((dest / "videos").glob("*")) if (dest / "videos").is_dir() else []
                 info["videos"] = [v.name for v in videos]
                 episodes.append(info)
+                if episode_meta_path.is_file():
+                    _write_json(episode_meta_path, info)
         meta["episodes"] = episodes
+        action_frames = sum(int(episode.get("action_frames") or episode.get("frames") or 0) for episode in episodes)
+        video_frames = sum(int(episode.get("video_frames") or 0) for episode in episodes)
+        requested_video_frames = sum(int(episode.get("requested_video_frames") or 0) for episode in episodes)
+        effective_video_frames = sum(int(episode.get("effective_video_frames") or 0) for episode in episodes)
+        per_camera: dict[str, int] = {}
+        for episode in episodes:
+            for name, count in (episode.get("per_camera_video_frames") or {}).items():
+                per_camera[str(name)] = per_camera.get(str(name), 0) + int(count)
+        meta["frames"] = action_frames
+        meta["action_frames"] = action_frames
+        meta["video_frames"] = video_frames
+        meta["actual_video_frames"] = video_frames
+        meta["requested_video_frames"] = requested_video_frames
+        meta["effective_video_frames"] = effective_video_frames
+        meta["per_camera_video_frames"] = dict(sorted(per_camera.items()))
+        meta["duration_s"] = round(sum(float(episode.get("duration_s") or 0.0) for episode in episodes), 4)
         meta["updated_utc"] = datetime.now(timezone.utc).isoformat()
         _write_json(path / "meta.json", meta)
         return self.get(path.name)
@@ -334,47 +560,148 @@ class VideoLibrary:
         return path
 
 
-def list_local_models(roots: list[Path], *, max_depth: int = 5) -> list[dict[str, Any]]:
+_MODEL_SKIP = {".git", ".venv", "node_modules", "__pycache__", ".uv", "wandb", "blobs", "downloads", ".cache"}
+
+
+def policy_config(path: Path) -> dict[str, Any]:
+    """LeRobot policy configs declare the robot interface; generic HF models do not."""
+    config = _read_json(path / "config.json")
+    if not config.get("input_features") or not config.get("output_features"):
+        return {}
+    return config
+
+
+def is_policy_dir(path: Path) -> bool:
+    """A LeRobot / HF policy folder: config.json plus weights next to it."""
+    if not (path / "config.json").is_file():
+        return False
+    if (path / "pretrained_model").is_dir():
+        return True
+    has_weights = (
+        any(path.glob("*.safetensors"))
+        or (path / "model.pt").is_file()
+        or (path / "pytorch_model.bin").is_file()
+    )
+    return has_weights and bool(policy_config(path))
+
+
+def _model_entry(
+    path: Path,
+    *,
+    name: str,
+    source: str,
+    repo_id: str = "",
+    policy_type: str = "",
+) -> dict[str, Any]:
+    stat = path.stat() if path.exists() else None
+    return {
+        "id": repo_id or name,
+        "name": name,
+        "repo_id": repo_id,
+        "policy_type": policy_type,
+        "path": str(path),
+        "source": source,
+        "mtime": int(stat.st_mtime) if stat else 0,
+    }
+
+
+def _scan_policy_roots(root: Path, *, max_depth: int, source: str) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    skip = {".git", ".venv", "node_modules", "__pycache__", ".uv", "wandb"}
 
-    def is_policy(path: Path) -> bool:
-        if not (path / "config.json").is_file():
-            return False
-        if (path / "pretrained_model").is_dir():
-            return True
-        return any(path.glob("*.safetensors")) or (path / "model.pt").is_file() or (path / "pytorch_model.bin").is_file()
-
-    def walk(root: Path, depth: int) -> None:
-        if depth > max_depth or not root.is_dir():
+    def walk(path: Path, depth: int) -> None:
+        if depth > max_depth or not path.is_dir():
+            return
+        if is_policy_dir(path):
+            # LeRobot training saves checkpoints as `<run>/<step>/pretrained_model`,
+            # so the step folder reads better than the generic leaf name.
+            name = path.parent.name if path.name == "pretrained_model" and path.parent.name else path.name
+            found.append(
+                _model_entry(path, name=name, source=source, policy_type=str(policy_config(path).get("type") or ""))
+            )
             return
         try:
-            children = list(root.iterdir())
+            children = list(path.iterdir())
         except OSError:
             return
-        if is_policy(root):
-            key = str(root.resolve())
-            if key not in seen:
-                seen.add(key)
-                stat = root.stat()
-                found.append(
-                    {
-                        "name": root.name,
-                        "path": str(root),
-                        "mtime": int(stat.st_mtime),
-                    }
-                )
-            return
         for child in children:
-            if not child.is_dir() or child.name in skip or child.name.startswith("."):
+            if not child.is_dir() or child.name in _MODEL_SKIP or child.name.startswith("."):
                 continue
             walk(child, depth + 1)
 
-    for raw in roots:
-        walk(Path(raw), 0)
-    found.sort(key=lambda row: row.get("mtime", 0), reverse=True)
+    walk(root, 0)
     return found
+
+
+def _model_repo_id(dirname: str) -> str:
+    rest = dirname[len("models--") :] if dirname.startswith("models--") else dirname
+    return rest.replace("--", "/", 1)
+
+
+def _latest_snapshot_dir(repo_dir: Path) -> Path | None:
+    snaps = repo_dir / "snapshots"
+    if not snaps.is_dir():
+        return repo_dir if repo_dir.is_dir() else None
+    try:
+        children = [p for p in snaps.iterdir() if p.is_dir()]
+    except OSError:
+        return None
+    if not children:
+        return None
+    children.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return children[0]
+
+
+def _scan_hub_models() -> list[dict[str, Any]]:
+    """One entry per cached `models--org--name` repo, pointing at its newest snapshot."""
+    hub = huggingface_hub_cache()
+    if not hub.is_dir():
+        return []
+    try:
+        children = list(hub.iterdir())
+    except OSError:
+        return []
+    found: list[dict[str, Any]] = []
+    for child in children:
+        if not child.is_dir() or not child.name.startswith("models--"):
+            continue
+        snapshot = _latest_snapshot_dir(child)
+        if snapshot is None or not is_policy_dir(snapshot):
+            continue
+        repo_id = _model_repo_id(child.name)
+        found.append(
+            _model_entry(
+                snapshot,
+                name=repo_id,
+                source="hub",
+                repo_id=repo_id,
+                policy_type=str(policy_config(snapshot).get("type") or ""),
+            )
+        )
+    return found
+
+
+def list_local_models(roots: list[Path], *, max_depth: int = 6) -> list[dict[str, Any]]:
+    """Scan the HF hub cache, `HF_LEROBOT_HOME`, and explicit roots for policies."""
+    found: dict[str, dict[str, Any]] = {}
+
+    def add(entries: list[dict[str, Any]]) -> None:
+        for entry in entries:
+            key = str(Path(entry["path"]).resolve())
+            prev = found.get(key)
+            if prev is None or int(entry["mtime"]) >= int(prev["mtime"]):
+                found[key] = entry
+
+    add(_scan_hub_models())
+    home = lerobot_home()
+    if home.is_dir():
+        # Dataset cache lives under the same root, so keep this walk shallow.
+        add(_scan_policy_roots(home, max_depth=3, source="lerobot"))
+    for raw in roots:
+        add(_scan_policy_roots(Path(raw), max_depth=max_depth, source="local"))
+
+    rows = list(found.values())
+    rows.sort(key=lambda row: row.get("mtime", 0), reverse=True)
+    return rows
 
 
 DatasetLibrary = VideoLibrary
@@ -408,10 +735,39 @@ def _lerobot_info(path: Path) -> dict[str, Any]:
     info = _read_json(path / "meta" / "info.json")
     if not info:
         return {}
+    tasks: list[str] = []
+    tasks_path = path / "meta" / "tasks.jsonl"
+    if tasks_path.is_file():
+        try:
+            with tasks_path.open(encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle):
+                    if line_number >= 100:
+                        break
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    value = row.get("task") or row.get("name") or row.get("description")
+                    if isinstance(value, str) and value.strip():
+                        tasks.append(value.strip()[:500])
+        except OSError:
+            pass
+
+    def text(key: str) -> str:
+        value = info.get(key)
+        return value.strip()[:2000] if isinstance(value, str) else ""
+
+    task = text("task") or (tasks[0] if tasks else "")
     return {
         "fps": info.get("fps"),
         "episodes": info.get("total_episodes") or info.get("total_episodes_in_set"),
-        "task": (info.get("features") or {}).get("task") or info.get("task"),
+        "title": text("title"),
+        "subtitle": text("subtitle"),
+        "description": text("description"),
+        "task": task,
+        "tasks": tasks,
         "lerobot": True,
     }
 
@@ -443,22 +799,43 @@ def _has_videos(path: Path) -> bool:
         return False
 
 
+def _has_series(path: Path) -> bool:
+    data = path / "data"
+    if not data.is_dir():
+        return False
+    try:
+        return next(data.rglob("*.parquet"), None) is not None
+    except OSError:
+        return False
+
+
 def _dataset_entry(repo_id: str, path: Path, source: str) -> dict[str, Any] | None:
     extra = _lerobot_info(path)
     if not extra.get("lerobot"):
         return None
     stat = path.stat() if path.exists() else None
+    has_video = _has_videos(path)
+    previewable = has_video or _has_series(path)
     return {
         "id": repo_id,
         "repo_id": repo_id,
         "name": repo_id,
+        "title": extra.get("title") or repo_id,
+        "subtitle": extra.get("subtitle") or extra.get("task") or "",
+        "description": extra.get("description") or "",
+        "task": extra.get("task") or "",
+        "tasks": extra.get("tasks") or [],
         "path": str(path),
         "source": source,
         "mtime": int(stat.st_mtime) if stat else 0,
         "episodes": extra.get("episodes"),
         "fps": extra.get("fps"),
         "lerobot": True,
-        "playable": _has_videos(path),
+        "has_video": has_video,
+        "previewable": previewable,
+        # Retain the public compatibility field while allowing series-only
+        # datasets to open in the episode viewer.
+        "playable": previewable,
     }
 
 
@@ -466,6 +843,8 @@ _SOURCE_RANK = {"local": 0, "lerobot": 1, "hub": 2}
 
 
 def _better_dataset(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
+    if bool(candidate.get("has_video")) != bool(current.get("has_video")):
+        return bool(candidate.get("has_video"))
     if bool(candidate.get("playable")) != bool(current.get("playable")):
         return bool(candidate.get("playable"))
     cr = _SOURCE_RANK.get(str(candidate.get("source")), 9)

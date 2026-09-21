@@ -12,6 +12,7 @@ from lerobot_monitor import loop as loop_module
 from lerobot_monitor.config import CamerasConfig, LibraryConfig, MonitorConfig, RecordingConfig, RobotConfig
 from lerobot_monitor.loop import Command, ControlLoop
 from lerobot_monitor.policy import ActionChunk
+from lerobot_monitor.types import JOINT_ORDER
 
 
 def _loop(tmp_path: Path) -> ControlLoop:
@@ -307,6 +308,59 @@ def test_live_jog_cannot_cancel_in_flight_relax(tmp_path: Path) -> None:
     assert loop._pending_release == "disconnect"
     assert loop._slew_goal is goal
     loop.follower.send_pose.assert_not_called()
+
+
+def test_disconnect_relaxes_when_follower_is_controllable(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    loop.hold_when_idle = True
+    loop.joints = {name: 0.0 for name in JOINT_ORDER}
+    reply: queue.Queue[dict] = queue.Queue(maxsize=1)
+
+    loop._handle(Command("disconnect_robot", {}, reply))
+
+    assert loop.mode == "jogging"
+    assert loop._pending_release == "disconnect"
+    loop.follower.disconnect.assert_not_called()
+
+    loop._slew_t0 -= loop._slew_duration + 1.0
+    loop._tick_jog()
+
+    loop.follower.disconnect.assert_called_once_with()
+    assert loop.mode == "offline"
+    assert loop._pending_release is None
+    assert reply.get(timeout=1) == {"ok": True}
+
+
+def test_disconnect_skips_relax_when_follower_is_not_controllable(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "offline"
+
+    result = _dispatch(loop, "disconnect_robot")
+
+    assert result == {"ok": True}
+    loop.follower.disconnect.assert_called_once_with()
+    loop.follower.send_pose.assert_not_called()
+    assert loop.mode == "offline"
+    assert loop._pending_release is None
+
+
+def test_disconnect_releases_directly_if_relax_send_fails(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    loop.hold_when_idle = True
+    loop.joints = {name: 0.0 for name in JOINT_ORDER}
+    reply: queue.Queue[dict] = queue.Queue(maxsize=1)
+    loop._handle(Command("disconnect_robot", {}, reply))
+    assert loop.mode == "jogging"
+
+    loop.follower.send_pose.side_effect = RuntimeError("bus write failed")
+    loop._tick()
+
+    loop.follower.disconnect.assert_called_once_with()
+    assert loop.mode == "offline"
+    assert loop._pending_release is None
+    assert reply.get(timeout=1) == {"ok": True}
 
 
 @pytest.mark.parametrize("kind,payload", [("record_start", {}), ("teleop_start", {"auto_record": True})])

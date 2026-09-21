@@ -901,9 +901,10 @@ class ControlLoop:
     def _release_follower(self, reason: str) -> None:
         self._clear_debug_lease()
         self._clear_rollout_prediction()
-        if not self.follower.connected:
-            return
-        self.follower.disconnect()
+        if self.follower.connected:
+            self.follower.disconnect()
+        self._slew_goal = None
+        self._slew_start = None
         self.mode = "estop" if reason == "estop" or self._estop.is_set() else "offline"
         self._pending_release = None
         self.log("info", f"released follower serial ({reason})")
@@ -918,8 +919,22 @@ class ControlLoop:
                 return {name: float(saved[name]) for name in JOINT_ORDER if name in saved}
         return dict(RELAX_POSE)
 
+    def _can_control_follower(self) -> bool:
+        """Whether the loop currently owns a connected, actionable follower bus."""
+        if (
+            not self.follower.connected
+            or self._estop.is_set()
+            or self.mode == "estop"
+            or self.pending is not None
+        ):
+            return False
+        return self.bus_owner() in {"hold", "monitor", "teleop", "record", "rollout", "jog"}
+
     def _begin_relax_then_release(self, reason: str) -> None:
         if not self.follower.connected or self._pending_release:
+            return
+        if not self._can_control_follower():
+            self._release_follower(reason)
             return
         try:
             current = self.joints or self.follower.get_pose()
@@ -1008,6 +1023,9 @@ class ControlLoop:
             self._clear_debug_lease()
             self._close_writer()
             if self.follower.connected:
+                if self._pending_release:
+                    self._reply(cmd, ok=True, pending=True)
+                    return
                 self._pending_release_reply = cmd.reply
                 cmd.reply = None
                 self._begin_relax_then_release("disconnect")
@@ -1349,6 +1367,8 @@ class ControlLoop:
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
             self.log("error", f"read failed: {exc}")
+            if self._pending_release:
+                self._release_follower(self._pending_release)
             return
 
         try:
@@ -1369,7 +1389,9 @@ class ControlLoop:
             self._clear_debug_lease()
             self.last_error = str(exc)
             self.log("error", f"{self.mode} tick failed: {exc}")
-            if self.mode in {"rollout", "record", "teleop"}:
+            if self.mode == "jogging" and self._pending_release:
+                self._release_follower(self._pending_release)
+            elif self.mode in {"rollout", "record", "teleop"}:
                 self._close_writer()
                 self.mode = "idle"
 

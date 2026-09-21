@@ -1,5 +1,14 @@
 # Dev log
 
+## 2026-09-21（Disconnect 安全降级）
+
+- 新增 `_can_control_follower()`：只有 follower 已连接、非 E-STOP、无 pending 任务，且
+  bus owner 属于 hold/monitor/teleop/record/rollout/jog 时才允许执行 relax-release。
+- `disconnect_robot` 在不可控状态下跳过 relax，直接释放串口；relax 过程中若读取或写入
+  失败，也会立即降级为直接断开，避免控制线程卡在 `jogging` 且 disconnect 请求不返回。
+- `_release_follower` 统一收口断开后的 slew 状态、mode 与等待中的 API reply，确保总线
+  已断连或发送失败时仍能返回 `ok`。
+
 ## 2026-09-21（Rollout 预测对照、模型库与 chunk 评分）
 
 - 修复 Snapshot 与 Replay 标题同时显示：`replay-badge` / `snapshot-badge` 都由

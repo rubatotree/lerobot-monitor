@@ -5,6 +5,8 @@
 - 相机 MJPEG 改为可视区懒加载：主相机与 Hardware 小图只有进入视口且页面可见时才设置
   `src`；面板折叠、滚出视口、进入 Replay 或页面隐藏时立即移除 `src`，关闭浏览器端持续
   解码和 MJPEG 连接。
+- 主相机的 IntersectionObserver 改为观察卡片容器，而不是初始 `display:none` 的图片
+  元素，避免懒加载形成“未进入视口所以永不设置 src”的 no signal 死锁。
 - 页面隐藏时暂停 Replay 视频与时钟，停止接收状态后的重绘；恢复可见时只应用最新一帧
   状态，并按原播放状态恢复视频。
 - 实时 Chart.js 更新合并为 150 ms 一次，WebSocket 突发消息不再逐条触发两张 canvas

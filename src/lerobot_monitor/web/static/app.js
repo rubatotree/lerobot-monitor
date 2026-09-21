@@ -86,11 +86,18 @@ function syncMjpegStreams() {
   });
 }
 
+function mjpegObservedTarget(img) {
+  return img.closest(".cam-card") || img;
+}
+
 function ensureMjpegObserver() {
   if (mjpegObserver || typeof IntersectionObserver !== "function") return mjpegObserver;
   mjpegObserver = new IntersectionObserver((entries) => {
     entries.forEach((entry) => {
-      const img = entry.target;
+      const img = entry.target.matches("img[data-mjpeg-src]")
+        ? entry.target
+        : entry.target.querySelector("img[data-mjpeg-src]");
+      if (!img) return;
       img.dataset.mjpegVisible = entry.isIntersecting ? "1" : "0";
       if (entry.isIntersecting) activateMjpeg(img);
       else deactivateMjpeg(img);
@@ -102,7 +109,7 @@ function ensureMjpegObserver() {
 function observeMjpeg(img) {
   if (!img || !img.dataset.mjpegSrc) return;
   const observer = ensureMjpegObserver();
-  if (observer) observer.observe(img);
+  if (observer) observer.observe(mjpegObservedTarget(img));
   else img.dataset.mjpegVisible = "1";
   activateMjpeg(img);
 }
@@ -643,7 +650,7 @@ function syncCamCards(ids) {
     if (!ids.includes(id)) {
       if (mjpegObserver) {
         const img = camCards[id].querySelector("img[data-mjpeg-src]");
-        if (img) mjpegObserver.unobserve(img);
+        if (img) mjpegObserver.unobserve(mjpegObservedTarget(img));
       }
       camCards[id].remove();
       delete camCards[id];
@@ -685,7 +692,7 @@ function renderCamMenu(list) {
   const focused = ae && root.contains(ae) && ["INPUT", "TEXTAREA", "SELECT"].includes(ae.tagName);
   if (focused) return;
   if (mjpegObserver) {
-    root.querySelectorAll("img[data-mjpeg-src]").forEach((img) => mjpegObserver.unobserve(img));
+    root.querySelectorAll("img[data-mjpeg-src]").forEach((img) => mjpegObserver.unobserve(mjpegObservedTarget(img)));
   }
   root.innerHTML = "";
   if (!camMenu.length) {

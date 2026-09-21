@@ -9,8 +9,9 @@ from typing import Any
 
 from .types import RELAX_POSE, ZERO_POSE
 
-PRESET_KINDS = ("record", "rollout", "pose")
+PRESET_KINDS = ("record", "rollout", "pose", "debug")
 EPISODE_KINDS = ("video", "dataset")
+LIBRARY_KINDS = ("video", "dataset")
 DEFAULT_POSE_PRESETS: dict[str, dict[str, float]] = {
     "relax": dict(RELAX_POSE),
     "zero": dict(ZERO_POSE),
@@ -26,6 +27,7 @@ class JsonStore:
             "ui": {},
             "presets": {kind: {} for kind in PRESET_KINDS},
             "episode_overrides": {kind: {} for kind in EPISODE_KINDS},
+            "library_overrides": {kind: {} for kind in LIBRARY_KINDS},
         }
         self._load()
         self._ensure_default_poses()
@@ -53,6 +55,12 @@ class JsonStore:
                 group = overrides.get(kind)
                 if isinstance(group, dict):
                     self._data["episode_overrides"][kind] = group
+        library_overrides = raw.get("library_overrides")
+        if isinstance(library_overrides, dict):
+            for kind in LIBRARY_KINDS:
+                group = library_overrides.get(kind)
+                if isinstance(group, dict):
+                    self._data["library_overrides"][kind] = group
 
     def _ensure_default_poses(self) -> None:
         pose = self._data["presets"].setdefault("pose", {})
@@ -188,4 +196,50 @@ class JsonStore:
             raise KeyError(kind)
         with self._lock:
             self._data["episode_overrides"][kind].pop(str(source_id), None)
+            self._write()
+
+    def library_override(self, kind: str, source_id: str) -> dict[str, str]:
+        """Return the monitor-owned note and description for one library source."""
+        if kind not in LIBRARY_KINDS:
+            raise KeyError(kind)
+        with self._lock:
+            saved = self._data["library_overrides"][kind].get(str(source_id))
+            if not isinstance(saved, dict):
+                return {}
+            return {
+                key: str(saved[key])
+                for key in ("note", "description")
+                if saved.get(key) is not None
+            }
+
+    def save_library_override(
+        self,
+        kind: str,
+        source_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, str]:
+        if kind not in LIBRARY_KINDS:
+            raise KeyError(kind)
+        key = str(source_id).strip()
+        if not key:
+            raise ValueError("library source id is empty")
+        with self._lock:
+            group = self._data["library_overrides"][kind].setdefault(key, {})
+            entry = dict(group) if isinstance(group, dict) else {}
+            for field in ("note", "description"):
+                if field in payload:
+                    entry[field] = str(payload[field])
+            self._data["library_overrides"][kind][key] = entry
+            self._write()
+            return {
+                field: str(entry[field])
+                for field in ("note", "description")
+                if entry.get(field) is not None
+            }
+
+    def delete_library_override(self, kind: str, source_id: str) -> None:
+        if kind not in LIBRARY_KINDS:
+            raise KeyError(kind)
+        with self._lock:
+            self._data["library_overrides"][kind].pop(str(source_id), None)
             self._write()

@@ -101,6 +101,13 @@ class EpisodeEditBody(BaseModel):
     note: str | None = None
 
 
+class LibraryEditBody(BaseModel):
+    kind: str
+    id: str
+    note: str | None = None
+    description: str | None = None
+
+
 class SnapshotCameraBody(BaseModel):
     key: str
     jpeg_base64: str
@@ -483,10 +490,20 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             for i, row in enumerate(episodes)
         ]
 
+    def _merge_library_override(kind: str, source_id: str, row: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(row)
+        saved = hub.store.library_override(kind, source_id)
+        for field in ("note", "description"):
+            if field in saved:
+                merged[field] = saved[field]
+        return merged
+
     @router.get("/api/videos")
     async def list_videos() -> list[dict[str, Any]]:
         rows = await asyncio.to_thread(hub.videos.list)
-        for row in rows:
+        for index, row in enumerate(rows):
+            row = _merge_library_override("video", row["id"], row)
+            rows[index] = row
             row["episodes"] = _merge_episode_overrides("video", row["id"], row.get("episodes") or [])
         return rows
 
@@ -513,6 +530,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             raise HTTPException(404, f"unknown video '{video_id}'") from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        row = _merge_library_override("video", video_id, row)
         row["episodes"] = _merge_episode_overrides("video", video_id, row.get("episodes") or [])
         return row
 
@@ -523,6 +541,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         try:
             await asyncio.to_thread(hub.videos.delete, video_id)
             await asyncio.to_thread(hub.store.delete_episode_overrides, "video", video_id)
+            await asyncio.to_thread(hub.store.delete_library_override, "video", video_id)
         except FileNotFoundError:
             raise HTTPException(404, f"unknown video '{video_id}'") from None
         except ValueError as exc:
@@ -593,7 +612,29 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.get("/api/datasets")
     async def list_datasets() -> list[dict[str, Any]]:
-        return await asyncio.to_thread(hub.hf_datasets)
+        rows = await asyncio.to_thread(hub.hf_datasets)
+        return [
+            _merge_library_override("dataset", str(row.get("repo_id") or row.get("id") or ""), row)
+            for row in rows
+        ]
+
+    @router.put("/api/library")
+    async def edit_library(body: LibraryEditBody) -> dict[str, Any]:
+        payload = {
+            key: value
+            for key, value in (("note", body.note), ("description", body.description))
+            if value is not None
+        }
+        try:
+            saved = await asyncio.to_thread(
+                hub.store.save_library_override,
+                body.kind,
+                body.id,
+                payload,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"kind": body.kind, "id": body.id, **saved}
 
     def _episode_source(kind: str, source_id: str) -> tuple[dict[str, Any], int, bool]:
         """Resolve a library entry to (row, episode count, playable)."""
@@ -639,6 +680,11 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             "subtitle": str(subtitle) if isinstance(subtitle, str) else "",
             "description": str(description) if isinstance(description, str) else "",
         }
+        saved = hub.store.library_override(kind, id)
+        if "note" in saved:
+            source["note"] = saved["note"]
+        if "description" in saved:
+            source["description"] = saved["description"]
         return {
             "kind": kind,
             "id": id,

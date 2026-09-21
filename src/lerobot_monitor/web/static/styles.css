@@ -50,7 +50,7 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
-button, input, select {
+button, input, select, textarea {
   font: inherit;
   color: inherit;
 }
@@ -336,6 +336,50 @@ main.episodes-closed {
 .lib-row-button { display: block; width: 100%; min-height: 44px; padding: 8px; border: 0; background: transparent; color: inherit; text-align: left; overflow-wrap: anywhere; }
 .lib-row-button:hover { color: var(--accent); }
 .lib-row-button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.lib-note-button {
+  display: block;
+  width: 100%;
+  min-height: 26px;
+  padding: 4px 8px;
+  border: 0;
+  border-top: 1px dashed var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lib-note-button.empty { color: var(--faint); font-style: italic; }
+.lib-note-button:hover { color: var(--accent); }
+.lib-note-button.hidden { display: none; }
+.lib-note-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px;
+  padding: 5px;
+  border-top: 1px solid var(--line);
+}
+.lib-note-editor.hidden { display: none; }
+.lib-note-editor input {
+  min-width: 0;
+  min-height: 28px;
+  padding: 3px 6px;
+  font-size: 11px;
+}
+.lib-note-actions { display: flex; align-items: center; gap: 3px; }
+.lib-note-actions button { min-height: 28px; padding: 3px 7px; font-size: 10px; }
+.lib-note-actions .icon-btn { width: 28px; min-width: 28px; padding: 5px; }
+.lib-note-actions svg {
+  width: 13px;
+  height: 13px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 .lib-list li.ep-row {
   display: block;
   padding: 4px 6px;
@@ -506,14 +550,45 @@ main.episodes-closed {
 .episode-source-description {
   display: -webkit-box;
   margin-top: 4px;
+  padding-left: 4px;
+  border-left: 2px solid transparent;
   color: var(--faint);
   font-size: 10px;
   line-height: 1.4;
   overflow: hidden;
+  cursor: text;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
 }
+.episode-source-description.empty { font-style: italic; }
+.episode-source-description:hover,
+.episode-source-description:focus-visible {
+  color: var(--text);
+  border-left-color: var(--accent-dim);
+  outline: none;
+}
 .episode-source-description[hidden], .episode-source-subtitle[hidden] { display: none; }
+.ep-description-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+.ep-description-editor textarea {
+  width: 100%;
+  min-height: 58px;
+  padding: 5px 7px;
+  resize: vertical;
+  background: #090a12;
+  border: 1px solid var(--line);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.ep-description-editor textarea:focus {
+  outline: 1px solid var(--accent-dim);
+  border-color: var(--accent-dim);
+}
+.ep-description-editor button { min-height: 28px; padding: 3px 8px; font-size: 10px; }
 #btn-ep-close { flex: 0 0 36px; min-width: 36px; min-height: 36px; padding: 4px; font-size: 20px; line-height: 1; }
 #vid-detail {
   flex: 1;

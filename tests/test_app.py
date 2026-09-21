@@ -226,6 +226,72 @@ def test_episode_edit_persists(tmp_path: Path, monkeypatch) -> None:
         assert reopened.get("/lerobot/api/ui").json()["selected_video"] == video_id
 
 
+def test_library_notes_and_descriptions_merge_into_lists(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    monkeypatch.delenv("LEROBOT_HOME", raising=False)
+    videos_root = tmp_path / "videos"
+    datasets_root = tmp_path / "datasets"
+    dataset = datasets_root / "user" / "series"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text(
+        '{"fps": 10, "total_episodes": 1, "title": "Series Demo", "description": "From dataset"}\n',
+        encoding="utf-8",
+    )
+    cfg = MonitorConfig(
+        store_path=tmp_path / "store.json",
+        server=ServerConfig(port=0, base_path="/lerobot"),
+        robot=RobotConfig(auto_connect=False, port="COM_UNUSED"),
+        cameras=CamerasConfig(probe=False),
+        recording=RecordingConfig(root=videos_root),
+        library=LibraryConfig(videos_root=videos_root, dataset_roots=[datasets_root]),
+    )
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        video_id = client.post("/lerobot/api/videos", json={"name": "blocks", "task": "sort"}).json()["id"]
+        saved = client.put(
+            "/lerobot/api/library",
+            json={"kind": "video", "id": video_id, "note": "check lighting", "description": "local run"},
+        )
+        assert saved.status_code == 200
+        assert saved.json()["note"] == "check lighting"
+
+        listed_video = next(row for row in client.get("/lerobot/api/videos").json() if row["id"] == video_id)
+        assert listed_video["note"] == "check lighting"
+        assert listed_video["description"] == "local run"
+        assert client.get(f"/lerobot/api/videos/{video_id}").json()["note"] == "check lighting"
+
+        saved_dataset = client.put(
+            "/lerobot/api/library",
+            json={
+                "kind": "dataset",
+                "id": "user/series",
+                "note": "baseline",
+                "description": "Monitor description",
+            },
+        )
+        assert saved_dataset.status_code == 200
+        listed_dataset = next(
+            row for row in client.get("/lerobot/api/datasets").json() if row["repo_id"] == "user/series"
+        )
+        assert listed_dataset["note"] == "baseline"
+        assert listed_dataset["description"] == "Monitor description"
+
+        episodes = client.get("/lerobot/api/episodes", params={"kind": "dataset", "id": "user/series"})
+        assert episodes.status_code == 200
+        assert episodes.json()["source"]["description"] == "Monitor description"
+        assert episodes.json()["source"]["note"] == "baseline"
+
+        assert client.put(
+            "/lerobot/api/library",
+            json={"kind": "unknown", "id": "x", "note": "nope"},
+        ).status_code == 400
+
+        assert client.delete(f"/lerobot/api/videos/{video_id}").status_code == 200
+        assert app.state.hub.store.library_override("video", video_id) == {}
+
+
 def _lifecycle_config(tmp_path: Path) -> MonitorConfig:
     return MonitorConfig(
         store_path=tmp_path / "store.json",

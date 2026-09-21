@@ -1382,6 +1382,93 @@ initSplitters();
 if ($("roll-kv") && !$("roll-kv").children.length) addKvRow();
 if ($("btn-kv-add")) bind("btn-kv-add", () => addKvRow());
 
+const LIBRARY_EDIT_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg>`;
+
+function librarySourceId(kind, row) {
+  return kind === "video" ? String(row.id || "") : String(row.repo_id || row.id || "");
+}
+
+async function saveLibraryOverride(kind, sourceId, payload) {
+  const saved = await api("/api/library", { kind, id: sourceId, ...payload }, "PUT");
+  const cache = kind === "video" ? videosCache : datasetsCache;
+  const row = cache.find((item) => librarySourceId(kind, item) === sourceId);
+  if (row) Object.assign(row, saved);
+  if (episodeSource && episodeSource.kind === kind && episodeSource.id === sourceId) {
+    Object.assign(episodeSource, saved);
+  }
+  renderVideos();
+  renderDatasets();
+  renderEpisodes();
+  return saved;
+}
+
+function appendLibraryNote(li, kind, sourceId, row) {
+  const noteButton = document.createElement("button");
+  noteButton.type = "button";
+  noteButton.className = `lib-note-button${row.note ? "" : " empty"}`;
+  noteButton.textContent = row.note || "Add note";
+  noteButton.title = row.note ? `Note: ${row.note}` : "Add note";
+  noteButton.setAttribute("aria-label", row.note ? `Edit note: ${row.note}` : "Add note");
+  const editor = document.createElement("div");
+  editor.className = "lib-note-editor hidden";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = row.note || "";
+  input.placeholder = "note";
+  input.setAttribute("aria-label", "Library note");
+  const actions = document.createElement("span");
+  actions.className = "lib-note-actions";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "ghost icon-btn";
+  save.title = "Save note";
+  save.setAttribute("aria-label", "Save note");
+  save.innerHTML = LIBRARY_EDIT_ICON;
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "ghost";
+  cancel.textContent = "Cancel";
+  actions.append(save, cancel);
+  editor.append(input, actions);
+  noteButton.addEventListener("click", () => {
+    noteButton.classList.add("hidden");
+    editor.classList.remove("hidden");
+    input.focus();
+    input.select();
+  });
+  const closeEditor = () => {
+    editor.classList.add("hidden");
+    noteButton.classList.remove("hidden");
+  };
+  const commit = async () => {
+    save.disabled = true;
+    cancel.disabled = true;
+    input.disabled = true;
+    try {
+      await saveLibraryOverride(kind, sourceId, { note: input.value.trim() });
+    } catch (err) {
+      toastError(err);
+      closeEditor();
+    } finally {
+      save.disabled = false;
+      cancel.disabled = false;
+      input.disabled = false;
+    }
+  };
+  save.addEventListener("click", commit);
+  cancel.addEventListener("click", closeEditor);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commit();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeEditor();
+    }
+  });
+  li.append(noteButton, editor);
+}
+
 function renderVideos() {
   const ol = $("vid-list");
   if (!ol) return;
@@ -1404,6 +1491,7 @@ function renderVideos() {
     li.title = vid.path || vid.id;
     button.addEventListener("click", () => selectVideo(vid.id));
     li.appendChild(button);
+    appendLibraryNote(li, "video", String(vid.id), vid);
     ol.appendChild(li);
   });
 }
@@ -1432,6 +1520,7 @@ function renderDatasets() {
     li.title = ds.path || ds.repo_id || "";
     button.addEventListener("click", () => selectHfDataset(ds));
     li.appendChild(button);
+    appendLibraryNote(li, "dataset", id, ds);
     ol.appendChild(li);
   });
 }
@@ -1621,6 +1710,58 @@ function toggleEpisodeEditor(index) {
   renderEpisodes();
 }
 
+function openEpisodeDescriptionEditor() {
+  if (!episodeSource || episodeMutationPending || $("ep-description-editor")) return;
+  const description = $("ep-description");
+  if (!description || description.hidden) return;
+  const editor = document.createElement("div");
+  editor.id = "ep-description-editor";
+  editor.className = "ep-description-editor";
+  const input = document.createElement("textarea");
+  input.rows = 3;
+  input.value = episodeSource.description || "";
+  input.placeholder = "description";
+  input.setAttribute("aria-label", "Library description");
+  const actions = document.createElement("div");
+  actions.className = "row-actions";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.textContent = "Save";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "ghost";
+  cancel.textContent = "Cancel";
+  actions.append(save, cancel);
+  editor.append(input, actions);
+  description.hidden = true;
+  description.parentElement.appendChild(editor);
+  input.focus();
+  const close = () => {
+    editor.remove();
+    description.hidden = false;
+  };
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    cancel.disabled = true;
+    input.disabled = true;
+    try {
+      await saveLibraryOverride(episodeSource.kind, episodeSource.id, { description: input.value.trim() });
+      close();
+      renderEpisodes();
+    } catch (err) {
+      toastError(err);
+      close();
+    }
+  });
+  cancel.addEventListener("click", close);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+    }
+  });
+}
+
 function renderEpisodes() {
   const detail = $("vid-detail");
   const list = $("ep-list");
@@ -1643,9 +1784,14 @@ function renderEpisodes() {
     $("ep-subtitle").title = subtitle;
   }
   if ($("ep-description")) {
-    $("ep-description").textContent = description;
-    $("ep-description").hidden = !description;
-    $("ep-description").title = description;
+    const descriptionNode = $("ep-description");
+    descriptionNode.textContent = description || "Add description";
+    descriptionNode.hidden = false;
+    descriptionNode.classList.toggle("empty", !description);
+    descriptionNode.title = description || "Add description";
+    descriptionNode.tabIndex = 0;
+    descriptionNode.setAttribute("role", "button");
+    descriptionNode.setAttribute("aria-label", description ? "Edit description" : "Add description");
   }
   list.innerHTML = "";
   list.setAttribute("aria-busy", String(episodeLoading));
@@ -2704,6 +2850,15 @@ if ($("viz-ep")) {
   });
 }
 if ($("btn-ep-close")) bind("btn-ep-close", closeEpisodeSelection);
+if ($("ep-description")) {
+  $("ep-description").addEventListener("click", openEpisodeDescriptionEditor);
+  $("ep-description").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openEpisodeDescriptionEditor();
+    }
+  });
+}
 bindReplaySeek("replay-seek");
 bindReplayChartSeek(stateChart, "chart-state");
 bindReplayChartSeek(actionChart, "chart-action");

@@ -274,7 +274,7 @@ class ControlLoop:
         self._commands.put(Command(kind=kind, payload=payload or {}, reply=None))
 
     def acquire_debug_lease(self, timeout: float = 8.0) -> dict[str, Any]:
-        """Reserve idle control ownership for one read-only inference request."""
+        """Reserve control ownership for one read-only inference request."""
         return self.submit("debug_lease_acquire", timeout=timeout)
 
     def release_debug_lease(self, token: str, timeout: float = 8.0) -> dict[str, Any]:
@@ -967,8 +967,8 @@ class ControlLoop:
                 self._reply(cmd, ok=False, error="model debug is already active")
             elif self.pending is not None or self.writer is not None:
                 self._reply(cmd, ok=False, error="model debug requires no pending task or recording")
-            elif self.mode != "idle" or not self.follower.connected:
-                self._reply(cmd, ok=False, error="model debug requires an idle connected follower")
+            elif self.mode not in {"idle", "offline"}:
+                self._reply(cmd, ok=False, error="model debug requires an idle control loop")
             else:
                 self._debug_lease_token = uuid.uuid4().hex
                 self._reply(cmd, ok=True, token=self._debug_lease_token)
@@ -1325,14 +1325,12 @@ class ControlLoop:
                 self._apply_estop()
             return
         if not self.follower.connected:
-            self._clear_debug_lease()
             if self.mode not in {"offline", "estop"}:
                 self.mode = "offline"
             return
         try:
             self.joints = self.follower.get_pose()
         except Exception as exc:  # noqa: BLE001
-            self._clear_debug_lease()
             self.last_error = str(exc)
             self.log("error", f"read failed: {exc}")
             return

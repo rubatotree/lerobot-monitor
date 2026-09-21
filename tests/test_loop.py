@@ -160,18 +160,10 @@ def test_jog_is_rejected_while_task_start_is_pending(tmp_path: Path) -> None:
     loop.follower.send_pose.assert_not_called()
 
 
-def test_debug_lease_requires_idle_connected_follower(tmp_path: Path) -> None:
+def test_debug_lease_allows_offline_loop_without_follower(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
-
-    assert _dispatch(loop, "debug_lease_acquire") == {
-        "ok": False,
-        "error": "model debug requires an idle connected follower",
-    }
-
-    loop.mode = "idle"
-    loop.pending = "rollout_start"
-    assert _dispatch(loop, "debug_lease_acquire")["ok"] is False
-    loop.pending = None
+    loop.follower.connected = False
+    loop.mode = "offline"
 
     granted = _dispatch(loop, "debug_lease_acquire")
     assert granted["ok"] is True
@@ -179,6 +171,23 @@ def test_debug_lease_requires_idle_connected_follower(tmp_path: Path) -> None:
     assert loop.display_mode() == "debug"
     assert loop.bus_owner() == "debug"
     assert _dispatch(loop, "debug_lease_acquire")["error"] == "model debug is already active"
+
+
+def test_debug_lease_rejects_pending_task_and_active_control_mode(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    loop.pending = "rollout_start"
+    assert _dispatch(loop, "debug_lease_acquire") == {
+        "ok": False,
+        "error": "model debug requires no pending task or recording",
+    }
+    loop.pending = None
+
+    loop.mode = "rollout"
+    assert _dispatch(loop, "debug_lease_acquire") == {
+        "ok": False,
+        "error": "model debug requires an idle control loop",
+    }
 
 
 def test_debug_lease_release_requires_matching_token(tmp_path: Path) -> None:
@@ -196,7 +205,7 @@ def test_debug_lease_release_requires_matching_token(tmp_path: Path) -> None:
     assert loop.display_mode() == "idle"
 
 
-def test_estop_and_disconnect_clear_debug_lease(tmp_path: Path) -> None:
+def test_estop_clears_debug_lease(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
     loop.mode = "idle"
     _dispatch(loop, "debug_lease_acquire")
@@ -207,15 +216,28 @@ def test_estop_and_disconnect_clear_debug_lease(tmp_path: Path) -> None:
     assert loop.display_mode() == "estop"
 
 
-def test_serial_loss_clears_debug_lease(tmp_path: Path) -> None:
+def test_debug_lease_survives_serial_loss(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
     loop.mode = "idle"
-    _dispatch(loop, "debug_lease_acquire")
+    token = str(_dispatch(loop, "debug_lease_acquire")["token"])
     loop.follower.connected = False
 
     loop._tick()
 
-    assert loop._debug_lease_token is None
+    assert loop._debug_lease_token == token
+    assert loop.display_mode() == "debug"
+
+
+def test_offline_debug_lease_blocks_follower_connect(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.follower.connected = False
+    loop.mode = "offline"
+    _dispatch(loop, "debug_lease_acquire")
+
+    with pytest.raises(RuntimeError, match="model debug is active"):
+        loop._handle(Command("connect_robot", {"port": "COM1"}))
+
+    loop.follower.connect.assert_not_called()
 
 
 @pytest.mark.parametrize(

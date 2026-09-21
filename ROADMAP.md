@@ -258,9 +258,10 @@ Windows 硬件侧采用“单一设备所有者、generation 失效、有界关�
 monitor 只负责校验、重扫和展示，不引入数据库迁移或把机器人数据写入原始数据集。
 
 VLA 调试复用控制线程已有的 policy 缓存，但通过显式 debug lease 与 teleop、record、
-rollout、jog、relax 等动作入口互斥。lease 只授予 idle（含 hold）且无 pending 任务的
-控制循环；推理在事件循环外执行，默认只返回 action chunk，不向机械臂发送动作。
-这使模型调试可以复用生产推理路径，同时保留 E-STOP、断连和任务切换的现有所有权语义。
+rollout、jog、relax 等动作入口互斥。lease 在 idle（含 hold）或 offline（未连接 follower）
+且无 pending 任务时授予，不要求 follower 在线；推理在事件循环外执行，默认只返回
+action chunk，不向机械臂发送动作。这使模型调试可以复用生产推理路径，同时保留
+E-STOP、Stop 和任务切换的现有所有权语义。
 
 ### 核心模块
 
@@ -269,7 +270,7 @@ rollout、jog、relax 等动作入口互斥。lease 只授予 idle（含 hold）
 - `JsonStore.library_overrides`：按 video/dataset 来源保存 note 与 description，
   删除或重排 episode 时沿用既有 override 语义。
 - `ControlLoop` debug lease：控制线程授予/释放 token，lease 生效时显示 `debug`，
-  阻断动作启动，并由 E-STOP、断连和任务切换自动清除。
+  阻断动作启动；E-STOP、Stop 和任务切换会清除 lease，follower 断连不会取消只读推理。
 - `policy.predict_action_chunk`：优先原生 chunk API，失败时回退逐帧 `select_action`，
   统一 postprocess、关节映射、补齐、截断和 degraded 标记。
 - Web：Snapshots Library 分组、行内 note/description 编辑、顶部保存快照、快照查看，
@@ -280,8 +281,8 @@ rollout、jog、relax 等动作入口互斥。lease 只授予 idle（含 hold）
 - 快照 ID、相机 key、JSON 内容和路径必须经过严格校验，任何读写都不得越过
   `snapshots_root`；损坏 manifest 只跳过该目录，不能使整个 Library 失效。
 - 请求体使用 base64 JPEG，必须在解码前限制单张、相机数和总量，避免内存放大攻击。
-- policy 对象可能有状态，推理必须串行；lease 的授予、释放、estop 和断连清理必须幂等，
-  不能让迟到推理覆盖新任务或让动作入口绕过 lease。
+- policy 对象可能有状态，推理必须串行；lease 的授予、释放、estop 和任务切换清理必须
+  幂等，不能让迟到推理覆盖新任务或让动作入口绕过 lease。
 - 快照图像和关节不在 UI 内编辑；note/description 是 monitor override，不回写原始数据。
 - 第一版硬件状态通过“保存快照后再调试”进入，不做硬件直连推理。
 
@@ -315,9 +316,10 @@ rollout、jog、relax 等动作入口互斥。lease 只授予 idle（含 hold）
 - `JsonStore.library_overrides` 保存 video/dataset 的 note 与 description，并在
   `/api/videos`、`/api/datasets`、`/api/episodes` 合并；episode description 以 override
   优先于数据集自带描述，删除来源时同步清理 override。
-- `ControlLoop` 新增 debug lease：仅在 idle（含 hold）且无 pending 任务时授予 token，
-  `display_mode()` 显示 `debug`，teleop/record/rollout/jog/resume/capture 等入口被拒绝，
-  E-STOP、断连、Stop 与任务切换自动清除；lease 生效时不再发送 hold 位姿。
+- `ControlLoop` 新增 debug lease：在 idle（含 hold）或 offline（未连接 follower）且无
+  pending 任务时授予 token，`display_mode()` 显示 `debug`，
+  teleop/record/rollout/jog/resume/capture 等入口被拒绝；E-STOP、Stop 与任务切换清除
+  lease，follower 断连不取消只读推理，lease 生效时不再发送 hold 位姿。
 - `policy.predict_action_chunk` 优先使用 `policy.predict_action_chunk`（`(B, T, A)`），
   不支持或返回非法形状时回退逐帧 `select_action` 并标记 `degraded`；两条路径统一
   postprocess、`observation_to_pose` 映射、输入关节补齐与 `chunk_size` 截断。
@@ -329,8 +331,8 @@ rollout、jog、relax 等动作入口互斥。lease 只授予 idle（含 hold）
   device、extra 参数、chunk_size、fps、相机映射、Run、状态行与 Send first step。
 - action chunk 以同色虚线从当前 elapsed 向右叠加到 command action 图；快照模式从 0 起
   整段显示；切换 episode、打开 snapshot、拖动时间轴、离开回放或重新 Run 都会清空 chunk。
-- 自动化结果为 `103 passed, 2 skipped`（排除 `test_sim`），并通过 `node --check` 与
-  `git diff --check`；包含 `test_sim` 时为 `126 passed, 2 skipped, 5 failed/errored`，
+- 自动化结果为 `105 passed, 2 skipped`（排除 `test_sim`），并通过 `node --check` 与
+  `git diff --check`；包含 `test_sim` 时为 `128 passed, 2 skipped, 5 failed/errored`，
   非通过项全部来自当前 venv 缺少 `scservo_sdk`。
 - 未执行真实硬件与浏览器视觉验证：快照抓帧、note/description 行内编辑、chunk overlay
   与 Send first step 的手动清单仍待在有机械臂与相机的环境确认；`test_sim` 因当前 venv

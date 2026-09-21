@@ -2084,7 +2084,9 @@ function syncDebugActions() {
   const send = $("btn-dbg-send");
   if (!send) return;
   const actions = vizState.chunk && Array.isArray(vizState.chunk.actions) ? vizState.chunk.actions : [];
-  send.disabled = !actions.length;
+  const robotConnected = !!(last.robot && last.robot.connected);
+  send.disabled = !actions.length || !robotConnected;
+  send.title = robotConnected ? "" : "Connect the follower to send actions";
 }
 
 function renderDebugPanel() {

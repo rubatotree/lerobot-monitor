@@ -86,6 +86,7 @@ class RecordingConfig(BaseModel):
 class LibraryConfig(BaseModel):
     videos_root: Path | None = None
     datasets_root: Path | None = None
+    snapshots_root: Path = Path("data/snapshots")
     dataset_roots: list[Path] = Field(default_factory=list)
     models_roots: list[Path] = Field(default_factory=lambda: [Path("data/models"), Path("../outputs")])
 
@@ -123,6 +124,9 @@ class MonitorConfig(BaseModel):
     def datasets_root(self) -> Path:
         """Backward-compatible alias for the local video session root."""
         return self.videos_root()
+
+    def snapshots_root(self) -> Path:
+        return Path(self.library.snapshots_root)
 
     @classmethod
     def load(cls, path: str | Path | None) -> MonitorConfig:

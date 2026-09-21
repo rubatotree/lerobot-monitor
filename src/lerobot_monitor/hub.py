@@ -15,6 +15,7 @@ from .loop import ControlLoop
 from .robot import FollowerArm
 from .runtime import format_runtime, probe_runtime
 from .session import list_sessions
+from .snapshots import SnapshotLibrary
 from .store import JsonStore
 from .types import JOINT_LIMITS, JOINT_ORDER, PRESETS
 
@@ -26,6 +27,7 @@ class RuntimeHub:
         self.cameras = CameraHub(config.cameras, self.store)
         self.videos = VideoLibrary(config.videos_root())
         self.datasets = self.videos
+        self.snapshots = SnapshotLibrary(config.snapshots_root())
         self.follower = FollowerArm(config.robot)
         self.leader = LeaderArm(config.leader)
         self._snapshot: dict[str, Any] = {}

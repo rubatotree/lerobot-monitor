@@ -21,6 +21,7 @@ from .preview import (
     lerobot_episode_payload,
     local_episode_payload,
 )
+from .snapshots import SnapshotTooLargeError
 from .types import JOINT_ORDER
 
 STATIC_DIR = Path(__file__).resolve().parent / "web" / "static"
@@ -98,6 +99,32 @@ class EpisodeEditBody(BaseModel):
     name: str | None = None
     task: str | None = None
     note: str | None = None
+
+
+class SnapshotCameraBody(BaseModel):
+    key: str
+    jpeg_base64: str
+
+
+class SnapshotCreateBody(BaseModel):
+    name: str = ""
+    task: str = ""
+    note: str = ""
+    description: str = ""
+    origin: str = "hardware"
+    source: dict[str, Any] | None = None
+    joints: dict[str, float] = Field(default_factory=dict)
+    cameras: list[SnapshotCameraBody] = Field(default_factory=list)
+
+
+class SnapshotUpdateBody(BaseModel):
+    name: str | None = None
+    task: str | None = None
+    note: str | None = None
+    description: str | None = None
+    origin: str | None = None
+    source: dict[str, Any] | None = None
+    joints: dict[str, float] | None = None
 
 
 class AutoRecordBody(BaseModel):
@@ -716,6 +743,92 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.get("/api/models")
     async def list_models() -> list[dict[str, Any]]:
         return await asyncio.to_thread(hub.models)
+
+    @router.get("/api/snapshots")
+    async def list_snapshots() -> list[dict[str, Any]]:
+        return await asyncio.to_thread(hub.snapshots.list)
+
+    @router.post("/api/snapshots")
+    async def create_snapshot(body: SnapshotCreateBody) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                hub.snapshots.create,
+                name=body.name,
+                task=body.task,
+                note=body.note,
+                description=body.description,
+                origin=body.origin,
+                source=body.source,
+                joints=body.joints,
+                cameras=[camera.model_dump() for camera in body.cameras],
+            )
+        except SnapshotTooLargeError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.get("/api/snapshots/{snapshot_id}")
+    async def get_snapshot(snapshot_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(hub.snapshots.get, snapshot_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, f"unknown snapshot '{snapshot_id}'") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.put("/api/snapshots/{snapshot_id}")
+    async def update_snapshot(snapshot_id: str, body: SnapshotUpdateBody) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                hub.snapshots.update,
+                snapshot_id,
+                body.model_dump(exclude_none=True),
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(404, f"unknown snapshot '{snapshot_id}'") from exc
+        except SnapshotTooLargeError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.delete("/api/snapshots/{snapshot_id}")
+    async def delete_snapshot(snapshot_id: str) -> dict[str, Any]:
+        try:
+            await asyncio.to_thread(hub.snapshots.delete, snapshot_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, f"unknown snapshot '{snapshot_id}'") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"ok": True}
+
+    @router.post("/api/snapshots/{snapshot_id}/duplicate")
+    async def duplicate_snapshot(snapshot_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(hub.snapshots.duplicate, snapshot_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, f"unknown snapshot '{snapshot_id}'") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.get("/api/snapshots/{snapshot_id}/camera/{key}")
+    async def snapshot_camera_file(snapshot_id: str, key: str) -> FileResponse:
+        try:
+            path = await asyncio.to_thread(hub.snapshots.camera_path, snapshot_id, key)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return FileResponse(path, media_type="image/jpeg")
+
+    @router.get("/api/snapshots/{snapshot_id}/preview")
+    async def snapshot_preview(snapshot_id: str) -> FileResponse:
+        try:
+            path = await asyncio.to_thread(hub.snapshots.preview_path, snapshot_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return FileResponse(path, media_type="image/jpeg")
 
     @router.get("/api/cameras")
     async def list_cameras() -> list[dict[str, Any]]:

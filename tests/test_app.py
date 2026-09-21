@@ -1,8 +1,11 @@
 import asyncio
+import base64
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import cv2
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -466,3 +469,64 @@ def test_capture_legacy_fps_sets_both_rates_and_rejects_over_capacity(tmp_path: 
         assert rollout_payload["policy_fps"] == 120
         assert rollout_payload["action_fps"] is None
         assert rollout_payload["video_fps"] is None
+
+
+def test_snapshot_routes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    snapshots_root = tmp_path / "snapshots"
+    cfg = MonitorConfig(
+        store_path=tmp_path / "store.json",
+        server=ServerConfig(port=0, base_path="/lerobot"),
+        robot=RobotConfig(auto_connect=False, port="COM_UNUSED"),
+        cameras=CamerasConfig(probe=False),
+        recording=RecordingConfig(root=tmp_path / "videos"),
+        library=LibraryConfig(
+            videos_root=tmp_path / "videos",
+            snapshots_root=snapshots_root,
+            models_roots=[],
+        ),
+    )
+    image = np.zeros((40, 80, 3), dtype=np.uint8)
+    ok, encoded = cv2.imencode(".jpg", image)
+    assert ok
+    jpeg_base64 = base64.b64encode(encoded.tobytes()).decode("ascii")
+
+    with TestClient(create_app(cfg)) as client:
+        created = client.post(
+            "/lerobot/api/snapshots",
+            json={
+                "name": "pick",
+                "task": "pick cube",
+                "joints": {"gripper": 1.0},
+                "cameras": [{"key": "front camera", "jpeg_base64": jpeg_base64}],
+            },
+        )
+        assert created.status_code == 200
+        snapshot_id = created.json()["id"]
+        assert created.json()["cameras"][0]["key"] == "front_camera"
+
+        listed = client.get("/lerobot/api/snapshots")
+        assert listed.status_code == 200
+        assert [row["id"] for row in listed.json()] == [snapshot_id]
+        detail = client.get(f"/lerobot/api/snapshots/{snapshot_id}")
+        assert detail.status_code == 200
+        camera = client.get(f"/lerobot/api/snapshots/{snapshot_id}/camera/front_camera")
+        assert camera.status_code == 200
+        assert camera.headers["content-type"].startswith("image/jpeg")
+        preview = client.get(f"/lerobot/api/snapshots/{snapshot_id}/preview")
+        assert preview.status_code == 200
+
+        updated = client.put(
+            f"/lerobot/api/snapshots/{snapshot_id}",
+            json={"note": "edited", "description": "debug input"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["note"] == "edited"
+
+        duplicated = client.post(f"/lerobot/api/snapshots/{snapshot_id}/duplicate")
+        assert duplicated.status_code == 200
+        assert duplicated.json()["id"] != snapshot_id
+
+        deleted = client.delete(f"/lerobot/api/snapshots/{snapshot_id}")
+        assert deleted.status_code == 200
+        assert client.get(f"/lerobot/api/snapshots/{snapshot_id}").status_code == 404

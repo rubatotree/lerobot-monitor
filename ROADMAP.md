@@ -246,3 +246,61 @@ Windows 硬件侧采用“单一设备所有者、generation 失效、有界关�
 - 自动化结果为 `74 passed, 2 skipped`，统计时排除 `test_sim`；其余可运行测试和差异检查通过。
 - 完整 `test_sim` 未验证，因为当前环境缺少 `scservo_sdk`。该缺口涉及依赖真实/仿真总线 SDK 的路径，不能由本轮通过结果推断为已覆盖。
 - 按用户要求，本轮没有执行浏览器检查或多视口视觉 smoke；Replay transport、DOM overlay、触摸拖动与响应式表现仍需在后续浏览器验证中确认。
+
+## 后续里程碑（2026-09-21）：Snapshot 库、可编辑备注与 VLA Model Debug
+
+状态：实施中。
+
+### 架构动机
+
+快照采用“目录即记录”的文件系统模型：`snapshots_root/<id>/snapshot.json` 是唯一索引，
+目录名是权威 ID，相机 JPEG 与缩略图是附属资源。这样用户可以直接修改或复制目录，
+monitor 只负责校验、重扫和展示，不引入数据库迁移或把机器人数据写入原始数据集。
+
+VLA 调试复用控制线程已有的 policy 缓存，但通过显式 debug lease 与 teleop、record、
+rollout、jog、relax 等动作入口互斥。lease 只授予 idle（含 hold）且无 pending 任务的
+控制循环；推理在事件循环外执行，默认只返回 action chunk，不向机械臂发送动作。
+这使模型调试可以复用生产推理路径，同时保留 E-STOP、断连和任务切换的现有所有权语义。
+
+### 核心模块
+
+- `SnapshotLibrary`：目录扫描、manifest 校验、路径约束、相机 key 归一化、复制/删除、
+  静态相机文件和 `preview.jpg` 缩略图。
+- `JsonStore.library_overrides`：按 video/dataset 来源保存 note 与 description，
+  删除或重排 episode 时沿用既有 override 语义。
+- `ControlLoop` debug lease：控制线程授予/释放 token，lease 生效时显示 `debug`，
+  阻断动作启动，并由 E-STOP、断连和任务切换自动清除。
+- `policy.predict_action_chunk`：优先原生 chunk API，失败时回退逐帧 `select_action`，
+  统一 postprocess、关节映射、补齐、截断和 degraded 标记。
+- Web：Snapshots Library 分组、行内 note/description 编辑、顶部保存快照、快照查看，
+  以及 Model Debug 面板、preset、相机映射和虚线 action chunk overlay。
+
+### 风险与边界
+
+- 快照 ID、相机 key、JSON 内容和路径必须经过严格校验，任何读写都不得越过
+  `snapshots_root`；损坏 manifest 只跳过该目录，不能使整个 Library 失效。
+- 请求体使用 base64 JPEG，必须在解码前限制单张、相机数和总量，避免内存放大攻击。
+- policy 对象可能有状态，推理必须串行；lease 的授予、释放、estop 和断连清理必须幂等，
+  不能让迟到推理覆盖新任务或让动作入口绕过 lease。
+- 快照图像和关节不在 UI 内编辑；note/description 是 monitor override，不回写原始数据。
+- 第一版硬件状态通过“保存快照后再调试”进入，不做硬件直连推理。
+
+### 分阶段实施
+
+1. 快照配置、`SnapshotLibrary`、Hub/API 接入、文件服务与快照测试。
+2. library override 存储、video/dataset/episode 合并、删除清理、前端行内编辑与测试。
+3. debug lease、chunk 推理、`/api/debug/infer`、Model Debug 面板、快照查看与
+   chart overlay，并完成全量回归和本地记录更新。
+
+### 验收标准
+
+- 创建、列表、读取、编辑、复制、删除快照均以目录名 ID 为准；损坏目录跳过，
+  路径穿越、超限 base64 和非法 key 有稳定错误。
+- video/dataset 的 note 与 description 可编辑并持久化；episode description
+  以 override 优先，删除来源时同步清理 override。
+- 无 idle lease 时 infer 返回 409；无策略或策略加载失败返回 400；
+  chunk 推理返回策略/降级路径、latency、fps 与关节动作序列，且不自动控制机械臂。
+- 顶部快照按钮能从回放或硬件状态抓取图像与关节；快照视图显示相机、扁平状态线和
+  action chunk；Model Debug 可保存 preset、映射相机、运行推理并发送首步。
+- `pytest`、`node --check`、`git diff --check` 通过；硬件与浏览器验证边界在
+  `docs/dev_log.md` 中明确记录。

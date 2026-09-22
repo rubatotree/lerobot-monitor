@@ -980,6 +980,7 @@ main.episodes-closed {
 #cameras.replaying { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
 #cameras.replaying > .cam-card { display: none; }
 #replay {
+  position: relative;
   grid-column: 1 / -1;
   grid-row: 1 / -1;
   display: flex;
@@ -1095,6 +1096,17 @@ main.episodes-closed {
 }
 #viz-t { flex: 0 0 auto; min-width: 14ch; color: var(--text); text-align: right; white-space: nowrap; font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
 .replay-exit { flex: 0 0 auto; min-height: 28px; padding: 3px 10px; color: var(--text); }
+.video-exit {
+  position: absolute;
+  top: 50px;
+  right: 10px;
+  z-index: 4;
+  min-width: 54px;
+  background: rgba(17, 19, 31, 0.92);
+  border-color: var(--line);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.24);
+}
+.replay-exit.hidden { display: none; }
 #replay .viz-cams { flex: 1; min-height: 0; padding: 4px; }
 .cam-card {
   display: flex;
@@ -1223,6 +1235,294 @@ main.episodes-closed {
 }
 .chart-wrap .panel-body { position: relative; }
 .chart-wrap.collapsed, .log-wrap.collapsed { min-height: 0; }
+.joint-controls {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+.joint-control {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.joint-control select {
+  width: 100%;
+  min-height: 28px;
+  padding: 2px 6px;
+  color: var(--text);
+  background: #090a12;
+  border: 1px solid var(--line);
+}
+.joint-speed-control {
+  grid-template-columns: 72px minmax(0, 1fr) 58px;
+  margin-top: 1px;
+}
+.joint-speed-control input[type="range"] {
+  width: 100%;
+  height: 20px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.joint-speed-control input[type="range"]::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--accent) 0 var(--joint-speed-progress, 25%),
+    #252838 var(--joint-speed-progress, 25%) 100%
+  );
+}
+.joint-speed-control input[type="range"]::-webkit-slider-thumb {
+  width: 15px;
+  height: 15px;
+  margin-top: -5px;
+  appearance: none;
+  border: 2px solid #0b0c14;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.joint-speed-control input[type="range"]::-moz-range-track {
+  height: 5px;
+  border-radius: 999px;
+  background: #252838;
+}
+.joint-speed-control input[type="range"]::-moz-range-progress {
+  height: 5px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+.joint-speed-control input[type="range"]::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border: 2px solid #0b0c14;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.joint-speed-control input[type="range"]:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 3px;
+}
+.joint-speed-control output {
+  padding: 3px 5px;
+  color: var(--text);
+  background: #090a12;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.joint-serial-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px 62px;
+  width: 100%;
+  gap: 5px;
+  align-items: center;
+}
+.joint-serial-control {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  width: 100%;
+  height: 32px;
+  min-height: 32px;
+  gap: 6px;
+  padding: 0 8px;
+  color: var(--text);
+  background: #11131f;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 10px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.joint-serial-control:hover {
+  border-color: var(--accent-dim);
+  background: #151827;
+}
+.joint-serial-control.on {
+  color: #eafff8;
+  background: color-mix(in srgb, var(--ok) 12%, #11131f);
+  border-color: color-mix(in srgb, var(--ok) 55%, var(--line));
+}
+.joint-serial-control > span:not(.joint-serial-indicator) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.joint-serial-control:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.joint-serial-indicator {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--faint);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--faint) 16%, transparent);
+}
+.joint-serial-control.on .joint-serial-indicator {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent);
+}
+.joint-serial-control b {
+  color: var(--faint);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 9px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+.joint-serial-control.on b { color: var(--ok); }
+.joint-send-button,
+.joint-control-lamp {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  height: 30px;
+  padding: 0 7px;
+  color: var(--muted);
+  background: #11131f;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.joint-send-button:hover:not(:disabled),
+.joint-control-lamp:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.joint-send-button {
+  padding: 0;
+}
+.joint-send-button svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.joint-send-button:disabled,
+.joint-control-lamp:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.joint-control-lamp {
+  gap: 5px;
+  min-width: 62px;
+}
+.joint-control-lamp span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+.joint-control-lamp.on {
+  color: var(--ok);
+  border-color: #2d4d42;
+  background: #15241e;
+}
+.joint-control-lamp.on span {
+  background: var(--ok);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 20%, transparent);
+}
+.joint-sync-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px 62px;
+  align-items: center;
+  gap: 6px;
+}
+.joint-sync-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 30px;
+  padding: 0;
+  color: var(--muted);
+  background: #11131f;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.joint-sync-button:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: #171a2a;
+}
+.joint-sync-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.joint-sync-button.on {
+  color: var(--ok);
+  border-color: #2d4d42;
+  background: #15241e;
+}
+.joint-sync-button svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.joint-auto-lamp {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  width: 62px;
+  height: 30px;
+  gap: 5px;
+  padding: 0 7px;
+  color: var(--muted);
+  background: #11131f;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.joint-auto-lamp:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.joint-auto-lamp:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.joint-auto-lamp span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+.joint-auto-lamp.on {
+  color: var(--ok);
+  border-color: #2d4d42;
+  background: #15241e;
+}
+.joint-auto-lamp.on span {
+  background: var(--ok);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 20%, transparent);
+}
 #joint-rows {
   display: flex;
   flex-direction: column;
@@ -1255,7 +1555,7 @@ main.episodes-closed {
   opacity: 0.4;
   accent-color: var(--faint);
 }
-#joint-panel:not(.bus-live) input[type="range"] { opacity: 0.35; }
+#joint-panel.read-only .j-row input { opacity: 0.35; pointer-events: none; }
 .j-val {
   font-family: "IBM Plex Mono", ui-monospace, monospace;
   font-size: 11px;

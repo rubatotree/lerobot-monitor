@@ -1,5 +1,62 @@
 # Dev log
 
+## 2026-09-22（Joints 面板显式连接与同步源）
+
+- Joints 面板新增同步源、Speed cap 和 Serial control。默认 `Follower / 180°/s /
+  serial off`，加载页面不再因拖动滑条隐式连接 COM 口。
+- `Follower` 为可编辑目标通道；串口关闭时只更新 UI，开启后通过 `/api/joints` 发送。
+  `Leader`、`Joint state`、`Command`、`Predict` 均为只读源；leader relay 要求 leader
+  已在 Hardware 面板手动连接。
+- 控制线程新增 live target 与 `max_speed` 限制，manual 输出和 leader relay 都按真实
+  `dt` 逐步逼近目标。Stop、E-STOP、Disconnect、relax-release、任务启动和 follower
+  异常会清除 live target，防止迟到命令继续控制硬件。
+- `/api/status` 增加 `leader_joints`；`/api/joints` 增加 `source` 与 `max_speed`，
+  非法 source 和非正/非有限速度返回 `400`。`ui.joints` 持久化 source 与 speed cap。
+- Prediction 源在没有新 rollout chunk 时保留最后值并显示 stale，不自动回退其他源。
+- 移除 Apply targets / From follower / From leader 与 Hold pose 控件；Serial control
+  改为带状态指示的主按钮，Speed cap 位于其下方并使用自定义轨道/滑块。Joints 配置只存
+  `ui.joints`，pose preset 仍只保存关节目标。
+- Serial control 开启且不在 teleop/record/rollout 等任务模式时，当前 Joints command
+  会立即发送，Speed cap 变化也立即以新上限重发；无需额外 Apply。
+- 回放 dataset/video 时，`Joint state` 与 `Command` 同步源改为按统一白线
+  `vizState.elapsed` 从当前 episode 的 `obs.*` / `act.*` series 线性插值；拖动、播放、
+  暂停和跳帧都会同步刷新 Joints 滑条，不再读取实时硬件状态。
+- Serial control 开启后，Joints 当前同步到的 state / command / prediction pose 会统一
+  下发 follower；回放游标处的数据因此可直接驱动机械臂。Joints 面板的滑条、同步源、
+  Speed cap 和 Serial control 操作不再调用 `exitReplayForControl`。
+- 关闭 Serial control 改为调用 `/api/hardware/force_disconnect`，立即释放 follower，
+  不再执行 relax-then-release 过渡。
+- Replay 顶栏移除 `arm off` 与 snapshot `edit`，EXIT 移入全局顶栏并在 replay 期间显示。
+- 修复 Serial control 下发时后端短暂进入 `jog` 导致 replay 被强制关闭的问题；状态推送
+  不再把 `jog` 视为任务模式，只有明确启动 loading / teleop / record / rollout 才关闭
+  replay 或 snapshot 观看模式。
+- Joints 右栏顺序改为 Serial control、Speed cap、无文字分隔线、Sync + 同步按钮、关节
+  列表。新增同步按钮可把当前源立即填入 command，并修复仅切换到 Follower 源时只更新
+  targets、不更新滑条的问题。
+- Sync 改为与 send/control 类似的双控：`sync` 单次拉取，`auto` 灯持续跟随。所有源
+  行为一致并允许 Follower 自动同步；手动编辑或 preset load 自动关闭 auto，None 不锁定
+  auto。send/sync 与 control/auto 分别使用统一宽度，Sync 与 auto 同高对齐。
+- Serial control 右侧新增 `send` 单次发送与 `control` 持续输出灯。默认 control 熄灭，
+  滑条编辑、自动同步和 preset load 不再隐式下发；send 或 control 开启才发送，手动
+  Sync 只填充面板值，由 send/control 决定是否写到串口。
+- Serial control 缩窄并与右侧按钮同高；send 使用上传箭头、sync 使用下载箭头表示相反
+  方向；serial control 与 sync 的持续输出灯统一显示 `auto`；移除 Sync 上方分割线。
+- relax / preset slew 时后端状态报告 `motion_locked`，前端停止 Joints 自动输出和
+  leader relay；竞态中的 live jog 由后端返回 `ignored`，不再刷 `cannot live jog` 日志。
+- 验证：非仿真测试 `163 passed`；完整测试 `193 passed, 1 failed`，唯一失败仍是
+  `test_sim` 的模拟总线初始位姿断言，与本轮 Joints/API 路径无关。`node --check`、
+  Python compile 和 `git diff --check` 通过。Chrome smoke 10/10 + 7/7 + 3/3 + 5/5 + 1/1 + 4/4 + 7/7 + 3/3 + 1/1 + 3/3 + 1/1 + 6/6 + 6/6 + 1/1 通过，覆盖默认
+  不连接串口、串口关闭拖动不发请求、五种同步源、设置持久化、prediction stale、
+  串口开启即发送 command、Speed cap 重发、回放白线插值、桌面/390px 窄屏与浏览器
+  console，以及回放 state 下发、开关 serial 不退出 replay、即时 force disconnect 和
+  EXIT/arm/edit 布局、`jog` 状态不再关闭 replay，以及 Sync 按钮对 follower / command /
+  replay state 的即时填充，以及 None、编辑暂停、全绿自动恢复、手动同步恢复、preset
+  load 视为编辑、视频窗口 EXIT 对齐、全绿自动恢复、Follower 手动同步、preset 串口
+  下发、motion lock、send 单次发送、control 默认关闭与持续输出、control 关闭时 preset
+  不写串口、按钮几何、图标方向与 auto 文案。
+- 验证边界：尚未连接真实 follower/leader 执行 relay、速度上限和反复连接/断开 soak；
+  硬件动作连续性、COM 口释放和主动臂读数抖动仍需在设备环境确认。
+
 ## 2026-09-22（Hardware preset、固定工具栏与设备身份恢复）
 
 - Library 的四个搜索框合并为标签栏下方的共享 sticky 搜索框；关键词按标签存入

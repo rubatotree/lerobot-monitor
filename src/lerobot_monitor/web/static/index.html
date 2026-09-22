@@ -201,14 +201,6 @@
             <span id="snapshot-badge" class="replay-tag snapshot hidden">SNAPSHOT</span>
             <span id="replay-title">—</span>
             <span id="replay-status" class="replay-status" role="status" aria-live="polite"></span>
-            <button type="button" id="viz-arm" class="ghost arm-toggle" title="Replay actions on robot (off)" aria-label="Replay actions on robot" aria-pressed="false">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="7" width="14" height="11" rx="2"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><path d="M12 7V4"/></svg>
-              <span id="viz-arm-label">arm off</span>
-            </button>
-            <button type="button" id="btn-snap-edit" class="ghost arm-toggle hidden" title="Edit snapshot name, task, note and description">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg>
-              <span>edit</span>
-            </button>
           </div>
           <div class="replay-transport" role="group" aria-label="Replay transport">
             <button type="button" id="viz-play" class="ghost icon-btn" title="Play" aria-label="Play">
@@ -220,9 +212,9 @@
             <label class="sr-only" for="replay-seek">Replay timeline</label>
             <input id="replay-seek" type="range" min="0" max="1000" value="0" step="1" aria-describedby="viz-t" disabled/>
             <output id="viz-t" for="replay-seek" aria-live="off">0.00s / 0.00s</output>
-            <button type="button" id="viz-exit" class="ghost replay-exit">EXIT</button>
           </div>
         </header>
+        <button type="button" id="viz-exit" class="ghost replay-exit video-exit hidden">EXIT</button>
         <div id="viz-cams" class="viz-cams"></div>
       </div>
     </section>
@@ -288,16 +280,48 @@
       <div class="side-panes">
       <section class="panel side-tab-panel" id="joint-panel" data-panel="joints" data-tab-panel="joints" role="tabpanel" aria-labelledby="side-tab-joints">
         <div class="panel-body">
-        <div id="joint-rows"></div>
-        <div class="row-actions">
-          <button type="button" id="btn-apply">Apply targets</button>
-          <button type="button" id="btn-read-pose">From follower</button>
-          <button type="button" id="btn-read-leader" class="ghost">From leader</button>
+        <div class="joint-controls">
+          <div class="joint-serial-row">
+            <button type="button" id="btn-joint-serial" class="joint-serial-control" aria-pressed="false">
+              <span class="joint-serial-indicator" aria-hidden="true"></span>
+              <span>Serial control</span>
+              <b id="joint-serial-status">offline</b>
+            </button>
+            <button type="button" id="btn-joint-send" class="joint-send-button" title="Send current command" aria-label="Send current command">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M5 20h14"/></svg>
+            </button>
+            <button type="button" id="btn-joint-control" class="joint-control-lamp" aria-pressed="false" title="Continuous command output">
+              <span aria-hidden="true"></span>
+              auto
+            </button>
+          </div>
+          <label class="joint-control joint-speed-control">
+            <span>Speed cap</span>
+            <input id="joint-max-speed" type="range" min="0" max="720" step="30" value="180"/>
+            <output id="joint-max-speed-value" for="joint-max-speed">180°/s</output>
+          </label>
+          <div class="joint-sync-row">
+            <label class="joint-control">
+              <span>Sync</span>
+              <select id="joint-sync-source">
+                <option value="none">None</option>
+                <option value="follower">Follower</option>
+                <option value="leader">Leader</option>
+                <option value="state">Joint state</option>
+                <option value="command">Command</option>
+                <option value="prediction">Predict</option>
+              </select>
+            </label>
+            <button type="button" id="btn-joint-sync" class="joint-sync-button" title="Sync from Follower" aria-label="Sync from Follower">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>
+            </button>
+            <button type="button" id="btn-joint-auto" class="joint-auto-lamp" aria-pressed="false" title="Automatic sync">
+              <span aria-hidden="true"></span>
+              auto
+            </button>
+          </div>
         </div>
-        <label class="check">
-          <input type="checkbox" id="chk-hold" checked/>
-          Hold pose while serial is leased
-        </label>
+        <div id="joint-rows"></div>
         </div>
       </section>
 

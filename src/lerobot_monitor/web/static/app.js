@@ -23,6 +23,21 @@ let camMenu = [];
 let lastPorts = [];
 let lastHwKey = "";
 let followSliders = false;
+const JOINT_SYNC_SOURCES = new Set(["none", "follower", "leader", "state", "command", "prediction"]);
+let jointSyncSource = "follower";
+let jointMaxSpeed = 180;
+let jointSerialEnabled = false;
+let jointSerialReady = false;
+let jointSerialSeenConnected = false;
+let jointSerialBusy = false;
+let jointControlEnabled = false;
+let jointRelayTimer = null;
+let jointRelayInFlight = false;
+let jointLiveInFlight = false;
+let jointPredictionStale = false;
+let jointAutoSyncEnabled = false;
+let jointSyncAvailable = false;
+let lastReplayJointPanelElapsed = Number.NaN;
 let autoRecord = false;
 let capturing = false;
 let selectedVideoId = "";
@@ -1869,6 +1884,7 @@ function clearRolloutPredictions() {
   );
   const hasChunks = rolloutPredictionList().length > 0;
   if (!hasChunks && !hasOverlay(stateChart) && !hasOverlay(actionChart)) return;
+  if (jointSyncSource === "prediction") jointPredictionStale = true;
   vizState.rolloutPredictions = [];
   [stateChart, actionChart].forEach((chart) => {
     if (!hasOverlay(chart)) return;
@@ -1877,6 +1893,7 @@ function clearRolloutPredictions() {
     syncChartDatasets(chart);
     scheduleChartUpdate(chart);
   });
+  syncJointControls();
 }
 
 function limitsFor(name) {
@@ -1885,21 +1902,314 @@ function limitsFor(name) {
   return name === "gripper" ? [0, 100] : [-180, 180];
 }
 
-function flushLive() {
+function jointSpeedPayload() {
+  return jointMaxSpeed > 0 ? { max_speed: jointMaxSpeed } : {};
+}
+
+function jointSourceIsEditable() {
+  return true;
+}
+
+function jointSerialOutputReady() {
+  const motionLocked = !!(last && last.motion_locked);
+  return jointSerialEnabled && jointSerialReady && !taskFollowing() && !motionLocked;
+}
+
+function jointHardwareEnabled() {
+  return jointSerialOutputReady() && jointControlEnabled;
+}
+
+function clearPendingLive() {
+  if (liveTimer) clearTimeout(liveTimer);
+  liveTimer = null;
+  pendingLive = {};
+}
+
+function stopJointRelay() {
+  if (jointRelayTimer) clearInterval(jointRelayTimer);
+  jointRelayTimer = null;
+}
+
+function latestJointPredictionPose() {
+  const chunks = rolloutPredictionList();
+  if (!chunks.length) return null;
+  const ordered = [...chunks].sort((left, right) => left.start - right.start);
+  const latest = ordered[ordered.length - 1];
+  if (!latest || !Array.isArray(latest.points) || !latest.points.length) return null;
+  const now = liveWallClockNow();
+  const point = latest.points.find((entry) => entry.x >= now) || latest.points[latest.points.length - 1];
+  return point && point.joints && Object.keys(point.joints).length ? point.joints : null;
+}
+
+async function relayLeaderPose() {
+  if (!jointRelayTimer || jointRelayInFlight) return;
+  jointRelayInFlight = true;
+  try {
+    await api("/api/joints", {
+      joints: {},
+      live: true,
+      source: "leader",
+      ...jointSpeedPayload(),
+    });
+  } catch (err) {
+    toastError(err);
+    stopJointRelay();
+  } finally {
+    jointRelayInFlight = false;
+  }
+}
+
+function syncJointControls() {
+  const panel = $("joint-panel");
+  const serial = $("btn-joint-serial");
+  const serialStatus = $("joint-serial-status");
+  const syncButton = $("btn-joint-sync");
+  const autoButton = $("btn-joint-auto");
+  const sendButton = $("btn-joint-send");
+  const controlButton = $("btn-joint-control");
+  if (!panel || !serial || !serialStatus) return;
+
+  const robot = (last && last.robot) || {};
+  const leader = (last && last.leader) || {};
+  const mode = (last && (last.display_mode || last.mode)) || "offline";
+  const running = taskFollowing() || mode === "estop";
+  if (!jointSerialBusy) {
+    if (robot.connected) {
+      jointSerialEnabled = true;
+      jointSerialReady = true;
+      jointSerialSeenConnected = true;
+    } else if (jointSerialSeenConnected) {
+      jointSerialEnabled = false;
+      jointSerialReady = false;
+      jointSerialSeenConnected = false;
+    }
+  }
+  serial.disabled = jointSerialBusy || running;
+  serial.classList.toggle("on", jointSerialEnabled);
+  serial.setAttribute("aria-pressed", String(jointSerialEnabled));
+  panel.classList.toggle("read-only", !jointSourceIsEditable());
+  const rowInputsEditable = jointSourceIsEditable() && !running;
+  document.querySelectorAll("#joint-rows input").forEach((input) => {
+    input.disabled = !rowInputsEditable;
+  });
+
+  if (jointSerialBusy) serialStatus.textContent = "working";
+  else if (robot.connected) serialStatus.textContent = `${robot.port || "serial"} · on`;
+  else serialStatus.textContent = "offline";
+
+  if (!jointSerialEnabled || !jointSerialReady) jointControlEnabled = false;
+  const outputReady = jointSerialOutputReady();
+  if (sendButton) sendButton.disabled = !outputReady;
+  if (controlButton) {
+    controlButton.disabled = !outputReady;
+    controlButton.classList.toggle("on", jointControlEnabled);
+    controlButton.setAttribute("aria-pressed", String(jointControlEnabled));
+  }
+
+  const sourceLabels = {
+    none: "none",
+    follower: "follower",
+    leader: "leader",
+    state: "joint state",
+    command: "command",
+    prediction: "predict",
+  };
+  let status = sourceLabels[jointSyncSource] || jointSyncSource;
+  if (jointSyncSource === "none") {
+    status += " · manual";
+  } else if (jointSyncSource === "follower") {
+    status += jointHardwareEnabled() ? " · command" : " · ui only";
+  } else if (jointSyncSource === "leader") {
+    if (!leader.connected) status += " · leader required";
+    else status += jointHardwareEnabled() ? " · relay" : " · read only";
+  } else {
+    status += " · read only";
+  }
+  if (jointSyncSource === "prediction" && jointPredictionStale) status += " · stale";
+  if (syncButton) {
+    const title = `Sync once from ${sourceLabels[jointSyncSource] || jointSyncSource} · ${status}`;
+    syncButton.title = title;
+    syncButton.setAttribute("aria-label", title);
+    syncButton.disabled = running || jointSyncSource === "none" || !jointSyncAvailable;
+  }
+  if (autoButton) {
+    const title = `Automatic sync from ${sourceLabels[jointSyncSource] || jointSyncSource} · ${status}`;
+    autoButton.title = title;
+    autoButton.setAttribute("aria-label", title);
+    autoButton.classList.toggle("on", jointAutoSyncEnabled);
+    autoButton.setAttribute("aria-pressed", String(jointAutoSyncEnabled));
+    autoButton.disabled = running;
+  }
+
+  const relayWanted = (
+    jointSyncSource === "leader"
+    && jointHardwareEnabled()
+    && !!leader.connected
+  );
+  if (!relayWanted) {
+    stopJointRelay();
+  } else if (!jointRelayTimer) {
+    jointRelayTimer = setInterval(relayLeaderPose, 40);
+    relayLeaderPose();
+  }
+}
+
+function updateJointSpeedLabel() {
+  const output = $("joint-max-speed-value");
+  const input = $("joint-max-speed");
+  if (output) output.textContent = jointMaxSpeed > 0 ? `${jointMaxSpeed}°/s` : "Instant";
+  if (input) input.style.setProperty("--joint-speed-progress", `${(jointMaxSpeed / 720) * 100}%`);
+}
+
+function applyJointUi(config) {
+  if (config && JOINT_SYNC_SOURCES.has(config.source)) jointSyncSource = config.source;
+  const speed = Number(config && config.max_speed);
+  if (Number.isFinite(speed) && speed >= 0 && speed <= 720) jointMaxSpeed = speed;
+  const source = $("joint-sync-source");
+  const speedInput = $("joint-max-speed");
+  if (source) source.value = jointSyncSource;
+  if (speedInput) speedInput.value = String(jointMaxSpeed);
+  updateJointSpeedLabel();
+  syncJointControls();
+}
+
+function setJointSyncSource(value) {
+  if (!JOINT_SYNC_SOURCES.has(value)) return;
+  jointSyncSource = value;
+  clearPendingLive();
+  stopJointRelay();
+  jointPredictionStale = false;
+  lastReplayJointPanelElapsed = Number.NaN;
+  updateJoints(last && last.joints ? last.joints : {});
+  syncJointControls();
+  persistUi();
+}
+
+function setJointMaxSpeed(value) {
+  const speed = Number(value);
+  if (!Number.isFinite(speed)) return;
+  jointMaxSpeed = Math.max(0, Math.min(720, speed));
+  updateJointSpeedLabel();
+  syncJointControls();
+  sendCurrentJointSourceCommand();
+  persistUi();
+}
+
+function sendJointCommand(joints, { force = false } = {}) {
+  if (!(force ? jointSerialOutputReady() : jointHardwareEnabled())) return;
+  if (!Object.keys(joints).length) return;
+  pendingLive = { ...pendingLive, ...joints };
+  if (liveTimer) clearTimeout(liveTimer);
+  liveTimer = null;
+  flushLive(force);
+}
+
+function sendCurrentJointSourceCommand() {
+  if (jointSyncSource === "follower" || jointSyncSource === "none") {
+    sendJointCommand({ ...targets });
+    return;
+  }
+  if (jointSyncSource === "leader") return;
+  const pose = jointSourcePose(last && last.joints ? last.joints : {}, vizState.elapsed);
+  if (pose) sendJointCommand(pose);
+}
+
+function sendCurrentCommandOnce() {
+  sendJointCommand({ ...targets }, { force: true });
+}
+
+function toggleJointControl() {
+  if (!jointSerialOutputReady()) return;
+  jointControlEnabled = !jointControlEnabled;
+  syncJointControls();
+  if (jointControlEnabled) sendCurrentCommandOnce();
+}
+
+async function setJointSerial(enabled) {
+  if (jointSerialBusy) return;
+  const serial = $("btn-joint-serial");
+  if (!serial) return;
+  jointSerialBusy = true;
+  jointSerialEnabled = enabled;
+  if (!enabled) {
+    jointControlEnabled = false;
+    jointSerialSeenConnected = false;
+  }
+  if (!enabled) {
+    clearPendingLive();
+    stopJointRelay();
+  }
+  syncJointControls();
+  try {
+    if (enabled) {
+      if (!busLive) {
+        const port = $("arm-port") ? $("arm-port").value : "";
+        await api("/api/robot/connect", port ? { port } : {});
+        busLive = true;
+        jointSerialReady = true;
+      }
+      syncJointControls();
+      sendCurrentJointSourceCommand();
+      localLog("joint serial enabled");
+    } else {
+      if (taskFollowing()) throw new Error("stop the active task before disconnecting the follower");
+      if (busLive || jointSerialReady) {
+        await api("/api/hardware/force_disconnect", { role: "arm" });
+      }
+      busLive = false;
+      jointSerialReady = false;
+      localLog("joint serial disabled");
+    }
+  } catch (err) {
+    jointSerialEnabled = busLive;
+    jointSerialReady = busLive;
+    jointSerialSeenConnected = busLive;
+    toastError(err);
+  } finally {
+    jointSerialBusy = false;
+    syncJointControls();
+  }
+}
+
+function flushLive(force = false) {
   liveTimer = null;
   const joints = pendingLive;
   pendingLive = {};
   if (!Object.keys(joints).length) return;
-  api("/api/joints", { joints, live: true, duration_s: 0 }).catch(toastError);
+  if (!(force ? jointSerialOutputReady() : jointHardwareEnabled())) return;
+  if (jointLiveInFlight) {
+    pendingLive = { ...joints, ...pendingLive };
+    liveTimer = setTimeout(flushLive, 40);
+    return;
+  }
+  jointLiveInFlight = true;
+  api("/api/joints", {
+    joints,
+    live: true,
+    duration_s: 0,
+    source: "manual",
+    ...jointSpeedPayload(),
+  }).catch(toastError).finally(() => {
+    jointLiveInFlight = false;
+    if (Object.keys(pendingLive).length && !liveTimer) {
+      liveTimer = setTimeout(flushLive, 0);
+    }
+  });
 }
 
 function queueLive(name, value) {
-  exitReplayForControl();
+  if (!jointHardwareEnabled()) return;
   followSliders = taskFollowing();
   if (followSliders) return;
   pendingLive[name] = value;
   if (liveTimer) return;
   liveTimer = setTimeout(flushLive, 40);
+}
+
+function markJointEdited(name) {
+  if (!name) return;
+  jointAutoSyncEnabled = false;
+  syncJointControls();
 }
 
 function taskFollowing() {
@@ -1932,6 +2242,7 @@ function ensureJointRows(names) {
       targets[name] = value;
       slider.value = String(value);
       num.value = fmt(value);
+      markJointEdited(name);
       queueLive(name, value);
     };
     slider.addEventListener("input", () => applyValue(slider.value));
@@ -1948,11 +2259,38 @@ function ensureJointRows(names) {
   root.dataset.ready = "1";
 }
 
-function updateJoints(joints) {
+function jointSourcePose(joints, replayElapsed = vizState.elapsed) {
+  if (replayActive && vizState.previewReady && jointSyncSource === "state") {
+    return sampleReplayJointPose("obs.", replayElapsed);
+  }
+  if (replayActive && vizState.previewReady && jointSyncSource === "command") {
+    return sampleReplayJointPose("act.", replayElapsed);
+  }
+  if (jointSyncSource === "follower" || jointSyncSource === "state") {
+    return joints || null;
+  }
+  if (jointSyncSource === "leader") {
+    return (last && last.leader_joints) || null;
+  }
+  if (jointSyncSource === "command") {
+    return (last && last.action) || null;
+  }
+  if (jointSyncSource === "prediction") {
+    const sourcePose = latestJointPredictionPose();
+    jointPredictionStale = !sourcePose;
+    return sourcePose;
+  }
+  return null;
+}
+
+function updateJoints(joints, replayElapsed = vizState.elapsed) {
   const names = meta.joints.length ? meta.joints : JOINT_FALLBACK;
   ensureJointRows(names);
   const active = document.activeElement;
   followSliders = taskFollowing();
+  const availablePose = jointSourcePose(joints, replayElapsed);
+  jointSyncAvailable = !!availablePose && Object.keys(availablePose).length > 0;
+  const sourcePose = jointAutoSyncEnabled ? availablePose : null;
   names.forEach((name) => {
     const cur = joints[name];
     const el = document.querySelector(`[data-cur="${name}"]`);
@@ -1961,19 +2299,32 @@ function updateJoints(joints) {
     const val = document.querySelector(`[data-val="${name}"]`);
     const row = slider && slider.closest(".j-row");
     const editing = active && (active.dataset.joint === name || active.dataset.val === name);
-    if (cur != null && !editing && (followSliders || targets[name] == null)) {
+    const tolerance = MATCH_TOL[name] ?? 2;
+    const sourceValue = sourcePose && sourcePose[name] != null ? Number(sourcePose[name]) : Number.NaN;
+    const currentTarget = Number(targets[name]);
+    if (!editing && Number.isFinite(sourceValue)) {
+      targets[name] = sourceValue;
+      if (slider) slider.value = String(sourceValue);
+      if (val) val.value = fmt(sourceValue);
+    } else if (!editing && Number.isFinite(currentTarget)) {
+      if (slider) slider.value = String(currentTarget);
+      if (val) val.value = fmt(currentTarget);
+    } else if (targets[name] == null && cur != null && !editing) {
       targets[name] = cur;
       if (slider) slider.value = String(cur);
       if (val) val.value = fmt(cur);
     }
     const shown = slider ? Number(slider.value) : targets[name];
-    const tol = MATCH_TOL[name] ?? 2;
-    const matched = cur != null && shown != null && Math.abs(Number(shown) - Number(cur)) <= tol;
+    const matched = cur != null && shown != null && Math.abs(Number(shown) - Number(cur)) <= tolerance;
     if (row) {
       row.classList.toggle("matched", matched);
       row.classList.toggle("unmatched", !matched && cur != null);
     }
   });
+  if (sourcePose && jointSyncSource !== "leader" && jointSyncSource !== "none") {
+    sendJointCommand({ ...targets });
+  }
+  syncJointControls();
 }
 
 function setCamGrid(n) {
@@ -2221,7 +2572,9 @@ function applyStatus(d) {
   last = d;
   const backendMode = d.display_mode || d.mode || "offline";
   const pending = d.task && d.task.pending;
-  if (episodeSource && (pending || ["loading", "jog", "teleop", "record", "rollout"].includes(backendMode))) {
+  // Joints Serial control uses jog as its transport mode. It must not be treated
+  // like a task start while the user is inspecting replay or a snapshot.
+  if (episodeSource && (pending || ["loading", "teleop", "record", "rollout"].includes(backendMode))) {
     closeEpisodeSelection();
   }
   const mode = backendMode;
@@ -2234,6 +2587,7 @@ function applyStatus(d) {
   const leader = d.leader || {};
   busLive = !!robot.connected;
   $("joint-panel").classList.toggle("bus-live", busLive);
+  syncJointControls();
 
   syncDevicePowerButtons(robot, leader);
   const envEl = $("st-env");
@@ -2290,9 +2644,6 @@ function applyStatus(d) {
   } else {
     $("st-episode").textContent = task.recording ? `#${task.episode_index}` : "—";
   }
-
-  const hold = $("chk-hold");
-  if (document.activeElement !== hold) hold.checked = !!d.hold;
 
   renderMainCameras(d.cameras || []);
   renderCamMenu(d.cameras || []);
@@ -2734,7 +3085,10 @@ function persistUi() {
     api("/api/ui", {
       record: recordFields(),
       rollout: rolloutFields(),
-      hold: $("chk-hold").checked,
+      joints: {
+        source: jointSyncSource,
+        max_speed: jointMaxSpeed,
+      },
       auto_record: autoRecord,
       selected_dataset: selectedDatasetId,
       selected_video: selectedVideoId,
@@ -3234,7 +3588,10 @@ document.addEventListener("pointerdown", (event) => {
   closePresetNamePopover();
 });
 
-function applyPoseToSliders(pose) {
+function applyPoseToSliders(pose, { markEdited = true, send = true } = {}) {
+  if (markEdited) {
+    jointAutoSyncEnabled = false;
+  }
   Object.assign(targets, pose);
   Object.entries(pose).forEach(([name, value]) => {
     const slider = document.querySelector(`input[data-joint="${name}"]`);
@@ -3243,24 +3600,50 @@ function applyPoseToSliders(pose) {
     if (val) val.value = fmt(value);
   });
   updateJoints(last.joints || {});
+  if (send) sendJointCommand({ ...targets });
 }
-bind("btn-apply", () => {
-  exitReplayForControl();
-  return api("/api/joints", { joints: { ...targets }, duration_s: 2.5 });
-});
-bind("btn-read-pose", async () => {
-  const result = await api("/api/joints/read");
-  applyPoseToSliders(result.joints || {});
-});
-bind("btn-read-leader", async () => {
-  const result = await api("/api/joints/read_leader");
-  applyPoseToSliders(result.joints || {});
-});
-$("chk-hold").addEventListener("change", async (e) => {
-  try { await api("/api/hold", { enabled: e.target.checked }); persistUi(); }
-  catch (err) { toastError(err); }
-});
 
+function syncJointTargetFromSource() {
+  const pose = jointSourcePose(last && last.joints ? last.joints : {}, vizState.elapsed);
+  if (!pose || !Object.keys(pose).length) {
+    toastError(new Error(`no ${jointSyncSource} data to sync`));
+    return;
+  }
+  applyPoseToSliders(pose, { markEdited: false, send: false });
+  syncJointControls();
+}
+
+function toggleJointAutoSync() {
+  jointAutoSyncEnabled = !jointAutoSyncEnabled;
+  if (jointAutoSyncEnabled) {
+    syncJointTargetFromSource();
+  } else {
+    updateJoints(last && last.joints ? last.joints : {});
+  }
+  syncJointControls();
+}
+
+if ($("joint-sync-source")) {
+  $("joint-sync-source").addEventListener("change", (event) => setJointSyncSource(event.target.value));
+}
+if ($("joint-max-speed")) {
+  $("joint-max-speed").addEventListener("input", (event) => setJointMaxSpeed(event.target.value));
+}
+if ($("btn-joint-serial")) {
+  $("btn-joint-serial").addEventListener("click", () => setJointSerial(!jointSerialEnabled));
+}
+if ($("btn-joint-send")) {
+  $("btn-joint-send").addEventListener("click", sendCurrentCommandOnce);
+}
+if ($("btn-joint-control")) {
+  $("btn-joint-control").addEventListener("click", toggleJointControl);
+}
+if ($("btn-joint-sync")) {
+  $("btn-joint-sync").addEventListener("click", syncJointTargetFromSource);
+}
+if ($("btn-joint-auto")) {
+  $("btn-joint-auto").addEventListener("click", toggleJointAutoSync);
+}
 bind("btn-arm-toggle", () => togglePortConnection("arm"));
 bind("btn-leader-toggle", () => togglePortConnection("leader"));
 bind("btn-hdr-arm-power", () => togglePortConnection("arm"));
@@ -5061,12 +5444,14 @@ function syncReplayAvailability() {
   const ready = replayActive
     && vizState.previewReady
     && vizState.previewGeneration === previewRequestGeneration;
-  ["viz-play", "viz-restart", "viz-arm"].forEach((id) => {
+  ["viz-play", "viz-restart"].forEach((id) => {
     const control = $(id);
     if (control) control.disabled = !ready;
   });
   const seek = $("replay-seek");
   if (seek) seek.disabled = !ready;
+  const exit = $("viz-exit");
+  if (exit) exit.classList.toggle("hidden", !replayActive);
 }
 
 function syncArmToggle() {
@@ -5130,6 +5515,7 @@ function leaveReplay() {
   vizState.playing = false;
   vizState.previewReady = false;
   vizState.elapsed = 0;
+  lastReplayJointPanelElapsed = Number.NaN;
   clearVizChunk();
   snapshotActive = false;
   activeSnapshot = null;
@@ -5205,6 +5591,7 @@ function closeEpisodeSelection() {
   vizState.episodes = 0;
   vizState.duration = 0;
   vizState.elapsed = 0;
+  lastReplayJointPanelElapsed = Number.NaN;
   vizState.times = [];
   vizState.previewMeta = "";
   vizState.previewReady = false;
@@ -5253,6 +5640,7 @@ function updateReplayBar(elapsed, duration) {
   }
   if ($("viz-t")) $("viz-t").value = `${elapsed.toFixed(2)}s / ${duration.toFixed(2)}s`;
   [stateChart, actionChart].forEach((chart) => syncReplayChart(chart, elapsed, duration));
+  syncReplayJointPanel(elapsed);
 }
 
 function previewFileUrl(kind, id, episode, cam) {
@@ -5807,6 +6195,8 @@ function renderVizChart(data) {
   vizState.times = times;
   fillReplayChart(stateChart, times, series, "obs.");
   fillReplayChart(actionChart, times, series, "act.", chunkOverlayPoints(), chunkOverlayStart());
+  lastReplayJointPanelElapsed = Number.NaN;
+  syncReplayJointPanel(vizState.elapsed);
 }
 
 function renderVizChartsFromState() {
@@ -5879,6 +6269,35 @@ function sampleJointSeries(times, track, elapsed) {
     joints[name] = a + (b - a) * weight;
   }
   return Object.keys(joints).length ? joints : null;
+}
+
+function sampleReplayJointPose(prefix, elapsed) {
+  const times = vizState.times || [];
+  const series = vizState.series || {};
+  const track = {};
+  jointNames().forEach((name) => {
+    const values = series[`${prefix}${name}`];
+    if (Array.isArray(values) && values.length) {
+      track[name] = values.map((value) => value == null ? Number.NaN : Number(value));
+    }
+  });
+  return sampleJointSeries(times, track, elapsed);
+}
+
+function syncReplayJointPanel(elapsed) {
+  if (
+    !replayActive
+    || !vizState.previewReady
+    || (jointSyncSource !== "state" && jointSyncSource !== "command")
+  ) {
+    return;
+  }
+  const value = Math.max(0, Number(elapsed) || 0);
+  if (Number.isFinite(lastReplayJointPanelElapsed) && Math.abs(value - lastReplayJointPanelElapsed) < 0.02) {
+    return;
+  }
+  lastReplayJointPanelElapsed = value;
+  updateJoints(last && last.joints ? last.joints : {}, value);
 }
 
 function pushArmReplayFrame() {
@@ -5978,6 +6397,7 @@ async function loadPreview(kind, id, episode, autoplay = false) {
   vizState.arm = { times: [], track: {} };
   vizState.previewMeta = "";
   vizState.task = "";
+  lastReplayJointPanelElapsed = Number.NaN;
   clearVizChunk();
   enterReplay();
   resetReplayCharts();
@@ -6845,7 +7265,7 @@ fetch(BASE + "/api/meta")
     if (m.ui) {
       applyRecordFields(m.ui.record);
       applyRolloutFields(m.ui.rollout);
-      if (m.ui.hold != null) $("chk-hold").checked = !!m.ui.hold;
+      applyJointUi(m.ui.joints);
       if (m.ui.auto_record != null) autoRecord = !!m.ui.auto_record;
       if (m.ui.selected_dataset) selectedDatasetId = m.ui.selected_dataset;
       if (m.ui.selected_video) selectedVideoId = m.ui.selected_video;

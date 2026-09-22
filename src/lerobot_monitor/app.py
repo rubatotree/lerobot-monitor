@@ -34,9 +34,11 @@ STATIC_DIR = Path(__file__).resolve().parent / "web" / "static"
 
 
 class JogBody(BaseModel):
-    joints: dict[str, float]
+    joints: dict[str, float] = Field(default_factory=dict)
     duration_s: float | None = None
     live: bool = False
+    source: str = "manual"
+    max_speed: float | None = None
 
 
 class PresetBody(BaseModel):
@@ -238,6 +240,7 @@ class CameraFlagsBody(BaseModel):
 class UiStateBody(BaseModel):
     record: dict[str, Any] | None = None
     rollout: dict[str, Any] | None = None
+    joints: dict[str, Any] | None = None
     hold: bool | None = None
     hardware: dict[str, Any] | None = None
     auto_record: bool | None = None
@@ -410,9 +413,20 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         unknown = [name for name in body.joints if name not in JOINT_ORDER]
         if unknown:
             raise HTTPException(400, f"unknown joints: {unknown}")
+        if body.source not in {"manual", "leader"}:
+            raise HTTPException(400, f"unknown joint source '{body.source}'")
+        if body.max_speed is not None:
+            if not math.isfinite(body.max_speed) or body.max_speed <= 0:
+                raise HTTPException(400, "max_speed must be a positive finite number")
         return await _submit(
             "jog",
-            {"joints": body.joints, "duration_s": body.duration_s, "live": body.live},
+            {
+                "joints": body.joints,
+                "duration_s": body.duration_s,
+                "live": body.live,
+                "source": body.source,
+                "max_speed": body.max_speed,
+            },
         )
 
     @router.post("/api/joints/preset")

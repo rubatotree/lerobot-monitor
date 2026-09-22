@@ -47,6 +47,7 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         body = res.json()
         assert "mode" in body
         assert body["robot"]["connected"] is False
+        assert body["leader_joints"] == {}
         meta = client.get("/lerobot/api/meta")
         assert meta.status_code == 200
         assert "shoulder_pan" in meta.json()["joints"]
@@ -83,8 +84,9 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert b'id="btn-preset-dup"' in html
         assert b"rec-num" in html
         assert b"id=\"library\"" in html
-        assert b"From follower" in html
-        assert b"From leader" in html
+        assert b"From follower" not in html
+        assert b"From leader" not in html
+        assert b"btn-joint-serial" in html
         created = client.post("/lerobot/api/videos", json={"name": "blocks", "task": "sort"})
         assert created.status_code == 200
         video_id = created.json()["id"]
@@ -102,8 +104,10 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         transport_start = html.index(b'class="replay-transport"')
         transport_end = html.index(b"</div>", transport_start)
         replay_transport = html[transport_start:transport_end]
-        for control_id in (b"viz-play", b"viz-restart", b"replay-seek", b"viz-t", b"viz-exit"):
+        for control_id in (b"viz-play", b"viz-restart", b"replay-seek", b"viz-t"):
             assert b'id="' + control_id + b'"' in replay_transport
+        assert b'id="viz-exit"' in html
+        assert b'id="viz-exit"' not in replay_transport
         assert b"replay-foot" not in html
         assert b"viz-bottom-" not in html
         stopped = client.post("/lerobot/api/task/stop")
@@ -685,6 +689,26 @@ def _debug_config(tmp_path: Path) -> MonitorConfig:
     )
 
 
+def test_joint_api_validates_sync_source_and_speed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        invalid_source = client.post(
+            "/lerobot/api/joints",
+            json={"joints": {"gripper": 1.0}, "source": "policy"},
+        )
+        assert invalid_source.status_code == 400
+        assert "joint source" in invalid_source.json()["detail"]
+
+        invalid_speed = client.post(
+            "/lerobot/api/joints",
+            json={"joints": {"gripper": 1.0}, "max_speed": 0},
+        )
+        assert invalid_speed.status_code == 400
+        assert "max_speed" in invalid_speed.json()["detail"]
+
+
 def test_hardware_system_preset_apply_and_active_state(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     app = create_app(_debug_config(tmp_path))
@@ -886,7 +910,7 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="snap-list"',
         'id="lib-search"',
         'id="btn-lib-search-clear"',
-        'id="btn-snap-edit"',
+        'id="viz-exit"',
         'id="side-tabs"',
         'data-tab="joints"',
         'data-tab-panel="joints"',
@@ -1004,9 +1028,11 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     with TestClient(app) as client:
         css = client.get("/lerobot/static/styles.css")
         script = client.get("/lerobot/static/app.js")
+        page = client.get("/lerobot/")
 
     assert css.status_code == 200
     assert script.status_code == 200
+    assert page.status_code == 200
     assert ".library-search" in css.text
     assert ".library-tools" in css.text
     assert ".side-tools" in css.text
@@ -1017,6 +1043,15 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert ".hdr-icon.task-on" in css.text
     assert ".chart-hover-tooltip" in css.text
     assert ".chart-time-control" in css.text
+    assert ".joint-controls" in css.text
+    assert ".joint-serial-control" in css.text
+    assert ".joint-sync-button.on" in css.text
+    assert ".joint-auto-lamp.on" in css.text
+    assert ".joint-divider" not in css.text
+    assert "grid-template-columns: minmax(0, 1fr) 32px 62px;" in css.text
+    assert ".video-exit" in css.text
+    assert "::-webkit-slider-runnable-track" in css.text
+    assert "--joint-speed-progress" in css.text
     list_rule = re.search(r"\.lib-list\s*\{(?P<body>.*?)\}", css.text, re.DOTALL)
     assert list_rule is not None
     assert "max-height" not in list_rule.group("body")
@@ -1084,3 +1119,42 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert 'lbl.textContent = label;' in script.text
     assert 'id="st-bus"' not in script.text
     assert "function savedPortValue" in script.text
+    assert 'id="joint-sync-source"' in page.text
+    assert '<option value="none">None</option>' in page.text
+    assert 'id="btn-joint-sync"' in page.text
+    assert 'id="btn-joint-auto"' in page.text
+    assert 'id="btn-joint-send"' in page.text
+    assert 'id="btn-joint-control"' in page.text
+    assert 'id="btn-joint-serial"' in page.text
+    assert 'id="joint-max-speed"' in page.text
+    assert 'id="btn-apply"' not in page.text
+    assert 'id="btn-read-pose"' not in page.text
+    assert 'id="btn-read-leader"' not in page.text
+    assert 'id="chk-hold"' not in page.text
+    assert 'id="viz-arm"' not in page.text
+    assert 'id="btn-snap-edit"' not in page.text
+    assert 'let jointSyncSource = "follower";' in script.text
+    assert "function setJointSerial" in script.text
+    assert "function relayLeaderPose" in script.text
+    assert 'source: "leader"' in script.text
+    assert "jointPredictionStale" in script.text
+    assert 'if (kind === "pose") return { ...targets };' in script.text
+    assert "function sendCurrentJointSourceCommand" in script.text
+    assert "function sampleReplayJointPose" in script.text
+    assert "function syncReplayJointPanel" in script.text
+    assert "function syncJointTargetFromSource" in script.text
+    assert "let jointAutoSyncEnabled = false;" in script.text
+    assert "function toggleJointAutoSync" in script.text
+    assert "autoButton.disabled = running;" in script.text
+    assert "const availablePose = jointSourcePose" in script.text
+    assert "const sourcePose = jointAutoSyncEnabled ? availablePose : null" in script.text
+    assert "function sendJointCommand" in script.text
+    assert "sendJointCommand({ ...targets })" in script.text
+    assert "if (send) sendJointCommand({ ...targets });" in script.text
+    assert "let jointControlEnabled = false;" in script.text
+    assert "function toggleJointControl" in script.text
+    assert "last.motion_locked" in script.text
+    assert 'api("/api/hardware/force_disconnect", { role: "arm" })' in script.text
+    assert '["loading", "teleop", "record", "rollout"].includes(backendMode)' in script.text
+    assert 'sampleReplayJointPose("obs.", replayElapsed)' in script.text
+    assert 'sampleReplayJointPose("act.", replayElapsed)' in script.text

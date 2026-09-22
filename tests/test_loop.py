@@ -344,16 +344,17 @@ def test_estop_does_not_wait_for_policy_lock(tmp_path: Path) -> None:
     loop.follower.disconnect.assert_called()
 
 
-def test_live_jog_cannot_cancel_in_flight_relax(tmp_path: Path) -> None:
+def test_live_jog_is_ignored_during_in_flight_relax(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
     loop.mode = "jogging"
     loop._pending_release = "disconnect"
     goal = {"gripper": 12.0}
     loop._slew_goal = goal
+    reply: queue.Queue[dict] = queue.Queue(maxsize=1)
 
-    with pytest.raises(RuntimeError, match="live jog"):
-        loop._handle(Command("jog", {"joints": {"gripper": 1.0}, "live": True}))
+    loop._handle(Command("jog", {"joints": {"gripper": 1.0}, "live": True}, reply))
 
+    assert reply.get(timeout=1) == {"ok": True, "ignored": True, "reason": "motion_in_progress"}
     assert loop.mode == "jogging"
     assert loop._pending_release == "disconnect"
     assert loop._slew_goal is goal
@@ -789,3 +790,109 @@ def test_ui_log_handlers_share_and_cautiously_restore_root_level(tmp_path: Path,
         first.stop()
         second.stop()
         root.setLevel(original_level)
+
+
+def test_live_jog_speed_cap_steps_toward_target(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.joints = {name: 0.0 for name in JOINT_ORDER}
+
+    result = _dispatch(
+        loop,
+        "jog",
+        {
+            "joints": {"gripper": 50.0},
+            "live": True,
+            "source": "manual",
+            "max_speed": 10.0,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["smoothed"] is True
+    assert loop.mode == "jogging"
+    assert loop._live_control is True
+
+    loop._live_last_t -= 1.0
+    loop._tick_live_jog()
+    assert loop.follower.send_pose.call_args.args[0]["gripper"] == pytest.approx(10.0, abs=0.01)
+    assert loop.mode == "jogging"
+
+    loop._live_last_t -= 1.0
+    loop._tick_live_jog()
+    assert loop.follower.send_pose.call_args.args[0]["gripper"] == pytest.approx(20.0, abs=0.02)
+    assert loop.mode == "jogging"
+
+    loop._live_last_t -= 10.0
+    loop._tick_live_jog()
+    assert loop.follower.send_pose.call_args.args[0]["gripper"] == pytest.approx(50.0)
+    assert loop.mode == "idle"
+    assert loop._live_control is False
+
+
+def test_leader_jog_relays_pose_and_publishes_telemetry(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.leader.connected = True
+    pose = {name: 0.0 for name in JOINT_ORDER}
+    pose["gripper"] = 12.0
+    loop.leader.get_action_pose.return_value = pose
+    loop.joints = {name: 0.0 for name in JOINT_ORDER}
+
+    result = _dispatch(
+        loop,
+        "jog",
+        {"joints": {}, "live": True, "source": "leader"},
+    )
+
+    assert result["ok"] is True
+    assert result["source"] == "leader"
+    loop.follower.send_pose.assert_called_with(pose)
+    assert loop.snapshot()["leader_joints"] == pose
+
+
+def test_leader_jog_requires_manual_leader_connection(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.leader.connected = False
+    loop.joints = {name: 0.0 for name in JOINT_ORDER}
+
+    with pytest.raises(RuntimeError, match="leader"):
+        loop._handle(
+            Command(
+                "jog",
+                {"joints": {}, "live": True, "source": "leader"},
+            )
+        )
+
+    loop.follower.send_pose.assert_not_called()
+
+
+def test_task_stop_clears_live_jog_target(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.joints = {name: 0.0 for name in JOINT_ORDER}
+    _dispatch(
+        loop,
+        "jog",
+        {
+            "joints": {"gripper": 50.0},
+            "live": True,
+            "source": "manual",
+            "max_speed": 10.0,
+        },
+    )
+    assert loop._live_control is True
+
+    result = _dispatch(loop, "task_stop")
+
+    assert result["ok"] is True
+    assert loop._live_control is False
+    assert loop._live_target is None
+    assert loop.mode == "idle"
+
+
+def test_snapshot_reports_slew_motion_lock(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "jogging"
+    loop._live_control = False
+    assert loop.snapshot()["motion_locked"] is True
+
+    loop._live_control = True
+    assert loop.snapshot()["motion_locked"] is False

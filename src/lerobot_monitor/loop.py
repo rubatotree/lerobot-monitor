@@ -49,6 +49,25 @@ _UI_LOG_PREVIOUS_ROOT_LEVEL: int | None = None
 _UI_LOG_CHANGED_ROOT_LEVEL = False
 
 
+def _step_pose_toward(
+    current: dict[str, float],
+    target: dict[str, float],
+    max_delta: float,
+) -> dict[str, float]:
+    """Move each joint toward its target by at most ``max_delta`` units."""
+    step: dict[str, float] = {}
+    for name in JOINT_ORDER:
+        if name not in target:
+            continue
+        current_value = float(current.get(name, target[name]))
+        delta = float(target[name]) - current_value
+        if abs(delta) <= max_delta:
+            step[name] = float(target[name])
+        else:
+            step[name] = current_value + math.copysign(max_delta, delta)
+    return step
+
+
 class _UiLogHandler(logging.Handler):
     """Forward third-party loggers (policy load, HF download) into the UI log."""
 
@@ -144,6 +163,7 @@ class ControlLoop:
         self.hold_when_idle = config.control.hold_when_idle
         self.latched: dict[str, float] = {}
         self.joints: dict[str, float] = {}
+        self.leader_joints: dict[str, float] = {}
         self.action: dict[str, float] = {}
         self.loop_fps = 0.0
         self.last_error: str | None = None
@@ -153,6 +173,10 @@ class ControlLoop:
         self._slew_goal: dict[str, float] | None = None
         self._slew_t0 = 0.0
         self._slew_duration = config.control.jog_duration_s
+        self._live_target: dict[str, float] | None = None
+        self._live_max_speed = 0.0
+        self._live_last_t = 0.0
+        self._live_control = False
 
         self.writer: DatasetRecorder | None = None
         self.record_kind: str | None = None
@@ -305,6 +329,26 @@ class ControlLoop:
     def _clear_debug_lease(self) -> None:
         self._debug_lease_token = None
 
+    def _clear_live_control(self) -> None:
+        self._live_target = None
+        self._live_max_speed = 0.0
+        self._live_last_t = 0.0
+        self._live_control = False
+
+    def _read_leader_pose(self) -> dict[str, float]:
+        if not self.leader.connected:
+            raise RuntimeError("leader not connected")
+        try:
+            pose = self.leader.get_action_pose()
+        except Exception as exc:  # noqa: BLE001
+            self.leader.error = str(exc)
+            self.leader_joints = {}
+            with contextlib.suppress(Exception):
+                self.leader.disconnect()
+            raise
+        self.leader_joints = dict(pose)
+        return pose
+
     def _require_no_debug_lease(self, action: str) -> None:
         if self._debug_lease_token is not None:
             raise RuntimeError(f"cannot {action} while model debug is active")
@@ -384,6 +428,7 @@ class ControlLoop:
         first = self.mode != "estop"
         self.mode = "estop"
         self._clear_debug_lease()
+        self._clear_live_control()
         self.hold_when_idle = False
         self._slew_goal = None
         self._pending_release = None
@@ -652,11 +697,14 @@ class ControlLoop:
             "mode": self.mode,
             "display_mode": shown,
             "owner": owner,
+            "live_control": self._live_control,
+            "motion_locked": self.mode == "jogging" and not self._live_control,
             "fps": round(self.loop_fps, 1),
             "robot": self.follower.snapshot(),
             "leader": self.leader.snapshot(),
             "cameras": self.cameras.snapshots(),
             "joints": self.joints,
+            "leader_joints": self.leader_joints,
             "goal": self.latched,
             "action": self.action,
             # Dashed overlay for the charts; only meaningful while a rollout runs.
@@ -945,6 +993,7 @@ class ControlLoop:
             raise RuntimeError(error)
 
     def _release_follower(self, reason: str) -> None:
+        self._clear_live_control()
         self._clear_debug_lease()
         if self.follower.connected:
             self.follower.disconnect()
@@ -982,6 +1031,7 @@ class ControlLoop:
         if not self._can_control_follower():
             self._release_follower(reason)
             return
+        self._clear_live_control()
         try:
             current = self.joints or self.follower.get_pose()
         except Exception:
@@ -1088,6 +1138,7 @@ class ControlLoop:
                 self.leader.config.id = str(p["id"])
             if self.leader.connected:
                 self.leader.disconnect()
+            self.leader_joints = {}
             self.leader.connect()
             if self.leader.connected:
                 self._remember_port("leader", self.leader.config.port)
@@ -1096,6 +1147,7 @@ class ControlLoop:
         elif kind == "disconnect_leader":
             if self.mode in {"teleop", "record"}:
                 self.mode = "idle"
+            self.leader_joints = {}
             self.leader.disconnect()
             self._reply(cmd, ok=True)
         elif kind == "hardware_apply":
@@ -1129,6 +1181,7 @@ class ControlLoop:
             if role in {"arm", "all"}:
                 self._release_follower("force disconnect")
             if role in {"leader", "all"}:
+                self.leader_joints = {}
                 self.leader.disconnect()
             if not self.follower.connected and self.mode != "estop":
                 self.mode = "offline"
@@ -1138,33 +1191,68 @@ class ControlLoop:
             self._require_no_debug_lease("jog")
             if self.pending in {"teleop_start", "record_start", "rollout_start", "capture_start"}:
                 raise RuntimeError(f"cannot jog while {self.pending} is pending")
-            if self.mode == "jogging" and bool(p.get("live")):
-                raise RuntimeError("cannot live jog while a jog or relax motion is running")
+            source = str(p.get("source") or "manual")
+            if source not in {"manual", "leader"}:
+                raise ValueError(f"unknown jog source '{source}'")
+            raw_max_speed = p.get("max_speed")
+            max_speed: float | None = None
+            if raw_max_speed is not None:
+                max_speed = float(raw_max_speed)
+                if not math.isfinite(max_speed) or max_speed <= 0:
+                    raise ValueError("max_speed must be a positive finite number")
+            live = bool(p.get("live"))
+            if self.mode == "jogging" and live and not self._live_control:
+                self._reply(cmd, ok=True, ignored=True, reason="motion_in_progress")
+                return
             self._require_follower_connected("adjust joints")
             self._pending_release = None
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"cannot jog while {self.mode} is running")
+            if source == "leader":
+                self._require_leader_connected("relay leader pose")
+                requested = self._read_leader_pose()
+            else:
+                requested = p.get("joints") or {}
             current = self.joints or self.follower.get_pose()
-            target = merge_partial(current, p.get("joints") or {})
-            live = bool(p.get("live"))
+            target = merge_partial(current, requested)
             duration = p.get("duration_s")
             if live or (duration is not None and float(duration) <= 0):
+                if max_speed is not None:
+                    self._slew_start = None
+                    self._slew_goal = None
+                    self._live_target = target
+                    self._live_max_speed = max_speed
+                    self._live_last_t = time.perf_counter()
+                    self._live_control = True
+                    self.mode = "jogging"
+                    self._touch_bus()
+                    self._reply(
+                        cmd,
+                        ok=True,
+                        target=target,
+                        live=True,
+                        source=source,
+                        smoothed=True,
+                    )
+                    return
+                self._clear_live_control()
                 self._slew_goal = None
                 self.latched = dict(target)
                 self.action = dict(target)
                 self.mode = "idle"
                 self.follower.send_pose(target)
                 self._touch_bus()
-                self._reply(cmd, ok=True, target=target, live=True)
+                self._reply(cmd, ok=True, target=target, live=True, source=source)
                 return
+            self._clear_live_control()
             self._slew_start = dict(current)
             self._slew_goal = target
             self._slew_t0 = time.perf_counter()
             self._slew_duration = float(duration if duration is not None else self.config.control.jog_duration_s)
             self.mode = "jogging"
             self._touch_bus()
-            self.log("info", f"jog {list((p.get('joints') or {}).keys())} in {self._slew_duration:.1f}s")
-            self._reply(cmd, ok=True, target=target)
+            self.log("info", f"jog {list(requested.keys())} in {self._slew_duration:.1f}s")
+            self._reply(cmd, ok=True, target=target, source=source)
         elif kind == "preset":
             name = str(p.get("name") or "relax")
             pose: dict[str, float] | None = None
@@ -1185,7 +1273,7 @@ class ControlLoop:
             self._reply(cmd, ok=True, joints=pose)
         elif kind == "read_leader":
             self._require_leader_connected("read leader pose")
-            pose = self.leader.get_action_pose()
+            pose = self._read_leader_pose()
             self._reply(cmd, ok=True, joints=pose)
         elif kind == "hold":
             self.hold_when_idle = bool(p.get("enabled", True))
@@ -1194,6 +1282,7 @@ class ControlLoop:
             self.request_estop()
             self._reply(cmd, ok=True)
         elif kind == "task_stop":
+            self._clear_live_control()
             self._clear_debug_lease()
             self._invalidate_policy_load()
             self._cancel.clear()
@@ -1241,6 +1330,7 @@ class ControlLoop:
             self._reply(cmd, ok=True, stopped=stopped)
         elif kind == "resume":
             self._require_no_debug_lease("resume")
+            self._clear_live_control()
             self._estop.clear()
             self._require_follower_connected("resume torque")
             self.follower.enable_torque()
@@ -1256,6 +1346,7 @@ class ControlLoop:
             start_token = self._start_token(p)
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"stop {self.mode} before starting teleop")
+            self._clear_live_control()
             if self._aborted(cmd, "teleop", start_token):
                 return
             self._require_follower_connected("start teleop")
@@ -1302,6 +1393,7 @@ class ControlLoop:
             start_token = self._start_token(p)
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"stop {self.mode} before starting record")
+            self._clear_live_control()
             if self._aborted(cmd, "record", start_token):
                 return
             self._require_follower_connected("start recording")
@@ -1354,6 +1446,7 @@ class ControlLoop:
             self._require_no_debug_lease("start rollout")
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"stop {self.mode} before starting rollout")
+            self._clear_live_control()
             if self._aborted(cmd, "rollout"):
                 return
             self._require_follower_connected("start rollout")
@@ -1410,6 +1503,7 @@ class ControlLoop:
         elif kind == "capture_start":
             self._require_no_debug_lease("start capture")
             start_token = self._start_token(p)
+            self._clear_live_control()
             if self._aborted(cmd, "capture", start_token):
                 return
             if self.writer is not None:
@@ -1445,6 +1539,17 @@ class ControlLoop:
             if self.mode != "estop":
                 self._apply_estop()
             return
+        if not self.leader.connected:
+            self.leader_joints = {}
+        elif self.mode not in {"teleop", "record"}:
+            try:
+                self.leader_joints = dict(self.leader.get_action_pose())
+            except Exception as exc:  # noqa: BLE001
+                self.leader.error = str(exc)
+                self.leader_joints = {}
+                self.log("error", f"leader read failed: {exc}")
+                with contextlib.suppress(Exception):
+                    self.leader.disconnect()
         if not self.follower.connected:
             if self.mode in {"jogging", "teleop", "record", "rollout"}:
                 self._abort_active_task("follower disconnected")
@@ -1490,6 +1595,7 @@ class ControlLoop:
 
     def _abort_active_task(self, reason: str) -> None:
         """Return to a safe idle/offline state without waiting for another tick."""
+        self._clear_live_control()
         self._cancel.set()
         self.pending = None
         self._invalidate_policy_load()
@@ -1504,6 +1610,7 @@ class ControlLoop:
 
     def _force_abort_active_task(self) -> None:
         """Detach slow shutdown work so force stop can return immediately."""
+        self._clear_live_control()
         self.pending = None
         self._invalidate_policy_load()
         engine = self._inference_engine
@@ -1531,6 +1638,9 @@ class ControlLoop:
             pass
 
     def _tick_jog(self) -> None:
+        if self._live_control:
+            self._tick_live_jog()
+            return
         assert self._slew_start is not None and self._slew_goal is not None
         alpha = (time.perf_counter() - self._slew_t0) / max(self._slew_duration, 1e-3)
         pose = lerp_pose(self._slew_start, self._slew_goal, alpha)
@@ -1547,8 +1657,31 @@ class ControlLoop:
                 self.mode = "idle"
                 self._touch_bus()
 
+    def _tick_live_jog(self) -> None:
+        target = self._live_target
+        if target is None:
+            self._clear_live_control()
+            self.mode = "idle"
+            return
+        now = time.perf_counter()
+        dt = max(now - self._live_last_t, 1.0 / max(1.0, self.config.control.fps))
+        self._live_last_t = now
+        current = self.action or self.joints
+        if not current:
+            current = self.follower.get_pose()
+        pose = _step_pose_toward(current, target, self._live_max_speed * dt)
+        self.follower.send_pose(pose)
+        self.action = dict(pose)
+        self.latched = dict(pose)
+        if all(abs(float(pose[name]) - float(target[name])) <= 1e-6 for name in pose):
+            self.latched = dict(target)
+            self._clear_live_control()
+            self.mode = "idle"
+            self._touch_bus()
+
     def _tick_teleop(self) -> None:
         pose = self.leader.get_action_pose()
+        self.leader_joints = dict(pose)
         self.follower.send_pose(pose)
         self.action = dict(pose)
         self.latched = dict(pose)

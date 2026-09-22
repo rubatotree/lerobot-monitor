@@ -29,7 +29,12 @@
 - Arm/Leader 排版收敛为单行设备行：标题、端口选择、连接电源图标和各自的 force
   disconnect 图标同排，连接详情位于该行下方；`/api/hardware/force_disconnect`
   支持 `role=arm|leader|all` 单独释放。
-- 验证：排除 `test_sim.py` 后 `148 passed, 2 skipped`；`node --check`、Python compile
+- 移除控制命令中的隐式连接：`_require_follower_connected` /
+  `_require_leader_connected` 只检查连接状态并抛出明确错误。jog/relax、resume、
+  read pose、teleop、record、rollout 不再调用 `connect()`；实际 HTTP 验证中
+  `POST /api/joints` 返回 400，`POST /api/rollout/start` 接受排队后由控制线程记录
+  `start rollout requires a connected follower arm`。
+- 验证：排除 `test_sim.py` 后 `153 passed, 2 skipped`；`node --check`、Python compile
   通过。浏览器 smoke 覆盖系统 preset、显式 Load 日志、图标 Save/Rename、刷新持久化、
   服务重启自动恢复、1024/390px 无横向溢出；未使用真实串口和相机做换端口 soak。
 

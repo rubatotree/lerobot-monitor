@@ -922,12 +922,18 @@ class ControlLoop:
             self.mode = "offline"
             self.log("error", f"follower connect failed: {exc}")
 
-    def _ensure_follower(self) -> None:
+    def _require_follower_connected(self, action: str) -> None:
         if not self.follower.connected:
-            self._connect_follower()
-        if not self.follower.connected:
-            raise RuntimeError(self.follower.error or "follower serial not available")
+            error = f"{action} requires a connected follower arm; use Connect arm first"
+            self.last_error = error
+            raise RuntimeError(error)
         self._touch_bus()
+
+    def _require_leader_connected(self, action: str) -> None:
+        if not self.leader.connected:
+            error = f"{action} requires a connected leader arm; use Connect leader first"
+            self.last_error = error
+            raise RuntimeError(error)
 
     def _release_follower(self, reason: str) -> None:
         self._clear_debug_lease()
@@ -1125,7 +1131,7 @@ class ControlLoop:
                 raise RuntimeError(f"cannot jog while {self.pending} is pending")
             if self.mode == "jogging" and bool(p.get("live")):
                 raise RuntimeError("cannot live jog while a jog or relax motion is running")
-            self._ensure_follower()
+            self._require_follower_connected("adjust joints")
             self._pending_release = None
             if self.mode in {"teleop", "record", "rollout"}:
                 raise RuntimeError(f"cannot jog while {self.mode} is running")
@@ -1163,14 +1169,13 @@ class ControlLoop:
             cmd.kind = "jog"
             self._handle(cmd)
         elif kind == "read_pose":
-            self._ensure_follower()
+            self._require_follower_connected("read follower pose")
             pose = self.follower.get_pose()
             self.joints = dict(pose)
             self._touch_bus()
             self._reply(cmd, ok=True, joints=pose)
         elif kind == "read_leader":
-            if not self.leader.connected:
-                self.leader.connect()
+            self._require_leader_connected("read leader pose")
             pose = self.leader.get_action_pose()
             self._reply(cmd, ok=True, joints=pose)
         elif kind == "hold":
@@ -1223,7 +1228,7 @@ class ControlLoop:
         elif kind == "resume":
             self._require_no_debug_lease("resume")
             self._estop.clear()
-            self._ensure_follower()
+            self._require_follower_connected("resume torque")
             self.follower.enable_torque()
             pose = self.follower.get_pose()
             self.joints = dict(pose)
@@ -1239,11 +1244,10 @@ class ControlLoop:
                 raise RuntimeError(f"stop {self.mode} before starting teleop")
             if self._aborted(cmd, "teleop", start_token):
                 return
-            self._ensure_follower()
+            self._require_follower_connected("start teleop")
             if self._aborted(cmd, "teleop", start_token):
                 return
-            if not self.leader.connected:
-                self.leader.connect()
+            self._require_leader_connected("start teleop")
             if self._aborted(cmd, "teleop", start_token):
                 return
             if p.get("auto_record") is not None:
@@ -1286,11 +1290,10 @@ class ControlLoop:
                 raise RuntimeError(f"stop {self.mode} before starting record")
             if self._aborted(cmd, "record", start_token):
                 return
-            self._ensure_follower()
+            self._require_follower_connected("start recording")
             if self._aborted(cmd, "record", start_token):
                 return
-            if not self.leader.connected:
-                self.leader.connect()
+            self._require_leader_connected("start recording")
             if self._aborted(cmd, "record", start_token):
                 return
             self._close_writer()
@@ -1339,7 +1342,7 @@ class ControlLoop:
                 raise RuntimeError(f"stop {self.mode} before starting rollout")
             if self._aborted(cmd, "rollout"):
                 return
-            self._ensure_follower()
+            self._require_follower_connected("start rollout")
             if self._aborted(cmd, "rollout"):
                 return
             path = str(p.get("policy_path") or "")

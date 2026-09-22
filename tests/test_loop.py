@@ -159,15 +159,47 @@ def test_policy_loads_are_serialized_across_control_loops(tmp_path: Path, monkey
 
 
 @pytest.mark.parametrize("kind", ["teleop_start", "record_start"])
-def test_cancel_after_leader_connect_does_not_start_task(tmp_path: Path, kind: str) -> None:
+def test_task_start_requires_connected_leader_without_auto_connect(
+    tmp_path: Path,
+    kind: str,
+) -> None:
     loop = _loop(tmp_path)
-    loop.leader.connect.side_effect = loop._cancel.set
+    loop.leader.connected = False
 
-    loop._handle(Command(kind, {}))
+    with pytest.raises(RuntimeError, match="requires a connected leader arm"):
+        loop._handle(Command(kind, {}))
 
+    loop.leader.connect.assert_not_called()
     assert loop.writer is None
     assert loop.mode != "teleop"
     assert loop.mode != "record"
+
+
+@pytest.mark.parametrize(
+    "kind,payload,message",
+    [
+        ("jog", {"joints": {"gripper": 1.0}}, "requires a connected follower arm"),
+        ("resume", {}, "requires a connected follower arm"),
+        ("read_pose", {}, "requires a connected follower arm"),
+        ("rollout_start", {"policy_path": "fake/policy"}, "requires a connected follower arm"),
+        ("read_leader", {}, "requires a connected leader arm"),
+    ],
+)
+def test_control_commands_do_not_auto_connect_devices(
+    tmp_path: Path,
+    kind: str,
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    loop = _loop(tmp_path)
+    loop.follower.connected = False
+    loop.leader.connected = False
+
+    with pytest.raises(RuntimeError, match=message):
+        loop._handle(Command(kind, dict(payload)))
+
+    loop.follower.connect.assert_not_called()
+    loop.leader.connect.assert_not_called()
 
 
 def test_jog_is_rejected_while_task_start_is_pending(tmp_path: Path) -> None:
@@ -425,6 +457,7 @@ def test_stop_during_recorder_open_discards_unpublished_writer(
     payload: dict[str, object],
 ) -> None:
     loop = _loop(tmp_path)
+    loop.leader.connected = True
     entered = threading.Event()
     release = threading.Event()
     recorder = SimpleNamespace(

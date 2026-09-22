@@ -72,6 +72,7 @@
         stop
       </button>
       </div>
+      <button type="button" id="btn-hdr-resume" class="hdr-resume" title="Resume torque after an emergency stop">resume torque</button>
       <button type="button" id="btn-hdr-estop" class="hdr-estop" title="Emergency stop">E-STOP</button>
     </div>
   </header>
@@ -84,7 +85,13 @@
         <span class="chevron" aria-hidden="true">▾</span>
       </button>
       <div class="panel-body">
-        <section class="library-group" id="lib-videos" aria-labelledby="lib-videos-title">
+        <nav id="library-tabs" class="panel-tabs library-tabs" role="tablist" aria-label="Library sections">
+          <button type="button" class="panel-tab active" id="lib-tab-videos" data-tab="videos" role="tab" aria-selected="true" aria-controls="lib-videos" tabindex="0">Videos</button>
+          <button type="button" class="panel-tab" id="lib-tab-datasets" data-tab="datasets" role="tab" aria-selected="false" aria-controls="lib-datasets" tabindex="-1">Datasets</button>
+          <button type="button" class="panel-tab" id="lib-tab-snapshots" data-tab="snapshots" role="tab" aria-selected="false" aria-controls="lib-snapshots" tabindex="-1">Snapshots</button>
+          <button type="button" class="panel-tab" id="lib-tab-models" data-tab="models" role="tab" aria-selected="false" aria-controls="lib-models" tabindex="-1">Models</button>
+        </nav>
+        <section class="library-group" id="lib-videos" data-tab-panel="videos" role="tabpanel" aria-labelledby="lib-tab-videos" tabindex="0">
           <div class="library-heading">
             <h3 id="lib-videos-title">Videos</h3>
             <button type="button" id="btn-vid-refresh" class="ghost">Refresh</button>
@@ -92,7 +99,7 @@
           <p id="vid-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="vid-list" class="lib-list" aria-busy="false"></ol>
         </section>
-        <section class="library-group" id="lib-datasets" aria-labelledby="lib-datasets-title">
+        <section class="library-group" id="lib-datasets" data-tab-panel="datasets" role="tabpanel" aria-labelledby="lib-tab-datasets" tabindex="0" hidden>
           <div class="library-heading">
             <h3 id="lib-datasets-title">Datasets</h3>
             <button type="button" id="btn-ds-refresh" class="ghost">Scan cache</button>
@@ -100,7 +107,7 @@
           <p id="ds-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="ds-list" class="lib-list" aria-busy="false"></ol>
         </section>
-        <section class="library-group" id="lib-snapshots" aria-labelledby="lib-snapshots-title">
+        <section class="library-group" id="lib-snapshots" data-tab-panel="snapshots" role="tabpanel" aria-labelledby="lib-tab-snapshots" tabindex="0" hidden>
           <div class="library-heading">
             <h3 id="lib-snapshots-title">Snapshots</h3>
             <button type="button" id="btn-snap-refresh" class="ghost">Refresh</button>
@@ -108,7 +115,7 @@
           <p id="snap-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="snap-list" class="lib-list" aria-busy="false"></ol>
         </section>
-        <section class="library-group" id="lib-models" aria-labelledby="lib-models-title">
+        <section class="library-group" id="lib-models" data-tab-panel="models" role="tabpanel" aria-labelledby="lib-tab-models" tabindex="0" hidden>
           <div class="library-heading">
             <h3 id="lib-models-title">Models</h3>
             <button type="button" id="btn-md-refresh" class="ghost">Rescan</button>
@@ -203,11 +210,30 @@
     </section>
     <div id="split-v" class="split col" role="separator" aria-orientation="vertical"></div>
     <aside id="side">
-      <section class="panel" id="joint-panel" data-panel="joints">
-        <button type="button" class="panel-toggle" aria-expanded="true">
-          <h2>Joints</h2>
-          <span class="chevron" aria-hidden="true">▾</span>
+      <nav id="side-tabs" class="panel-tabs side-tabs" role="tablist" aria-label="Task panels">
+        <button type="button" class="panel-tab active" id="side-tab-joints" data-tab="joints" role="tab" aria-selected="true" aria-controls="joint-panel" tabindex="0" title="Joints">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"/><circle cx="9" cy="7" r="2"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="15" cy="17" r="2"/></svg>
+          <span>Joints</span>
         </button>
+        <button type="button" class="panel-tab" id="side-tab-record" data-tab="record" role="tab" aria-selected="false" aria-controls="record-panel" tabindex="-1" title="Record">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/></svg>
+          <span>Record</span>
+        </button>
+        <button type="button" class="panel-tab" id="side-tab-rollout" data-tab="rollout" role="tab" aria-selected="false" aria-controls="rollout-panel" tabindex="-1" title="Rollout">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="8 5 19 12 8 19 8 5" fill="currentColor" stroke="none"/></svg>
+          <span>Rollout</span>
+        </button>
+        <button type="button" class="panel-tab" id="side-tab-debug" data-tab="debug" role="tab" aria-selected="false" aria-controls="debug-panel" tabindex="-1" title="Model Debug">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6M10 3v5l-5 9a2 2 0 0 0 1.8 3h10.4A2 2 0 0 0 19 17l-5-9V3"/><path d="M8 14h8"/></svg>
+          <span>Debug</span>
+        </button>
+        <button type="button" class="panel-tab" id="side-tab-hardware" data-tab="hardware" role="tab" aria-selected="false" aria-controls="hw-panel" tabindex="-1" title="Hardware">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg>
+          <span>Hardware</span>
+        </button>
+      </nav>
+      <div class="side-panes">
+      <section class="panel side-tab-panel" id="joint-panel" data-panel="joints" data-tab-panel="joints" role="tabpanel" aria-labelledby="side-tab-joints">
         <div class="panel-body">
         <div id="joint-rows"></div>
         <div class="row-actions">
@@ -232,153 +258,146 @@
         </div>
       </section>
 
-      <section class="panel" id="task-panel" data-panel="tasks">
-        <button type="button" class="panel-toggle" aria-expanded="true">
-          <h2>Tasks</h2>
-          <span class="chevron" aria-hidden="true">▾</span>
-        </button>
+      <section class="panel side-tab-panel" id="record-panel" data-panel="record" data-tab-panel="record" role="tabpanel" aria-labelledby="side-tab-record" hidden>
         <div class="panel-body">
-        <div class="task-block">
-          <h3>Teleop</h3>
-          <details class="task-info">
-            <summary>Info</summary>
-            <pre id="info-teleop"></pre>
-          </details>
-        </div>
-        <div class="task-block">
-          <h3>Record</h3>
-          <label>Task
-            <input id="rec-task" type="text" placeholder="classify the blocks"/>
-          </label>
-          <label>Repo id
-            <input id="rec-repo" type="text" placeholder="user/dataset"/>
-          </label>
-          <label>Episodes
-            <input id="rec-num" type="number" value="50" min="1" step="1"/>
-          </label>
-          <div class="pair">
-            <label>Episode s
-              <input id="rec-ep" type="number" value="20" min="1" step="1"/>
-            </label>
-            <label>Reset s
-              <input id="rec-reset" type="number" value="5" min="0" step="1"/>
-            </label>
-          </div>
-          <div class="pair">
-            <label>Action FPS
-              <input id="rec-action-fps" type="number" value="15" min="1" step="1"/>
-            </label>
-            <label>Video FPS
-              <input id="rec-video-fps" type="number" value="30" min="1" step="1"/>
-            </label>
-          </div>
-          <label>Format
-              <select id="rec-format">
-                <option value="mp4">mp4</option>
-                <option value="avi">avi</option>
-              </select>
-          </label>
-          <label>Save path
-            <input id="rec-root" type="text" placeholder="data/datasets"/>
-          </label>
-          <div id="record-destination" class="record-destination" role="status" aria-live="polite">
-            Destination: data/datasets/&lt;session&gt;
-          </div>
-          <label class="check">
-            <input type="checkbox" id="chk-rec-resume"/>
-            Continue recording
-          </label>
-          <div class="resume-target" id="resume-target" role="status" aria-live="polite">
-            <span id="resume-target-text">Resume target: none</span>
-            <div class="row-actions">
-              <button type="button" id="btn-rec-use-video" class="ghost" disabled>Use browsed video</button>
-              <button type="button" id="btn-rec-clear-video" class="ghost" disabled>Clear</button>
+            <div class="task-block">
+              <h3>Record</h3>
+              <label>Task
+                <input id="rec-task" type="text" placeholder="classify the blocks"/>
+              </label>
+              <label>Repo id
+                <input id="rec-repo" type="text" placeholder="user/dataset"/>
+              </label>
+              <label>Episodes
+                <input id="rec-num" type="number" value="50" min="1" step="1"/>
+              </label>
+              <div class="pair">
+                <label>Episode s
+                  <input id="rec-ep" type="number" value="20" min="1" step="1"/>
+                </label>
+                <label>Reset s
+                  <input id="rec-reset" type="number" value="5" min="0" step="1"/>
+                </label>
+              </div>
+              <div class="pair">
+                <label>Action FPS
+                  <input id="rec-action-fps" type="number" value="15" min="1" step="1"/>
+                </label>
+                <label>Video FPS
+                  <input id="rec-video-fps" type="number" value="30" min="1" step="1"/>
+                </label>
+              </div>
+              <label>Format
+                  <select id="rec-format">
+                    <option value="mp4">mp4</option>
+                    <option value="avi">avi</option>
+                  </select>
+              </label>
+              <label>Save path
+                <input id="rec-root" type="text" placeholder="data/datasets"/>
+              </label>
+              <div id="record-destination" class="record-destination" role="status" aria-live="polite">
+                Destination: data/datasets/&lt;session&gt;
+              </div>
+              <label class="check">
+                <input type="checkbox" id="chk-rec-resume"/>
+                Continue recording
+              </label>
+              <div class="resume-target" id="resume-target" role="status" aria-live="polite">
+                <span id="resume-target-text">Resume target: none</span>
+                <div class="row-actions">
+                  <button type="button" id="btn-rec-use-video" class="ghost" disabled>Use browsed video</button>
+                  <button type="button" id="btn-rec-clear-video" class="ghost" disabled>Clear</button>
+                </div>
+              </div>
+              <label class="check">
+                <input type="checkbox" id="chk-rec-video" checked/>
+                Video
+              </label>
+              <label class="check">
+                <input type="checkbox" id="chk-rec-stream-enc" checked/>
+                Streaming encoding
+              </label>
+              <label>Encoder threads
+                <input id="rec-enc-threads" type="number" value="2" min="1" step="1"/>
+              </label>
+              <div class="preset-row">
+                <select id="rec-preset"></select>
+                <input id="rec-preset-name" type="text" placeholder="preset name"/>
+                <span class="preset-btns">
+                  <button type="button" id="btn-rec-save">Save</button>
+                  <button type="button" id="btn-rec-load" class="ghost">Load</button>
+                  <button type="button" id="btn-rec-dup" class="ghost">Duplicate</button>
+                  <button type="button" id="btn-rec-del" class="ghost">Delete</button>
+                </span>
+              </div>
+              <div class="row-actions">
+                <button type="button" id="btn-rec-next" class="ghost">Next ep</button>
+              </div>
+              <details class="task-info">
+                <summary>Command preview</summary>
+                <pre id="info-record"></pre>
+              </details>
             </div>
-          </div>
-          <label class="check">
-            <input type="checkbox" id="chk-rec-video" checked/>
-            Video
-          </label>
-          <label class="check">
-            <input type="checkbox" id="chk-rec-stream-enc" checked/>
-            Streaming encoding
-          </label>
-          <label>Encoder threads
-            <input id="rec-enc-threads" type="number" value="2" min="1" step="1"/>
-          </label>
-          <div class="preset-row">
-            <select id="rec-preset"></select>
-            <input id="rec-preset-name" type="text" placeholder="preset name"/>
-            <span class="preset-btns">
-              <button type="button" id="btn-rec-save">Save</button>
-              <button type="button" id="btn-rec-load" class="ghost">Load</button>
-              <button type="button" id="btn-rec-dup" class="ghost">Duplicate</button>
-              <button type="button" id="btn-rec-del" class="ghost">Delete</button>
-            </span>
-          </div>
-          <div class="row-actions">
-            <button type="button" id="btn-rec-next" class="ghost">Next ep</button>
-          </div>
-          <details class="task-info">
-            <summary>Info</summary>
-            <pre id="info-record"></pre>
-          </details>
-        </div>
-        <div class="task-block">
-          <h3>Rollout</h3>
-          <label>Policy path
-            <span class="policy-picker">
-              <input id="pol-path" type="text" autocomplete="off" aria-autocomplete="list" aria-expanded="false" aria-controls="pol-path-menu" placeholder="rubatotree/so101_classify_the_blocks_act_512"/>
-              <button type="button" id="btn-pol-path-menu" class="policy-picker-toggle" aria-label="Choose cached policy" title="Choose cached policy">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-              </button>
-              <div id="pol-path-menu" class="policy-picker-menu hidden" role="listbox" aria-label="Cached policies"></div>
-            </span>
-          </label>
-          <label>Instruction
-            <input id="pol-task" type="text" placeholder="Match each loose plastic block to the examples in the organizer and put it in the matching compartment."/>
-          </label>
-          <div class="pair">
-            <label>Duration s
-              <input id="pol-dur" type="number" value="60" min="0" step="1"/>
-            </label>
-            <label>Policy FPS
-              <input id="pol-fps" type="number" value="15" min="1" step="1"/>
-            </label>
-          </div>
-          <label>Device
-            <input id="pol-dev" type="text" value="cuda"/>
-          </label>
-          <p class="kv-lbl">Extra params</p>
-          <div id="roll-kv" class="kv-table"></div>
-          <button type="button" id="btn-kv-add" class="ghost">Add param</button>
-          <div class="preset-row">
-            <select id="roll-preset"></select>
-            <input id="roll-preset-name" type="text" placeholder="preset name"/>
-            <span class="preset-btns">
-              <button type="button" id="btn-roll-save">Save</button>
-              <button type="button" id="btn-roll-load" class="ghost">Load</button>
-              <button type="button" id="btn-roll-dup" class="ghost">Duplicate</button>
-              <button type="button" id="btn-roll-del" class="ghost">Delete</button>
-            </span>
-          </div>
-          <details class="task-info">
-            <summary>Info</summary>
-            <pre id="info-roll"></pre>
-          </details>
-        </div>
-        <div class="row-actions estop-row">
-          <button type="button" id="btn-estop" class="danger">E-STOP</button>
-          <button type="button" id="btn-resume" class="ghost">Resume torque</button>
-        </div>
+            <div class="task-block">
+              <h3>Teleop</h3>
+              <details class="task-info">
+                <summary>Command preview</summary>
+                <pre id="info-teleop"></pre>
+              </details>
+            </div>
         </div>
       </section>
 
-      <section class="panel" id="hw-panel" data-panel="hardware">
-        <button type="button" class="panel-toggle" aria-expanded="true">
-          <h2>Hardware</h2>
-          <span class="chevron" aria-hidden="true">▾</span>
-        </button>
+      <section class="panel side-tab-panel" id="rollout-panel" data-panel="rollout" data-tab-panel="rollout" role="tabpanel" aria-labelledby="side-tab-rollout" hidden>
+        <div class="panel-body">
+            <div class="task-block">
+              <h3>Rollout</h3>
+              <label>Policy path
+                <span class="policy-picker">
+                  <input id="pol-path" type="text" autocomplete="off" aria-autocomplete="list" aria-expanded="false" aria-controls="pol-path-menu" placeholder="rubatotree/so101_classify_the_blocks_act_512"/>
+                  <button type="button" id="btn-pol-path-menu" class="policy-picker-toggle" aria-label="Choose cached policy" title="Choose cached policy">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+                  </button>
+                  <div id="pol-path-menu" class="policy-picker-menu hidden" role="listbox" aria-label="Cached policies"></div>
+                </span>
+              </label>
+              <label>Instruction
+                <input id="pol-task" type="text" placeholder="Match each loose plastic block to the examples in the organizer and put it in the matching compartment."/>
+              </label>
+              <div class="pair">
+                <label>Duration s
+                  <input id="pol-dur" type="number" value="60" min="0" step="1"/>
+                </label>
+                <label>Policy FPS
+                  <input id="pol-fps" type="number" value="15" min="1" step="1"/>
+                </label>
+              </div>
+              <label>Device
+                <input id="pol-dev" type="text" value="cuda"/>
+              </label>
+              <p class="kv-lbl">Extra params</p>
+              <div id="roll-kv" class="kv-table"></div>
+              <button type="button" id="btn-kv-add" class="ghost">Add param</button>
+              <div class="preset-row">
+                <select id="roll-preset"></select>
+                <input id="roll-preset-name" type="text" placeholder="preset name"/>
+                <span class="preset-btns">
+                  <button type="button" id="btn-roll-save">Save</button>
+                  <button type="button" id="btn-roll-load" class="ghost">Load</button>
+                  <button type="button" id="btn-roll-dup" class="ghost">Duplicate</button>
+                  <button type="button" id="btn-roll-del" class="ghost">Delete</button>
+                </span>
+              </div>
+              <details class="task-info">
+                <summary>Command preview</summary>
+                <pre id="info-roll"></pre>
+              </details>
+            </div>
+        </div>
+      </section>
+
+      <section class="panel side-tab-panel" id="hw-panel" data-panel="hardware" data-tab-panel="hardware" role="tabpanel" aria-labelledby="side-tab-hardware" hidden>
         <div class="panel-body">
         <div class="task-block">
           <h3>Arm</h3>
@@ -403,7 +422,7 @@
           </div>
         </div>
         <details class="task-info">
-          <summary>Info</summary>
+          <summary>Command preview</summary>
           <pre id="info-hw"></pre>
         </details>
         <div class="task-block">
@@ -411,13 +430,9 @@
           <div id="cam-rows"></div>
         </div>
         </div>
-        </section>
+      </section>
 
-      <section class="panel" id="debug-panel" data-panel="debug">
-        <button type="button" class="panel-toggle" aria-expanded="true">
-          <h2>Model Debug</h2>
-          <span class="chevron" aria-hidden="true">▾</span>
-        </button>
+      <section class="panel side-tab-panel" id="debug-panel" data-panel="debug" data-tab-panel="debug" role="tabpanel" aria-labelledby="side-tab-debug" hidden>
         <div class="panel-body">
         <div class="task-block">
           <label>Policy
@@ -466,6 +481,7 @@
         </div>
         </div>
       </section>
+      </div>
     </aside>
 
     <div id="split-h" class="split row" role="separator" aria-orientation="horizontal"></div>

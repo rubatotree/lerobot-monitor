@@ -33,6 +33,20 @@ Browser  --HTTP/WS/MJPEG-->  FastAPI
 7. 本机 policy 扫描：HF hub cache、HF_LEROBOT_HOME、outputs/checkpoints
 8. Episode 管理：独立 Episode 列、命名/任务/备注编辑、逐条播放，回放时下方 Joint state / Control state 时间条
 
+## 已完成（2026-09-22）：工作区标签化
+
+目标：在不改变机器人控制、Library 数据契约和异步刷新语义的前提下，将侧栏从纵向堆叠改为接近 VS Code 的单面板工作区。Library 的 Videos、Datasets、Snapshots、Models 使用同一内容区的标签页；右侧 Joints、Tasks、Hardware、Debug 同样每个任务一个标签页。
+
+实现边界：
+
+- 标签栏只控制 DOM 的 `hidden`、`aria-selected` 与 `tabindex`，不复制或移动表单控件，因此现有事件绑定、预设持久化和 WebSocket 更新路径保持不变。
+- 左右标签选择分别保存在 localStorage；支持鼠标、触摸、左右方向键、Home 与 End，并提供完整的 `tablist` / `tab` / `tabpanel` 语义。
+- 右侧每个标签面板拥有独立滚动容器，切换任务不会继承上一页的滚动位置；Library 折叠后仍恢复为窄图标轨道。
+- 右侧主标签固定为 Joints / Record / Rollout / Debug / Hardware；Teleop 命令预览位于 Record 页下方，顶栏统一提供 E-STOP 与 Resume torque；所有 `Info` 折叠项统一改名为 `Command preview`。
+- 窄屏沿用现有单列布局，标签栏保持横向可达且不产生页面级横向溢出。
+
+验收：桌面与 1024px 窄屏浏览器检查通过，五组标签切换、键盘导航、刷新恢复与长表单滚动正常；非仿真测试 `133 passed, 2 skipped`。
+
 ## 已完成：Library 回放与本机 policy 扫描
 
 目标

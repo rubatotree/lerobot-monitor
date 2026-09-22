@@ -1539,8 +1539,6 @@ bind("btn-leader-on", () => {
 });
 bind("btn-leader-off", () => api("/api/leader/disconnect"));
 bind("btn-rec-next", () => api("/api/record/next"));
-bind("btn-estop", () => api("/api/estop"));
-bind("btn-resume", () => api("/api/resume"));
 bind("btn-hdr-scan", () => runAction("btn-hdr-scan", "scan requested", async () => {
   await api("/api/scan");
   await refreshPorts();
@@ -1616,6 +1614,10 @@ bind("btn-hdr-auto", async () => {
   persistUi();
 });
 bind("btn-hdr-stop", () => requestStop());
+bind("btn-hdr-resume", () => {
+  localLog("resume torque requested");
+  return api("/api/resume");
+});
 bind("btn-hdr-estop", () => {
   localLog("E-STOP requested", "error");
   return api("/api/estop");
@@ -1666,11 +1668,11 @@ function loadPanelState() {
 function initPanels() {
   const state = loadPanelState();
   document.querySelectorAll("[data-panel]").forEach((panel) => {
+    const btn = [...panel.children].find((child) => child.classList.contains("panel-toggle"));
+    if (!btn) return;
     const id = panel.dataset.panel;
     const collapsed = !!state[id];
     panel.classList.toggle("collapsed", collapsed);
-    const btn = panel.querySelector(".panel-toggle");
-    if (!btn) return;
     btn.setAttribute("aria-expanded", String(!collapsed));
     btn.addEventListener("click", () => {
       const nowCollapsed = panel.classList.toggle("collapsed");
@@ -1683,6 +1685,52 @@ function initPanels() {
   });
 }
 initPanels();
+
+function initTabList(tablistId, storageKey, fallback, onSelect) {
+  const tablist = $(tablistId);
+  if (!tablist) return;
+  const tabs = [...tablist.querySelectorAll("[data-tab]")];
+  const panels = tabs.map((tab) => $(tab.getAttribute("aria-controls"))).filter(Boolean);
+  if (!tabs.length) return;
+
+  let saved = "";
+  try { saved = localStorage.getItem(storageKey) || ""; } catch { /* ignore */ }
+  const initial = tabs.some((tab) => tab.dataset.tab === saved) ? saved : fallback;
+
+  function selectTab(value, focus = false) {
+    const selected = tabs.some((tab) => tab.dataset.tab === value) ? value : fallback;
+    tabs.forEach((tab) => {
+      const active = tab.dataset.tab === selected;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", String(active));
+      tab.tabIndex = active ? 0 : -1;
+      if (active && focus) tab.focus();
+    });
+    panels.forEach((panel) => {
+      panel.hidden = panel.dataset.tabPanel !== selected;
+    });
+    try { localStorage.setItem(storageKey, selected); } catch { /* ignore */ }
+    if (onSelect) onSelect(selected);
+  }
+
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => selectTab(tab.dataset.tab));
+  });
+  tablist.addEventListener("keydown", (event) => {
+    const current = tabs.indexOf(event.target);
+    if (current < 0) return;
+    let next = current;
+    if (event.key === "ArrowLeft") next = (current - 1 + tabs.length) % tabs.length;
+    else if (event.key === "ArrowRight") next = (current + 1) % tabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    selectTab(tabs[next].dataset.tab, true);
+  });
+  selectTab(initial);
+}
+
 if ($("episodes") && $("episodes").classList.contains("hidden")) {
   document.querySelector("main")?.classList.add("episodes-closed");
 }
@@ -1768,6 +1816,10 @@ function initSplitters() {
   });
 }
 initSplitters();
+
+initTabList("library-tabs", "lerobot-monitor-library-tab", "videos");
+initTabList("side-tabs", "lerobot-monitor-side-tab", "joints");
+
 if ($("roll-kv") && !$("roll-kv").children.length) addKvRow();
 if ($("btn-kv-add")) bind("btn-kv-add", () => addKvRow());
 

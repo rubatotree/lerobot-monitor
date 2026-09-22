@@ -119,7 +119,7 @@ h3 {
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   justify-content: flex-end;
   min-width: 0;
 }
@@ -138,9 +138,9 @@ h3 {
   align-items: center;
   justify-content: center;
   gap: 2px;
-  min-width: 52px;
+  min-width: 48px;
   min-height: 44px;
-  padding: 4px 8px;
+  padding: 4px 6px;
   background: var(--surface);
   border: 1px solid var(--line);
   color: var(--muted);
@@ -185,6 +185,22 @@ h3 {
   letter-spacing: 0.04em;
 }
 .hdr-stop:hover { border-color: var(--accent); color: var(--accent); }
+.hdr-resume {
+  flex: 0 0 auto;
+  min-height: 40px;
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.hdr-resume:hover {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
 .hdr-estop {
   min-height: 40px;
   padding: 8px 22px;
@@ -309,6 +325,72 @@ main.episodes-closed {
   color: var(--muted);
   font-size: 18px;
 }
+.panel-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  min-width: 0;
+}
+.panel-tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-bottom-color: var(--line);
+  background: transparent;
+  color: var(--faint);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.panel-tab:hover {
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--text);
+}
+.panel-tab.active {
+  border-color: var(--line);
+  border-top-color: var(--accent);
+  border-bottom-color: var(--bg);
+  background: var(--bg);
+  color: var(--text);
+}
+.panel-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.panel-tab svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.panel-tab span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.library-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+.library-tabs .panel-tab { padding-inline: 4px; }
+.library-group[hidden], .side-tab-panel[hidden] { display: none; }
 .lib-list {
   list-style: none;
   margin: 6px 0 12px;
@@ -948,10 +1030,44 @@ main.episodes-closed {
 
 #side {
   background: var(--bg);
-  overflow-y: auto;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+.side-tabs {
+  flex-shrink: 0;
+  gap: 2px;
+  padding: 4px 4px 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  scrollbar-width: thin;
+}
+.side-tabs .panel-tab {
+  flex: 1 1 0;
+  min-width: 62px;
+  gap: 3px;
+  padding-inline: 2px;
+  font-size: 8px;
+  letter-spacing: 0;
+}
+.side-tabs .panel-tab svg {
+  width: 12px;
+  height: 12px;
+}
+.side-panes {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.panel.side-tab-panel {
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 12px 14px;
+  border-bottom: 0;
 }
 .panel {
   padding: 12px 14px;
@@ -1063,7 +1179,7 @@ main.episodes-closed {
 .cam-dev .mini:not([src]) { visibility: hidden; }
 .pair {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
   margin-bottom: 6px;
 }
@@ -1125,7 +1241,11 @@ select {
   color: var(--faint);
   font-size: 11px;
 }
-.task-info summary { cursor: pointer; }
+.task-info summary {
+  color: var(--muted);
+  cursor: pointer;
+}
+.task-info summary:hover { color: var(--accent); }
 .task-info pre {
   margin-top: 6px;
   padding: 8px;
@@ -1486,6 +1606,7 @@ body.dragging-row { cursor: row-resize; user-select: none; }
   .header-controls { width: 100%; }
   .header-actions { flex: 1 1 auto; overflow-x: auto; justify-content: flex-start; }
   .header-actions .hdr-icon { flex: 0 0 60px; }
+  .hdr-resume { flex: 0 0 auto; }
   .hdr-estop { flex: 0 0 auto; }
 }
 
@@ -1526,8 +1647,19 @@ body.dragging-row { cursor: row-resize; user-select: none; }
   }
   #side {
     flex: 0 0 auto;
+    display: block;
     width: 100%;
     max-height: none;
+    overflow: visible;
+  }
+  .side-tabs {
+    position: sticky;
+    top: 0;
+    z-index: 4;
+  }
+  .side-panes { overflow: visible; }
+  .panel.side-tab-panel {
+    height: auto;
     overflow: visible;
   }
   #bottom {
@@ -1552,6 +1684,7 @@ body.dragging-row { cursor: row-resize; user-select: none; }
     padding-bottom: 4px;
   }
   .header-actions .hdr-icon { flex: 0 0 52px; }
+  .hdr-resume { flex: 0 0 108px; padding-inline: 8px; }
   .hdr-estop { flex: 0 0 104px; }
   #library { min-height: 200px; max-height: 360px; }
   #episodes { min-height: 240px; max-height: 400px; }

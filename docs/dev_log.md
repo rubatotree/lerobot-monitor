@@ -1,5 +1,22 @@
 # Dev log
 
+## 2026-09-22（Monitor 工作区标签化）
+
+- Library 的 Videos、Datasets、Snapshots、Models 改为单内容区标签页；右侧 Joints、
+  Tasks、Hardware、Model Debug 改为编辑器式任务标签页，移除了侧栏纵向堆叠。
+- 标签状态由通用 `initTabList` 管理，支持鼠标、触摸、左右方向键、Home、End，并分别
+  通过 `lerobot-monitor-library-tab` / `lerobot-monitor-side-tab` 恢复上次选择。
+- 每个任务面板拥有独立滚动容器；Library 原有折叠轨道、异步刷新、表单绑定和
+  `data-panel` 契约均保持不变。
+- 右侧主标签固定为 Joints / Record / Rollout / Debug / Hardware；Teleop 命令预览
+  放到 Record 页下方；E-STOP 与新增的 Resume torque 统一放在顶栏，任务脚本折叠项
+  由 `Info` 改名为 `Command preview`。
+- 浏览器验证覆盖 1440×900 与 1024×900：标签切换、刷新持久化、任务面板滚动和
+  Hardware 长标签完整显示正常，窄屏页面横向溢出为 0。
+- 验证：非仿真测试 `133 passed, 2 skipped`；完整测试中 5 个 `test_sim` 项因当前
+  venv 缺少 `scservo_sdk` 未通过，与本轮 UI 改动无关。`node --check`、HTML 标签栈
+  检查和 `git diff --check` 通过。
+
 ## 2026-09-22（Rollout 连续推理回归修复）
 
 - 修复 rollout 预测图引入的实时推理回归：控制循环不再每 0.5 s 额外调用一次

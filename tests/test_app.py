@@ -62,13 +62,23 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert b"rec-reset" in html
         assert b"Extra params" in html
         assert b"preset-btns" in html
+        assert b'id="side-tab-record"' in html
+        assert b'id="record-panel"' in html
+        assert b'id="side-tab-rollout"' in html
+        assert b'id="rollout-panel"' in html
+        assert b'id="task-mode-tabs"' not in html
+        assert html.count(b"Command preview") == 4
+        assert b"<summary>Info</summary>" not in html
         assert b"arm-port" in html
         assert b"info-roll" in html
         assert b"btn-hdr-scan" in html
         assert b"btn-hdr-stop" in html
         assert b"btn-hdr-relax" in html
+        assert b'id="btn-hdr-resume"' in html
         assert b"btn-hdr-capture" in html
         assert b"btn-hdr-auto" in html
+        assert b'class="side-footer"' not in html
+        assert b'id="btn-resume"' not in html
         assert b"Duplicate" in html
         assert b"rec-num" in html
         assert b"id=\"library\"" in html
@@ -792,9 +802,15 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
     assert page.status_code == 200
     for marker in (
         'id="btn-hdr-snapshot"',
+        'id="library-tabs"',
+        'data-tab="videos"',
+        'data-tab-panel="videos"',
         'id="lib-snapshots"',
         'id="snap-list"',
         'id="btn-snap-edit"',
+        'id="side-tabs"',
+        'data-tab="joints"',
+        'data-tab-panel="joints"',
         'id="dbg-snap-editor"',
         'data-panel="debug"',
         'id="btn-dbg-run"',
@@ -877,3 +893,5 @@ def test_static_css_owns_hidden_replay_badges(tmp_path: Path, monkeypatch) -> No
 
     assert css.status_code == 200
     assert ".replay-tag.hidden" in css.text
+    assert ".panel-tab.active" in css.text
+    assert ".side-tab-panel[hidden]" in css.text

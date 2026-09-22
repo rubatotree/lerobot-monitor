@@ -85,20 +85,26 @@
         <span class="chevron" aria-hidden="true">▾</span>
       </button>
       <div class="panel-body">
-        <nav id="library-tabs" class="panel-tabs library-tabs" role="tablist" aria-label="Library sections">
-          <button type="button" class="panel-tab active" id="lib-tab-videos" data-tab="videos" role="tab" aria-selected="true" aria-controls="lib-videos" tabindex="0">Videos</button>
-          <button type="button" class="panel-tab" id="lib-tab-datasets" data-tab="datasets" role="tab" aria-selected="false" aria-controls="lib-datasets" tabindex="-1">Datasets</button>
-          <button type="button" class="panel-tab" id="lib-tab-snapshots" data-tab="snapshots" role="tab" aria-selected="false" aria-controls="lib-snapshots" tabindex="-1">Snapshots</button>
-          <button type="button" class="panel-tab" id="lib-tab-models" data-tab="models" role="tab" aria-selected="false" aria-controls="lib-models" tabindex="-1">Models</button>
-        </nav>
+        <div class="library-tools">
+          <nav id="library-tabs" class="panel-tabs library-tabs" role="tablist" aria-label="Library sections">
+            <button type="button" class="panel-tab active" id="lib-tab-videos" data-tab="videos" role="tab" aria-selected="true" aria-controls="lib-videos" tabindex="0">Videos</button>
+            <button type="button" class="panel-tab" id="lib-tab-datasets" data-tab="datasets" role="tab" aria-selected="false" aria-controls="lib-datasets" tabindex="-1">Datasets</button>
+            <button type="button" class="panel-tab" id="lib-tab-snapshots" data-tab="snapshots" role="tab" aria-selected="false" aria-controls="lib-snapshots" tabindex="-1">Snapshots</button>
+            <button type="button" class="panel-tab" id="lib-tab-models" data-tab="models" role="tab" aria-selected="false" aria-controls="lib-models" tabindex="-1">Models</button>
+          </nav>
+          <label class="sr-only" for="lib-search">Search the active library section</label>
+          <div class="library-search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+            <input id="lib-search" type="search" placeholder="Search title or note" autocomplete="off"/>
+            <button type="button" id="btn-lib-search-clear" class="ghost icon-btn" title="Clear search" aria-label="Clear search" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
+            </button>
+          </div>
+        </div>
         <section class="library-group" id="lib-videos" data-tab-panel="videos" role="tabpanel" aria-labelledby="lib-tab-videos" tabindex="0">
           <div class="library-heading">
             <h3 id="lib-videos-title">Videos</h3>
             <button type="button" id="btn-vid-refresh" class="ghost">Refresh</button>
-          </div>
-          <label class="sr-only" for="vid-search">Search videos by title or note</label>
-          <div class="library-search">
-            <input id="vid-search" type="search" placeholder="Search title or note" autocomplete="off"/>
           </div>
           <p id="vid-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="vid-list" class="lib-list" aria-busy="false"></ol>
@@ -108,10 +114,6 @@
             <h3 id="lib-datasets-title">Datasets</h3>
             <button type="button" id="btn-ds-refresh" class="ghost">Scan cache</button>
           </div>
-          <label class="sr-only" for="ds-search">Search datasets by title or note</label>
-          <div class="library-search">
-            <input id="ds-search" type="search" placeholder="Search title or note" autocomplete="off"/>
-          </div>
           <p id="ds-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="ds-list" class="lib-list" aria-busy="false"></ol>
         </section>
@@ -120,10 +122,6 @@
             <h3 id="lib-snapshots-title">Snapshots</h3>
             <button type="button" id="btn-snap-refresh" class="ghost">Refresh</button>
           </div>
-          <label class="sr-only" for="snap-search">Search snapshots by title or note</label>
-          <div class="library-search">
-            <input id="snap-search" type="search" placeholder="Search title or note" autocomplete="off"/>
-          </div>
           <p id="snap-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="snap-list" class="lib-list" aria-busy="false"></ol>
         </section>
@@ -131,10 +129,6 @@
           <div class="library-heading">
             <h3 id="lib-models-title">Models</h3>
             <button type="button" id="btn-md-refresh" class="ghost">Rescan</button>
-          </div>
-          <label class="sr-only" for="md-library-search">Search local models by title or note</label>
-          <div class="library-search">
-            <input id="md-library-search" type="search" placeholder="Filter local models by title or note" autocomplete="off"/>
           </div>
           <div id="md-drop" class="model-drop" tabindex="0" role="region" aria-label="Add model from Hugging Face or a dropped model card">
             <p class="model-drop-hint">
@@ -248,6 +242,41 @@
           <span>Hardware</span>
         </button>
       </nav>
+      <div id="preset-toolbar" class="side-tools">
+        <div class="preset-row">
+          <select id="preset-select" aria-label="Preset"></select>
+          <span class="preset-btns">
+            <button type="button" id="btn-preset-load" class="ghost icon-btn preset-icon-btn" title="Load preset" aria-label="Load preset">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg>
+            </button>
+            <button type="button" id="btn-preset-save" class="ghost icon-btn preset-icon-btn" title="Save preset" aria-label="Save preset">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h12l2 2v14H5z"/><path d="M8 4v6h8V4M8 20v-6h8v6"/></svg>
+            </button>
+            <button type="button" id="btn-preset-rename" class="ghost icon-btn preset-icon-btn" title="Rename preset" aria-label="Rename preset">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16z"/><path d="m13.5 6.5 4 4"/></svg>
+            </button>
+            <button type="button" id="btn-preset-dup" class="ghost icon-btn preset-icon-btn" title="Duplicate preset" aria-label="Duplicate preset">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="1"/><path d="M16 8V5H5v11h3"/></svg>
+            </button>
+            <button type="button" id="btn-preset-del" class="ghost icon-btn preset-icon-btn danger-icon" title="Delete preset" aria-label="Delete preset">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V4h6v3M8 10v7M12 10v7M16 10v7M7 7l1 13h8l1-13"/></svg>
+            </button>
+          </span>
+          <div id="preset-name-popover" class="preset-name-popover hidden">
+            <label id="preset-name-label" for="preset-name-input">Preset name</label>
+            <div class="preset-name-line">
+              <input id="preset-name-input" type="text" autocomplete="off"/>
+              <button type="button" id="btn-preset-name-confirm" class="icon-btn" title="Confirm" aria-label="Confirm preset name">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>
+              </button>
+              <button type="button" id="btn-preset-name-cancel" class="ghost icon-btn" title="Cancel" aria-label="Cancel preset rename">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
+              </button>
+            </div>
+            <p id="preset-name-error" class="preset-name-error" role="status" aria-live="polite"></p>
+          </div>
+        </div>
+      </div>
       <div class="side-panes">
       <section class="panel side-tab-panel" id="joint-panel" data-panel="joints" data-tab-panel="joints" role="tabpanel" aria-labelledby="side-tab-joints">
         <div class="panel-body">
@@ -256,16 +285,6 @@
           <button type="button" id="btn-apply">Apply targets</button>
           <button type="button" id="btn-read-pose">From follower</button>
           <button type="button" id="btn-read-leader" class="ghost">From leader</button>
-        </div>
-        <div class="preset-row">
-          <select id="pose-preset"></select>
-          <input id="pose-preset-name" type="text" placeholder="preset name"/>
-          <span class="preset-btns">
-            <button type="button" id="btn-pose-save">Save</button>
-            <button type="button" id="btn-pose-load" class="ghost">Load</button>
-            <button type="button" id="btn-pose-dup" class="ghost">Duplicate</button>
-            <button type="button" id="btn-pose-del" class="ghost">Delete</button>
-          </span>
         </div>
         <label class="check">
           <input type="checkbox" id="chk-hold" checked/>
@@ -337,16 +356,6 @@
               <label>Encoder threads
                 <input id="rec-enc-threads" type="number" value="2" min="1" step="1"/>
               </label>
-              <div class="preset-row">
-                <select id="rec-preset"></select>
-                <input id="rec-preset-name" type="text" placeholder="preset name"/>
-                <span class="preset-btns">
-                  <button type="button" id="btn-rec-save">Save</button>
-                  <button type="button" id="btn-rec-load" class="ghost">Load</button>
-                  <button type="button" id="btn-rec-dup" class="ghost">Duplicate</button>
-                  <button type="button" id="btn-rec-del" class="ghost">Delete</button>
-                </span>
-              </div>
               <div class="row-actions">
                 <button type="button" id="btn-rec-next" class="ghost">Next ep</button>
               </div>
@@ -395,16 +404,6 @@
               <p class="kv-lbl">Extra params</p>
               <div id="roll-kv" class="kv-table"></div>
               <button type="button" id="btn-kv-add" class="ghost">Add param</button>
-              <div class="preset-row">
-                <select id="roll-preset"></select>
-                <input id="roll-preset-name" type="text" placeholder="preset name"/>
-                <span class="preset-btns">
-                  <button type="button" id="btn-roll-save">Save</button>
-                  <button type="button" id="btn-roll-load" class="ghost">Load</button>
-                  <button type="button" id="btn-roll-dup" class="ghost">Duplicate</button>
-                  <button type="button" id="btn-roll-del" class="ghost">Delete</button>
-                </span>
-              </div>
               <details class="task-info">
                 <summary>Command preview</summary>
                 <pre id="info-roll"></pre>
@@ -416,26 +415,30 @@
       <section class="panel side-tab-panel" id="hw-panel" data-panel="hardware" data-tab-panel="hardware" role="tabpanel" aria-labelledby="side-tab-hardware" hidden>
         <div class="panel-body">
         <div class="task-block">
-          <h3>Arm</h3>
-          <label>Port
-            <select id="arm-port"></select>
-          </label>
-          <p class="hw-status" id="arm-status">disconnected</p>
-          <div class="row-actions">
-            <button type="button" id="btn-robot-on">Connect arm</button>
-            <button type="button" id="btn-robot-off" class="ghost">Disconnect</button>
+          <div class="device-row">
+            <h3>Arm</h3>
+            <select id="arm-port" aria-label="Arm device"></select>
+            <button type="button" id="btn-arm-toggle" class="port-toggle" aria-pressed="false" aria-label="Connect arm" title="Connect arm">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"/><path d="M7.4 6.4a7 7 0 1 0 9.2 0"/></svg>
+            </button>
+            <button type="button" id="btn-arm-force" class="force-device" aria-label="Force disconnect arm" title="Force disconnect arm">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"/><path d="M7.4 6.4a7 7 0 1 0 9.2 0"/><path d="m4 4 16 16"/></svg>
+            </button>
           </div>
+          <p class="hw-status" id="arm-status">disconnected</p>
         </div>
         <div class="task-block">
-          <h3>Leader</h3>
-          <label>Port
-            <select id="leader-port"></select>
-          </label>
-          <p class="hw-status" id="leader-status">disconnected</p>
-          <div class="row-actions">
-            <button type="button" id="btn-leader-on">Connect leader</button>
-            <button type="button" id="btn-leader-off" class="ghost">Disconnect</button>
+          <div class="device-row">
+            <h3>Leader</h3>
+            <select id="leader-port" aria-label="Leader device"></select>
+            <button type="button" id="btn-leader-toggle" class="port-toggle" aria-pressed="false" aria-label="Connect leader" title="Connect leader">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"/><path d="M7.4 6.4a7 7 0 1 0 9.2 0"/></svg>
+            </button>
+            <button type="button" id="btn-leader-force" class="force-device" aria-label="Force disconnect leader" title="Force disconnect leader">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"/><path d="M7.4 6.4a7 7 0 1 0 9.2 0"/><path d="m4 4 16 16"/></svg>
+            </button>
           </div>
+          <p class="hw-status" id="leader-status">disconnected</p>
         </div>
         <details class="task-info">
           <summary>Command preview</summary>
@@ -474,16 +477,6 @@
           <p class="kv-lbl">Extra params</p>
           <div id="dbg-kv" class="kv-table"></div>
           <button type="button" id="btn-dbg-kv-add" class="ghost">Add param</button>
-          <div class="preset-row">
-            <select id="dbg-preset"></select>
-            <input id="dbg-preset-name" type="text" placeholder="preset name"/>
-            <span class="preset-btns">
-              <button type="button" id="btn-dbg-save">Save</button>
-              <button type="button" id="btn-dbg-load" class="ghost">Load</button>
-              <button type="button" id="btn-dbg-dup" class="ghost">Duplicate</button>
-              <button type="button" id="btn-dbg-del" class="ghost">Delete</button>
-            </span>
-          </div>
           <p class="kv-lbl">Camera inputs</p>
           <div id="dbg-cam-map" class="kv-table"></div>
           <p id="dbg-source" class="bus-hint">source: open an episode or snapshot</p>

@@ -1,5 +1,141 @@
 # Dev log
 
+## 2026-09-22（Hardware preset、固定工具栏与设备身份恢复）
+
+- Library 的四个搜索框合并为标签栏下方的共享 sticky 搜索框；关键词按标签存入
+  `lerobot-monitor-library-search`，Models 的 Hub 搜索仍独立。
+- 右侧新增共享 preset 工具栏，五页通过 `PRESET_KIND_BY_TAB` 映射到 pose / record /
+  rollout / debug / hardware。下拉切换只选择，Load 才应用；Save、Rename、Duplicate、
+  Delete 改为图标按钮，新建与重命名使用内联弹层。标签选择、每页滚动位置和 preset
+  选择分别持久化。
+- 新增系统 preset `Disconnected`：store 自动补齐，首次选中但不执行；禁止覆盖、
+  rename 和 delete，可 duplicate 为用户 preset。用户显式 Load 后才写入
+  `ui.active_hardware_preset`。
+- `/api/ports` 和相机 snapshot 增加 `identity` / `device_key`。Hardware preset 绑定串口
+  hwid、虚拟 role+robot_id、远程 robot_id+camera_id 和本地 index/name；相机 label
+  重命名不再影响 preset 匹配，旧 COM 被其他 hwid 占用时会 skipped 而不是误连。
+- 新增 `POST /api/hardware/apply` 与 `hardware_apply` 控制命令。应用仅在 idle/offline、
+  无 pending、writer、debug lease 或 release 时执行；逐项记录 success / skipped / failed
+  到 UI 日志和 `run.log`。未列入 preset 的现存相机会被停用。
+- RuntimeHub 启动时读取活动 preset 并排队自动恢复；首次没有活动 preset 时只记录
+  `auto-restore skipped`，不连接任何设备。
+- arm/leader 端口行移除 `Port` 文案与两枚连接按钮，改为设备下拉框加单个电源图标；
+  空选项表示该 preset 不包含对应设备，图标只反映并切换实际连接状态。
+- 修复 arm 电源按钮误调用 `/api/arm/*` 导致的 404；实际请求按 arm→`/api/robot/*`、
+  leader→`/api/leader/*` 映射。图标改为网格居中，并新增 `Force disconnect` 直接
+  释放两条总线，不执行 relax。
+- Hardware preset 载入使用可中断状态：Load 图标在请求期间变黄；再次点击会设置
+  `_hardware_apply_force`，使 relax 等待立即退出并继续强制载入。
+- Arm/Leader 排版收敛为单行设备行：标题、端口选择、连接电源图标和各自的 force
+  disconnect 图标同排，连接详情位于该行下方；`/api/hardware/force_disconnect`
+  支持 `role=arm|leader|all` 单独释放。
+- 验证：排除 `test_sim.py` 后 `148 passed, 2 skipped`；`node --check`、Python compile
+  通过。浏览器 smoke 覆盖系统 preset、显式 Load 日志、图标 Save/Rename、刷新持久化、
+  服务重启自动恢复、1024/390px 无横向溢出；未使用真实串口和相机做换端口 soak。
+
+## 2026-09-22（未完成 HF 缓存导致的 rollout 加载失败）
+
+- `rubatotree/classify-blocks-2-smolvla` 首次加载时只下载了 config 与 processor，
+  `model.safetensors` 仍在 `.incomplete` 阶段；旧逻辑只要发现 snapshot 目录就强制离线，
+  因而报 `No such file or directory: ...\model.safetensors`。
+- `is_policy_dir()` 现在只把 `model.safetensors`、完整的分片索引、`model.pt`、
+  `pytorch_model.bin` 或 `adapter_model.safetensors` 视为策略权重，不再把
+  `policy_preprocessor_*.safetensors` / `policy_postprocessor_*.safetensors` 当模型本体。
+- `resolve_cached_policy_path()` 会校验 snapshot 的权重完整性；未完成缓存不再进入离线
+  加载，而是走现有 Hugging Face 下载回退。
+- 验证：`tests/test_policy.py` 与 `tests/test_library.py` 共 26 项通过；实际缓存下载完成后
+  `model.safetensors` 正确解析。排除 `test_sim.py` 的全量测试为
+  `134 passed, 2 skipped, 1 failed`，唯一失败是工作区既有前端 smoke 对
+  `chart.$hoverOverlayVisible` 的断言，与本次策略加载改动无关。
+
+## 2026-09-22（实时图表滚动与鼠标交互修正）
+
+- 实时图表整帧显示上一动画帧的时间轴与数据，避免曲线已落后一帧但横轴仍按当前时间
+  前进造成的右端闪烁。
+- 实时图表按 30Hz 量化刷新，并在右端保留稳定空白；最后一个采样值延伸到当前时间
+  槽，避免右端点在约 30ms 周期内漂移后突然跳回。
+- 时间轴恢复原来的绝对时间刻度与滚动格式；中间刻度从右侧进入、从左侧离开时按边缘
+  距离淡入淡出；透明区根据左右端点文字的实际宽度和中间刻度宽度计算，避免出现位置
+  或消失位置与固定时间数字重叠。时间文本变化本身不做淡化。
+- rollout 的未来窗口改为仅由当前时间尺度决定，不再随预测 chunk 长度伸缩；now 线
+  因此在一次 rollout 中保持固定像素位置，同时仍与时间轴上的当前时刻对齐。
+- mode 切换标注相对灰色竖线增加横向偏移，避免竖排模式名与标线相互贴近。
+- 悬停提示增加 actual 截止时间：live 图以当前渲染时刻为界，replay 以最后一条
+  actual 数据为界；未来时间只显示 prediction，不再回退显示最后一个 actual。
+- 悬停提示卡开关改为鼠标中键，仅控制提示卡本身；十字虚线、插值圆点和时间读数始终
+  显示。replay 与 snapshot 中这些圆点、以及图表左键拖动的白色游标都吸附到真实
+  采样帧，不再做时间插值。
+- 左侧图例增加逐项小灯选框，可分别控制 command、prediction、prediction gap、
+  mode change、current time 与各关节曲线的显示，默认全部开启。
+- 图例小灯缩小为 7px、上移并与图例线条中线对齐，选中状态使用蓝色。
+- replay/snapshot 图表鼠标样式由左右箭头改为十字光标，保留左键拖动 seek。
+- prediction 起点改用当前图表渲染帧作为基准，不再把状态快照晚于预测记录的负时间
+  差带入坐标；预测曲线与 now 线保持同一帧时间基准。
+- replay/snapshot 中，在 Commanded action 图上滚动鼠标滚轮可按固定采样帧前后浏览
+  动作；向上滚前一帧，向下滚后一帧，播放中的滚动会先暂停。
+- 鼠标拖动 seek 或滚轮浏览动作帧时，显式刷新当前鼠标坐标与悬停提示状态，使圆点和
+  时间信息立即跟随鼠标，不再等待下一次 Chart.js mousemove。
+- 动作图滚轮按标准 100px 刻度累积，每次达到一个刻度只前进或后退一帧，避免一个
+  滚轮事件按倍数跳过多帧。
+- 图例关闭的曲线不再绘制悬停圆点；提示表仍保留对应 actual/pred 数值，并用灰色
+  表示该值对应的曲线已隐藏。
+- 鼠标进入图表后显示横纵虚线，并在鼠标纵坐标处显示按相邻 Y 轴 tick 线性插值的读数；
+  曲线上的圆点按指针 X 坐标连续插值绘制，不再吸附到原始采样点。
+- 鼠标提示时间精确到毫秒；悬停提示卡每帧最多更新一次，避免高频 mousemove 触发 DOM
+  重建。鼠标左键或右键切换整个悬停图层，关闭后只保留干净曲线与时间轴。
+- 实时、预测和回放曲线统一为 1px、butt cap 与 bevel join，并吸附到设备像素网格，
+  消除端点、折点和横轴滚动造成的视觉增粗或闪烁。
+- 验证：浏览器中实测整帧延迟、中间刻度、毫秒提示、平滑插值圆点及左右键开关；
+  `node --check` 通过；排除缺少可选仿真依赖的 `test_sim.py` 后测试为
+  `134 passed, 2 skipped`。
+
+## 2026-09-22（Library 搜索与实时图表时间语义）
+
+- Library 的 `.lib-list` 不再拥有独立高度和滚动条，Videos、Datasets、Snapshots、
+  Models 统一由左侧面板滚动；每个标签页新增本地搜索框，只匹配标题/名称与 note。
+- 实时图表改用同一绝对时间轴保存 jog、relax、teleop、record、rollout 历史，模式切换
+  不再清空曲线；replay 保持秒数刻度，live 保持本地 `HH:MM:SS` 刻度。
+- 模式切换记录为灰色竖线，并在 Commanded action 的底部时间区域绘制竖排模式名；
+  `current time` 白线仅在 rollout 显示，relax/teleop/record 与 jog 一样直接追加。
+- 图例改为 `command` / `prediction`，保留 `prediction gap`，并新增 `mode change`；
+  prediction gap 仍按时间区间绘制半透明红色背景。
+- 图表悬停使用自定义提示卡，同一时间同时显示 actual 和 prediction；红色 gap 内没有
+  预测点时仍显示最近的 actual。提示卡与底部刻度共用时间格式化，时间单位可切换为
+  `wall`、`mode` 或 `start`。
+- 左侧图例新增 `Time` 区，用两行紧凑选择器显示当前 `unit` 与监控 `scale`。
+- `mode` 时间单位在模式切换线上标记 `0s`，后续刻度按该次切换重新计时。
+- 监控时间新增 `2s / 10s / 30s / 1m / 10m` scale 选择并持久化；图例移除 `mode age`
+  与 `total`。
+- 实时图表按 60Hz `requestAnimationFrame` 每帧重绘画布；右侧新采样延迟一帧进入
+  画布，曲线本身不再生成插值尾点。
+- 原始历史最多保留 36k 点，显示前按窗口降采样到 1200 点以内，兼顾 10min 窗口与
+  滚动流畅度；降采样使用固定绝对时间桶，并在窗口左端用真实相邻采样插值出边界点，
+  避免左侧反复跳变。
+- Tooltip 改为在光标时间前后两个真实采样之间线性插值；时间刻度文字使用 140ms
+  交叉淡化；曲线改为零张力与 butt cap，修复两端视觉变粗。
+- 验证：非仿真测试 `134 passed, 2 skipped`；完整测试 `160 passed, 2 skipped`，其余
+  5 个失败/错误均来自缺少 `scservo_sdk`。Chrome smoke 14/14 + 7/7 + 5/5 通过，覆盖四个
+  搜索框、单滚动容器、历史保留、模式标记、rollout now 线、红色 gap 像素、actual/
+  prediction 提示、gap actual 回退、时间戳一致性、时间单位切换、scale 轴范围、
+  长时间窗口降采样、左侧稳定边界、右侧一帧延迟、tooltip 插值与时间刻度淡化。
+
+## 2026-09-22（Action 序列图可读性）
+
+- Joint state 与 Commanded action 的 Y 轴统一固定为 ±180，曲线超出绘图区后由
+  Chart.js 硬裁切；原始关节值和动作值不 clamp。
+- 两张图共用底部最左侧一组图例，关节颜色按 Joints 面板顺序从 gripper 到
+  shoulder_pan 排列；line style 使用简短的实线、虚线、预测断档背景和当前时间线文案。
+- prediction gap 改为按时间区间绘制半透明红色背景带，不再叠加红色菱形数据点。
+- 两张图标题固定展开，移除了 Joint state 与 Commanded action 的收起按钮。
+- teleop、record、rollout 与 jog 使用线性时间轴并显示秒数，now 固定在窗口 88%
+  位置；rollout 的未来窗口由最新 action chunk 的步数和长度估算，最大保留 8 秒。
+- 时间轴改用快照 `ts` 的绝对时间戳，底部显示本地 `HH:MM:SS`；白色当前时间线不再
+  绘制 `now` 文案，图例以 `current time` 表示。
+- relax/jog 等非 rollout 行为不预留未来窗口；`loading → rollout` 沿用同一时间轴和
+  实时缓存，历史点容量由 180 提升到 1800，避免 rollout 实线过早消失。
+- 验证：非仿真测试 `133 passed, 2 skipped`；伪造 Chart.js 的浏览器测试覆盖
+  ±110 范围、数据裁剪、固定 now 比例、4 秒 rollout 未来窗口、图例唯一性与窄屏布局。
+
 ## 2026-09-22（Monitor 工作区标签化）
 
 - Library 的 Videos、Datasets、Snapshots、Models 改为单内容区标签页；右侧 Joints、

@@ -571,18 +571,32 @@ def policy_config(path: Path) -> dict[str, Any]:
     return config
 
 
+def _has_policy_weights(path: Path) -> bool:
+    """Ignore processor safetensors and require the actual model body."""
+    pretrained_model = path / "pretrained_model"
+    if pretrained_model.is_dir():
+        return _has_policy_weights(pretrained_model)
+    if (
+        (path / "model.safetensors").is_file()
+        or (path / "adapter_model.safetensors").is_file()
+        or (path / "model.pt").is_file()
+        or (path / "pytorch_model.bin").is_file()
+    ):
+        return True
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        weight_map = _read_json(path / index_name).get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            continue
+        if all((path / str(filename)).is_file() for filename in weight_map.values()):
+            return True
+    return False
+
+
 def is_policy_dir(path: Path) -> bool:
     """A LeRobot / HF policy folder: config.json plus weights next to it."""
     if not (path / "config.json").is_file():
         return False
-    if (path / "pretrained_model").is_dir():
-        return True
-    has_weights = (
-        any(path.glob("*.safetensors"))
-        or (path / "model.pt").is_file()
-        or (path / "pytorch_model.bin").is_file()
-    )
-    return has_weights and bool(policy_config(path))
+    return _has_policy_weights(path) and bool(policy_config(path))
 
 
 def _model_entry(

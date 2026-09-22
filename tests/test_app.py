@@ -80,7 +80,7 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert b"btn-hdr-auto" in html
         assert b'class="side-footer"' not in html
         assert b'id="btn-resume"' not in html
-        assert b"Duplicate" in html
+        assert b'id="btn-preset-dup"' in html
         assert b"rec-num" in html
         assert b"id=\"library\"" in html
         assert b"From follower" in html
@@ -121,6 +121,8 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert b"btn-teleop-on" not in html
         assert b"btn-rec-on" not in html
         assert b"btn-roll-on" not in html
+        assert b"btn-robot-on" not in html
+        assert b"btn-leader-on" not in html
         assert "runtime" in meta.json()
         estop = client.post("/lerobot/api/estop")
         assert estop.status_code == 200
@@ -136,6 +138,17 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert saved.status_code == 200
         listed = client.get("/lerobot/api/presets")
         assert listed.json()["pose"]["fold"]["gripper"] == 1.0
+        hardware = client.put(
+            "/lerobot/api/presets/hardware/bench",
+            json={"schema": 1, "devices": {}, "cameras": {}},
+        )
+        assert hardware.status_code == 200
+        renamed = client.post(
+            "/lerobot/api/presets/hardware/bench/rename",
+            json={"name": "bench 2"},
+        )
+        assert renamed.status_code == 200
+        assert "bench 2" in client.get("/lerobot/api/presets").json()["hardware"]
 
 
 def test_remote_blender_camera_controls_return_bad_request(
@@ -669,6 +682,66 @@ def _debug_config(tmp_path: Path) -> MonitorConfig:
     )
 
 
+def test_hardware_system_preset_apply_and_active_state(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        before = client.get("/lerobot/api/meta").json()
+        assert before["active_hardware_preset"] is None
+
+        applied = client.post(
+            "/lerobot/api/hardware/apply",
+            json={"name": "Disconnected"},
+        )
+        assert applied.status_code == 200
+        body = applied.json()
+        assert body["ok"] is True
+        assert body["complete"] is True
+        assert body["summary"]["failed"] == 0
+
+        after = client.get("/lerobot/api/meta").json()
+        assert after["active_hardware_preset"] == "Disconnected"
+        assert after["ui"]["active_hardware_preset"] == "Disconnected"
+
+        forced = client.post("/lerobot/api/hardware/force_disconnect")
+        assert forced.status_code == 200
+        assert forced.json()["ok"] is True
+
+
+def test_preset_rename_rejects_system_and_duplicate(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        unknown = client.post(
+            "/lerobot/api/presets/unknown/name/rename",
+            json={"name": "new"},
+        )
+        assert unknown.status_code == 400
+        system = client.post(
+            "/lerobot/api/presets/hardware/Disconnected/rename",
+            json={"name": "empty"},
+        )
+        assert system.status_code == 400
+        assert "system preset" in system.json()["detail"]
+
+        assert client.put(
+            "/lerobot/api/presets/hardware/one",
+            json={"schema": 1, "devices": {}, "cameras": {}},
+        ).status_code == 200
+        assert client.put(
+            "/lerobot/api/presets/hardware/two",
+            json={"schema": 1, "devices": {}, "cameras": {}},
+        ).status_code == 200
+        duplicate = client.post(
+            "/lerobot/api/presets/hardware/one/rename",
+            json={"name": "two"},
+        )
+        assert duplicate.status_code == 400
+        assert "already exists" in duplicate.json()["detail"]
+
+
 def _jpeg_base64(width: int = 24, height: int = 16) -> str:
     image = np.zeros((height, width, 3), dtype=np.uint8)
     ok, encoded = cv2.imencode(".jpg", image)
@@ -808,10 +881,8 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'data-tab-panel="videos"',
         'id="lib-snapshots"',
         'id="snap-list"',
-        'id="vid-search"',
-        'id="ds-search"',
-        'id="snap-search"',
-        'id="md-library-search"',
+        'id="lib-search"',
+        'id="btn-lib-search-clear"',
         'id="btn-snap-edit"',
         'id="side-tabs"',
         'data-tab="joints"',
@@ -825,6 +896,20 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="action-legend"',
         'id="md-file-input"',
         'id="pol-path-menu"',
+        'id="preset-toolbar"',
+        'id="preset-select"',
+        'id="btn-preset-load"',
+        'id="btn-preset-save"',
+        'id="btn-preset-rename"',
+        'id="btn-preset-dup"',
+        'id="btn-preset-del"',
+        'id="preset-name-popover"',
+        'id="btn-arm-toggle"',
+        'id="btn-leader-toggle"',
+        'id="btn-arm-force"',
+        'id="btn-leader-force"',
+        'aria-label="Arm device"',
+        'aria-label="Leader device"',
     ):
         assert marker in page.text
 
@@ -920,6 +1005,11 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert css.status_code == 200
     assert script.status_code == 200
     assert ".library-search" in css.text
+    assert ".library-tools" in css.text
+    assert ".side-tools" in css.text
+    assert ".preset-name-popover" in css.text
+    assert ".preset-icon-btn.loading" in css.text
+    assert ".force-device" in css.text
     assert ".chart-hover-tooltip" in css.text
     assert ".chart-time-control" in css.text
     list_rule = re.search(r"\.lib-list\s*\{(?P<body>.*?)\}", css.text, re.DOTALL)
@@ -977,3 +1067,11 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert 'canvas.addEventListener("wheel"' in script.text
     assert "function updateChartHoverFromClient" in script.text
     assert "const threshold = 100;" in script.text
+    assert "PRESET_KIND_BY_TAB" in script.text
+    assert "PRESET_SELECTION_KEY" in script.text
+    assert "PRESET_SCROLL_KEY" in script.text
+    assert "function hardwareFields" in script.text
+    assert "function selectLibrarySearchKind" in script.text
+    assert 'api("/api/hardware/apply"' in script.text
+    assert 'api("/api/hardware/force_disconnect"' in script.text
+    assert 'const endpointRole = role === "arm" ? "robot" : "leader";' in script.text

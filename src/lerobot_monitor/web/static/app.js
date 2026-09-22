@@ -31,12 +31,15 @@ let videosCache = [];
 let datasetsCache = [];
 let snapshotsCache = [];
 let modelsCache = [];
+const LIBRARY_SEARCH_KEY = "lerobot-monitor-library-search";
 const librarySearch = {
   videos: "",
   datasets: "",
   snapshots: "",
   models: "",
+  ...loadJsonStorage(LIBRARY_SEARCH_KEY),
 };
+let activeLibrarySearchKind = "videos";
 let activeSnapshot = null;
 let snapshotActive = false;
 let snapshotCaptureBusy = false;
@@ -2355,40 +2358,107 @@ function bind(id, fn) {
   });
 }
 
-let savedPresets = { record: {}, rollout: {}, pose: {}, debug: {} };
+let savedPresets = { record: {}, rollout: {}, pose: {}, debug: {}, hardware: {} };
+const PRESET_SELECTION_KEY = "lerobot-monitor-preset-selection";
+const PRESET_SCROLL_KEY = "lerobot-monitor-side-scroll";
+const PRESET_KIND_BY_TAB = {
+  joints: "pose",
+  record: "record",
+  rollout: "rollout",
+  debug: "debug",
+  hardware: "hardware",
+};
+const PRESET_LABELS = {
+  pose: "Joints",
+  record: "Record",
+  rollout: "Rollout",
+  debug: "Debug",
+  hardware: "Hardware",
+};
+let activePresetKind = "pose";
+let presetNameMode = "save";
+const presetLoadState = { kind: "", name: "", forceSent: false };
 
-function presetSelectId(kind) {
-  if (kind === "record") return "rec-preset";
-  if (kind === "rollout") return "roll-preset";
-  if (kind === "debug") return "dbg-preset";
-  return "pose-preset";
+function loadJsonStorage(key) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
 }
 
-function presetNameId(kind) {
-  if (kind === "record") return "rec-preset-name";
-  if (kind === "rollout") return "roll-preset-name";
-  if (kind === "debug") return "dbg-preset-name";
-  return "pose-preset-name";
+function saveJsonStorage(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ }
 }
 
-function fillPresetSelect(id, group) {
-  const sel = $(id);
-  const current = sel.value;
-  sel.innerHTML = `<option value="">—</option>`;
-  Object.keys(group || {}).sort().forEach((name) => {
-    const opt = document.createElement("option");
-    opt.value = name;
-    opt.textContent = name;
-    sel.appendChild(opt);
+const presetSelections = loadJsonStorage(PRESET_SELECTION_KEY);
+const presetScroll = loadJsonStorage(PRESET_SCROLL_KEY);
+
+function selectedPresetName(kind = activePresetKind) {
+  const group = savedPresets[kind] || {};
+  const selected = String(presetSelections[kind] || "");
+  if (selected && group[selected]) return selected;
+  if (kind === "hardware" && group["Disconnected"]) return "Disconnected";
+  return "";
+}
+
+function selectedPreset(kind = activePresetKind) {
+  const name = selectedPresetName(kind);
+  return name ? (savedPresets[kind] || {})[name] || null : null;
+}
+
+function isSystemPreset(kind = activePresetKind, name = selectedPresetName(kind)) {
+  const preset = name ? (savedPresets[kind] || {})[name] : null;
+  return Boolean(preset && preset.system);
+}
+
+function renderPresetToolbar() {
+  const select = $("preset-select");
+  if (!select) return;
+  const group = savedPresets[activePresetKind] || {};
+  const current = selectedPresetName();
+  select.innerHTML = `<option value="">—</option>`;
+  Object.keys(group).sort((left, right) => left.localeCompare(right)).forEach((name) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    select.appendChild(option);
   });
-  if (current && group[current]) sel.value = current;
+  select.value = current;
+  select.setAttribute("aria-label", `${PRESET_LABELS[activePresetKind]} preset`);
+  const system = isSystemPreset();
+  const hasSelection = Boolean(current);
+  const loading = presetLoadState.kind === activePresetKind;
+  for (const [id, disabled] of [
+    ["btn-preset-load", !hasSelection && !loading],
+    ["btn-preset-rename", !hasSelection || system],
+    ["btn-preset-dup", !hasSelection],
+    ["btn-preset-del", !hasSelection || system],
+  ]) {
+    if ($(id)) $(id).disabled = disabled;
+  }
+  const loadButton = $("btn-preset-load");
+  if (loadButton) {
+    loadButton.classList.toggle("loading", loading);
+    loadButton.title = loading ? "Force load preset" : "Load preset";
+    loadButton.setAttribute("aria-label", loading ? "Force load preset" : "Load preset");
+  }
+}
+
+function selectPresetKind(kind) {
+  activePresetKind = kind;
+  renderPresetToolbar();
+  const panel = document.querySelector(`[data-tab-panel="${kind}"]`);
+  if (panel) {
+    requestAnimationFrame(() => {
+      panel.scrollTop = Number(presetScroll[kind] || 0);
+    });
+  }
 }
 
 function refreshPresetSelects() {
-  fillPresetSelect("rec-preset", savedPresets.record);
-  fillPresetSelect("roll-preset", savedPresets.rollout);
-  fillPresetSelect("pose-preset", savedPresets.pose);
-  fillPresetSelect("dbg-preset", savedPresets.debug);
+  renderPresetToolbar();
 }
 
 function setTaskButton(id, on, label) {
@@ -2571,6 +2641,76 @@ function applyRolloutFields(p) {
   if (p.extra != null) setKvPairs(p.extra);
 }
 
+function serialPresetSpec(role) {
+  const select = $(role === "arm" ? "arm-port" : "leader-port");
+  const port = select ? select.value : "";
+  if (!port) return null;
+  const row = lastPorts.find((item) => item.port === port);
+  const identity = row && row.identity
+    ? { ...row.identity }
+    : { kind: "serial", hwid: "", port };
+  return { identity, port };
+}
+
+function cameraPresetIdentity(camera) {
+  if (camera && camera.identity) return { ...camera.identity };
+  if (camera && camera.remote) {
+    return {
+      kind: "remote",
+      robot_id: String(camera.robot_id || ""),
+      camera_id: String(camera.camera_id || ""),
+      object_name: String(camera.object_name || ""),
+    };
+  }
+  return {
+    kind: "local",
+    index: camera ? camera.index : null,
+    name: String(camera && camera.name || ""),
+  };
+}
+
+function cameraPresetKey(camera) {
+  if (camera && camera.device_key) return String(camera.device_key);
+  const identity = cameraPresetIdentity(camera);
+  if (identity.kind === "remote") {
+    return `remote:${identity.robot_id || "robot"}:${identity.camera_id || "camera"}`;
+  }
+  return `local:${identity.index ?? identity.name ?? "unknown"}`;
+}
+
+function hardwareFields() {
+  const devices = {};
+  const arm = serialPresetSpec("arm");
+  const leader = serialPresetSpec("leader");
+  if (arm) devices.arm = arm;
+  if (leader) devices.leader = leader;
+  const cameras = {};
+  const rows = (last && Array.isArray(last.cameras) && last.cameras.length)
+    ? last.cameras
+    : camMenu;
+  (rows || []).forEach((camera) => {
+    const settings = {
+      label: String(camera.label || ""),
+      enabled: Boolean(camera.enabled),
+      show_main: Boolean(camera.show_main),
+      feed_robot: Boolean(camera.feed_robot),
+    };
+    if (!camera.remote) {
+      settings.streaming = Boolean(camera.streaming);
+      settings.port = Number(camera.port);
+      settings.width = Number(camera.width);
+      settings.height = Number(camera.height);
+      settings.autofocus = Boolean(camera.autofocus);
+      settings.focus = Number(camera.focus || 0);
+    }
+    cameras[cameraPresetKey(camera)] = {
+      identity: cameraPresetIdentity(camera),
+      settings,
+    };
+  });
+  return { schema: 1, system: false, devices, cameras };
+}
+
 let uiTimer = null;
 function persistUi() {
   updateRecordDestinationUi();
@@ -2611,6 +2751,8 @@ function setHwStatus(id, device) {
   const el = $(id);
   if (!el) return;
   const connected = !!(device && device.connected);
+  const role = id.startsWith("arm") ? "arm" : "leader";
+  setPortToggle(role, connected);
   el.className = `hw-status${connected ? " on" : ""}`;
   if (!connected) {
     el.textContent = "disconnected";
@@ -2621,6 +2763,38 @@ function setHwStatus(id, device) {
   if (desc) lines.push(desc);
   if (device.id) lines.push(device.id);
   el.textContent = lines.join("\n");
+}
+
+function setPortToggle(role, connected) {
+  const button = $(`btn-${role}-toggle`);
+  const select = $(`${role}-port`);
+  if (!button) return;
+  button.classList.toggle("on", connected);
+  button.setAttribute("aria-pressed", String(connected));
+  button.disabled = !connected && !(select && select.value);
+  const action = connected ? "Disconnect" : "Connect";
+  button.title = `${action} ${role}`;
+  button.setAttribute("aria-label", `${action} ${role}`);
+}
+
+async function togglePortConnection(role) {
+  const select = $(`${role}-port`);
+  const endpointRole = role === "arm" ? "robot" : "leader";
+  const device = role === "arm"
+    ? ((last && last.robot) || {})
+    : ((last && last.leader) || {});
+  if (device.connected) {
+    return api(`/api/${endpointRole}/disconnect`);
+  }
+  const port = select ? select.value : "";
+  if (!port) throw new Error(`select a ${role} device before connecting`);
+  persistUi();
+  return api(`/api/${endpointRole}/connect`, { port });
+}
+
+async function forceDisconnectRole(role) {
+  localLog(`force disconnect ${role} requested — skipping relax`);
+  return api("/api/hardware/force_disconnect", { role });
 }
 
 function camerasFlag() {
@@ -2648,8 +2822,8 @@ function updateTaskInfo() {
   const leader = (last && last.leader) || meta.leader || {};
   const rec = recordFields();
   const roll = rolloutFields();
-  const armPort = ($("arm-port") && $("arm-port").value) || robot.port || "";
-  const leadPort = ($("leader-port") && $("leader-port").value) || leader.port || "";
+  const armPort = $("arm-port") ? $("arm-port").value : (robot.port || "");
+  const leadPort = $("leader-port") ? $("leader-port").value : (leader.port || "");
   const actionFps = rec.action_fps || (meta.recording && (meta.recording.action_fps || meta.recording.fps)) || 15;
   const videoFps = rec.video_fps || (meta.recording && (meta.recording.video_fps || meta.recording.fps)) || actionFps;
   const cams = camerasFlag();
@@ -2739,6 +2913,18 @@ function updateTaskInfo() {
   el.addEventListener("change", persistUi);
   el.addEventListener("input", persistUi);
 });
+["arm-port", "leader-port"].forEach((id) => {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener("change", () => {
+    el.dataset.userSelected = "true";
+    const role = id === "arm-port" ? "arm" : "leader";
+    const device = role === "arm"
+      ? ((last && last.robot) || {})
+      : ((last && last.leader) || {});
+    setPortToggle(role, Boolean(device.connected));
+  });
+});
 if ($("pol-path")) {
   const input = $("pol-path");
   input.addEventListener("input", () => {
@@ -2787,28 +2973,33 @@ bind("btn-rec-clear-video", () => {
   persistUi();
 });
 
+function setSelectedPreset(kind, name) {
+  if (name) presetSelections[kind] = name;
+  else delete presetSelections[kind];
+  saveJsonStorage(PRESET_SELECTION_KEY, presetSelections);
+  if (kind === activePresetKind) renderPresetToolbar();
+}
+
 async function saveNamedPreset(kind, name, payload) {
   const key = (name || "").trim();
   if (!key) throw new Error("preset name is empty");
-  await api(`/api/presets/${kind}/${encodeURIComponent(key)}`, payload, "PUT");
-  savedPresets[kind][key] = payload;
+  const saved = { ...payload };
+  delete saved.system;
+  await api(`/api/presets/${kind}/${encodeURIComponent(key)}`, saved, "PUT");
+  savedPresets[kind][key] = saved;
+  setSelectedPreset(kind, key);
   refreshPresetSelects();
-  const select = $(presetSelectId(kind));
-  if (select) select.value = key;
+  return saved;
 }
+
 async function deleteNamedPreset(kind, name) {
   if (!name) return;
   await api(`/api/presets/${kind}/${encodeURIComponent(name)}`, undefined, "DELETE");
   delete savedPresets[kind][name];
+  setSelectedPreset(kind, "");
   refreshPresetSelects();
 }
 
-bind("btn-rec-save", () => saveNamedPreset("record", $("rec-preset-name").value || $("rec-preset").value, recordFields()));
-bind("btn-rec-load", () => applyRecordFields(savedPresets.record[$("rec-preset").value]));
-bind("btn-rec-del", () => deleteNamedPreset("record", $("rec-preset").value));
-bind("btn-roll-save", () => saveNamedPreset("rollout", $("roll-preset-name").value || $("roll-preset").value, rolloutFields()));
-bind("btn-roll-load", () => applyRolloutFields(savedPresets.rollout[$("roll-preset").value]));
-bind("btn-roll-del", () => deleteNamedPreset("rollout", $("roll-preset").value));
 function uniquePresetName(kind, name) {
   const group = savedPresets[kind] || {};
   let copy = `${name} copy`;
@@ -2820,31 +3011,181 @@ async function duplicateNamedPreset(kind, name) {
   const src = (savedPresets[kind] || {})[name];
   if (!src || !name) throw new Error("select a preset to duplicate");
   const copy = uniquePresetName(kind, name);
-  await saveNamedPreset(kind, copy, JSON.parse(JSON.stringify(src)));
-  const nameId = presetNameId(kind);
-  if ($(nameId)) $(nameId).value = copy;
+  const payload = JSON.parse(JSON.stringify(src));
+  delete payload.system;
+  await saveNamedPreset(kind, copy, payload);
 }
 
-bind("btn-rec-dup", () => duplicateNamedPreset("record", $("rec-preset").value));
-bind("btn-roll-dup", () => duplicateNamedPreset("rollout", $("roll-preset").value));
-bind("btn-pose-save", () => saveNamedPreset("pose", $("pose-preset-name").value || $("pose-preset").value, { ...targets }));
-bind("btn-pose-load", () => {
-  const pose = savedPresets.pose[$("pose-preset").value];
-  if (!pose) return;
-  applyPoseToSliders(pose);
+function presetPayload(kind) {
+  if (kind === "pose") return { ...targets };
+  if (kind === "record") return recordFields();
+  if (kind === "rollout") return rolloutFields();
+  if (kind === "debug") return debugFields();
+  if (kind === "hardware") return hardwareFields();
+  throw new Error(`unknown preset kind: ${kind}`);
+}
+
+function applyPresetPayload(kind, payload) {
+  if (!payload) return;
+  if (kind === "pose") {
+    applyPoseToSliders(payload);
+    return;
+  }
+  if (kind === "record") {
+    applyRecordFields(payload);
+    return;
+  }
+  if (kind === "rollout") {
+    applyRolloutFields(payload);
+    return;
+  }
+  if (kind === "debug") applyDebugFields(payload);
+}
+
+async function loadSelectedPreset() {
+  const kind = activePresetKind;
+  const name = selectedPresetName(kind);
+  const payload = selectedPreset(kind);
+  if (!name || !payload) throw new Error("select a preset to load");
+  if (presetLoadState.kind === kind) {
+    const loadingName = presetLoadState.name;
+    if (kind === "hardware" && loadingName === name && !presetLoadState.forceSent) {
+      presetLoadState.forceSent = true;
+      renderPresetToolbar();
+      localLog(`hardware preset "${loadingName}": force load requested`);
+      await api("/api/hardware/apply", { name: loadingName, force: true });
+    }
+    return;
+  }
+
+  presetLoadState.kind = kind;
+  presetLoadState.name = name;
+  presetLoadState.forceSent = false;
+  renderPresetToolbar();
+  try {
+    if (kind === "hardware") {
+      if (replayActive || episodeSource) {
+        throw new Error("exit replay before loading a hardware preset");
+      }
+      const result = await api("/api/hardware/apply", { name });
+      const devices = payload.devices && typeof payload.devices === "object" ? payload.devices : {};
+      for (const role of ["arm", "leader"]) {
+        const select = $(`${role}-port`);
+        if (!select) continue;
+        select.value = String((devices[role] && devices[role].port) || "");
+        select.dataset.userSelected = "true";
+      }
+      persistUi();
+      await refreshPorts();
+      localLog(
+        `hardware preset "${name}": ${result.summary.success} ok, `
+        + `${result.summary.skipped} skipped, ${result.summary.failed} failed`,
+        result.complete ? "" : "error",
+      );
+      return;
+    }
+    applyPresetPayload(kind, payload);
+  } finally {
+    if (presetLoadState.kind === kind && presetLoadState.name === name) {
+      presetLoadState.kind = "";
+      presetLoadState.name = "";
+      presetLoadState.forceSent = false;
+      renderPresetToolbar();
+    }
+  }
+}
+
+function openPresetNamePopover(mode) {
+  const popover = $("preset-name-popover");
+  const input = $("preset-name-input");
+  if (!popover || !input) return;
+  const current = selectedPresetName();
+  presetNameMode = mode;
+  $("preset-name-label").textContent = mode === "rename" ? "Rename preset" : "Save preset as";
+  input.value = mode === "rename"
+    ? current
+    : (current ? `${current} copy` : `${PRESET_LABELS[activePresetKind]} preset`);
+  $("preset-name-error").textContent = "";
+  popover.classList.remove("hidden");
+  input.focus();
+  input.select();
+}
+
+function closePresetNamePopover() {
+  const popover = $("preset-name-popover");
+  if (popover) popover.classList.add("hidden");
+  const error = $("preset-name-error");
+  if (error) error.textContent = "";
+}
+
+async function confirmPresetName() {
+  const input = $("preset-name-input");
+  const error = $("preset-name-error");
+  const nextName = (input && input.value || "").trim();
+  if (!nextName) {
+    if (error) error.textContent = "Enter a preset name.";
+    return;
+  }
+  const kind = activePresetKind;
+  const current = selectedPresetName(kind);
+  if (nextName !== current && (savedPresets[kind] || {})[nextName]) {
+    if (error) error.textContent = "A preset with this name already exists.";
+    return;
+  }
+  try {
+    if (presetNameMode === "rename") {
+      const saved = await api(
+        `/api/presets/${kind}/${encodeURIComponent(current)}/rename`,
+        { name: nextName },
+        "POST",
+      );
+      delete savedPresets[kind][current];
+      savedPresets[kind][nextName] = saved;
+      setSelectedPreset(kind, nextName);
+    } else {
+      await saveNamedPreset(kind, nextName, presetPayload(kind));
+    }
+    closePresetNamePopover();
+  } catch (err) {
+    if (error) error.textContent = err.message || String(err);
+  }
+}
+
+bind("btn-preset-load", loadSelectedPreset);
+bind("btn-preset-save", async () => {
+  const name = selectedPresetName();
+  if (!name || isSystemPreset()) {
+    openPresetNamePopover("save");
+    return;
+  }
+  await saveNamedPreset(activePresetKind, name, presetPayload(activePresetKind));
 });
-bind("btn-pose-dup", () => duplicateNamedPreset("pose", $("pose-preset").value));
-bind("btn-pose-del", () => deleteNamedPreset("pose", $("pose-preset").value));
-$("rec-preset").addEventListener("change", () => {
-  $("rec-preset-name").value = $("rec-preset").value;
-  applyRecordFields(savedPresets.record[$("rec-preset").value]);
-});
-$("roll-preset").addEventListener("change", () => {
-  $("roll-preset-name").value = $("roll-preset").value;
-  applyRolloutFields(savedPresets.rollout[$("roll-preset").value]);
-});
-$("pose-preset").addEventListener("change", () => {
-  $("pose-preset-name").value = $("pose-preset").value;
+bind("btn-preset-rename", () => openPresetNamePopover("rename"));
+bind("btn-preset-dup", () => duplicateNamedPreset(activePresetKind, selectedPresetName()));
+bind("btn-preset-del", () => deleteNamedPreset(activePresetKind, selectedPresetName()));
+bind("btn-preset-name-confirm", confirmPresetName);
+bind("btn-preset-name-cancel", closePresetNamePopover);
+if ($("preset-select")) {
+  $("preset-select").addEventListener("change", () => {
+    setSelectedPreset(activePresetKind, $("preset-select").value);
+  });
+}
+if ($("preset-name-input")) {
+  $("preset-name-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      confirmPresetName();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closePresetNamePopover();
+    }
+  });
+}
+document.addEventListener("pointerdown", (event) => {
+  const popover = $("preset-name-popover");
+  if (!popover || popover.classList.contains("hidden")) return;
+  if (event.target.closest("#preset-name-popover, #btn-preset-save, #btn-preset-rename")) return;
+  closePresetNamePopover();
 });
 
 function applyPoseToSliders(pose) {
@@ -2874,18 +3215,10 @@ $("chk-hold").addEventListener("change", async (e) => {
   catch (err) { toastError(err); }
 });
 
-bind("btn-robot-on", () => {
-  const port = $("arm-port").value;
-  persistUi();
-  return api("/api/robot/connect", port ? { port } : {});
-});
-bind("btn-robot-off", () => api("/api/robot/disconnect"));
-bind("btn-leader-on", () => {
-  const port = $("leader-port").value;
-  persistUi();
-  return api("/api/leader/connect", port ? { port } : {});
-});
-bind("btn-leader-off", () => api("/api/leader/disconnect"));
+bind("btn-arm-toggle", () => togglePortConnection("arm"));
+bind("btn-leader-toggle", () => togglePortConnection("leader"));
+bind("btn-arm-force", () => forceDisconnectRole("arm"));
+bind("btn-leader-force", () => forceDisconnectRole("leader"));
 bind("btn-rec-next", () => api("/api/record/next"));
 bind("btn-hdr-scan", () => runAction("btn-hdr-scan", "scan requested", async () => {
   await api("/api/scan");
@@ -3165,8 +3498,20 @@ function initSplitters() {
 }
 initSplitters();
 
-initTabList("library-tabs", "lerobot-monitor-library-tab", "videos");
-initTabList("side-tabs", "lerobot-monitor-side-tab", "joints");
+initTabList("library-tabs", "lerobot-monitor-library-tab", "videos", selectLibrarySearchKind);
+initTabList("side-tabs", "lerobot-monitor-side-tab", "joints", (kind) => {
+  selectPresetKind(PRESET_KIND_BY_TAB[kind] || "pose");
+});
+document.querySelectorAll(".panel.side-tab-panel").forEach((panel) => {
+  let timer = null;
+  panel.addEventListener("scroll", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      presetScroll[panel.dataset.tabPanel] = Math.round(panel.scrollTop);
+      saveJsonStorage(PRESET_SCROLL_KEY, presetScroll);
+    }, 100);
+  });
+});
 
 if ($("roll-kv") && !$("roll-kv").children.length) addKvRow();
 if ($("btn-kv-add")) bind("btn-kv-add", () => addKvRow());
@@ -4128,16 +4473,6 @@ bind("btn-hdr-snapshot", captureSnapshot);
 bind("btn-dbg-run", runDebugInference);
 bind("btn-dbg-send", sendDebugFirstStep);
 bind("btn-dbg-kv-add", () => addKvRow("", "", "dbg-kv", () => {}));
-bind("btn-dbg-save", () => saveNamedPreset("debug", $("dbg-preset-name").value || $("dbg-preset").value, debugFields()));
-bind("btn-dbg-load", () => applyDebugFields(savedPresets.debug[$("dbg-preset").value]));
-bind("btn-dbg-dup", () => duplicateNamedPreset("debug", $("dbg-preset").value));
-bind("btn-dbg-del", () => deleteNamedPreset("debug", $("dbg-preset").value));
-if ($("dbg-preset")) {
-  $("dbg-preset").addEventListener("change", () => {
-    $("dbg-preset-name").value = $("dbg-preset").value;
-    applyDebugFields(savedPresets.debug[$("dbg-preset").value]);
-  });
-}
 if ($("dbg-policy")) {
   $("dbg-policy").addEventListener("change", () => {
     if ($("dbg-policy").value && $("dbg-path")) $("dbg-path").value = $("dbg-policy").value;
@@ -6221,32 +6556,55 @@ const LIBRARY_CONFIG = {
   models: { path: "/api/models", group: "lib-models", list: "md-list", status: "md-status", button: "btn-md-refresh", render: renderModels },
 };
 
-function bindLibrarySearchInputs() {
-  const inputs = {
-    videos: "vid-search",
-    datasets: "ds-search",
-    snapshots: "snap-search",
-    models: "md-library-search",
-  };
-  Object.entries(inputs).forEach(([kind, id]) => {
-    const input = $(id);
-    if (!input) return;
-    input.value = librarySearch[kind];
-    input.addEventListener("input", () => {
-      librarySearch[kind] = input.value;
-      LIBRARY_CONFIG[kind].render();
-    });
-    input.addEventListener("keydown", (event) => {
-      if (event.key !== "Escape" || !input.value) return;
-      event.preventDefault();
-      input.value = "";
-      librarySearch[kind] = "";
-      LIBRARY_CONFIG[kind].render();
-    });
-  });
+function librarySearchPlaceholder(kind) {
+  return kind === "models"
+    ? "Filter local models by title or note"
+    : "Search title or note";
 }
 
-bindLibrarySearchInputs();
+function updateLibrarySearchUi() {
+  const input = $("lib-search");
+  const clear = $("btn-lib-search-clear");
+  if (!input) return;
+  input.value = librarySearch[activeLibrarySearchKind] || "";
+  input.placeholder = librarySearchPlaceholder(activeLibrarySearchKind);
+  if (clear) clear.hidden = !input.value;
+}
+
+function selectLibrarySearchKind(kind) {
+  activeLibrarySearchKind = kind;
+  updateLibrarySearchUi();
+}
+
+function bindLibrarySearchInput() {
+  const input = $("lib-search");
+  if (!input) return;
+  input.addEventListener("input", () => {
+    librarySearch[activeLibrarySearchKind] = input.value;
+    saveJsonStorage(LIBRARY_SEARCH_KEY, librarySearch);
+    updateLibrarySearchUi();
+    LIBRARY_CONFIG[activeLibrarySearchKind].render();
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !input.value) return;
+    event.preventDefault();
+    input.value = "";
+    librarySearch[activeLibrarySearchKind] = "";
+    saveJsonStorage(LIBRARY_SEARCH_KEY, librarySearch);
+    updateLibrarySearchUi();
+    LIBRARY_CONFIG[activeLibrarySearchKind].render();
+  });
+  bind("btn-lib-search-clear", () => {
+    input.value = "";
+    librarySearch[activeLibrarySearchKind] = "";
+    saveJsonStorage(LIBRARY_SEARCH_KEY, librarySearch);
+    updateLibrarySearchUi();
+    LIBRARY_CONFIG[activeLibrarySearchKind].render();
+  });
+  updateLibrarySearchUi();
+}
+
+bindLibrarySearchInput();
 
 function setLibrarySectionState(kind) {
   const config = LIBRARY_CONFIG[kind];
@@ -6328,8 +6686,7 @@ function fillPortSelect(id, ports, connectedPort, fallback) {
   if (!sel) return;
   if (document.activeElement === sel) return;
   const current = sel.value;
-  const robotPort = last.robot && last.robot.connected ? last.robot.port : "";
-  const leaderPort = last.leader && last.leader.connected ? last.leader.port : "";
+  const explicitSelection = sel.dataset.userSelected === "true";
   const seen = new Set();
 
   function addOption(parent, p) {
@@ -6337,14 +6694,15 @@ function fillPortSelect(id, ports, connectedPort, fallback) {
     seen.add(p.port);
     const opt = document.createElement("option");
     opt.value = p.port;
-    let tag = "";
-    if (p.port === robotPort) tag = "  · arm connected";
-    else if (p.port === leaderPort) tag = "  · leader connected";
-    opt.textContent = `${p.port} — ${p.description || p.port}${tag}`;
+    opt.textContent = `${p.port} — ${p.description || p.port}`;
     parent.appendChild(opt);
   }
 
   sel.innerHTML = "";
+  const empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = "No device";
+  sel.appendChild(empty);
   const likely = ports.filter((p) => p.likely);
   const other = ports.filter((p) => !p.likely);
   if (likely.length) {
@@ -6359,17 +6717,12 @@ function fillPortSelect(id, ports, connectedPort, fallback) {
     other.forEach((p) => addOption(group, p));
     sel.appendChild(group);
   }
-  const preferred = connectedPort || fallback || current || "";
+  const preferred = connectedPort || (explicitSelection ? current : (fallback || ""));
   if (preferred && !seen.has(preferred)) {
     addOption(sel, { port: preferred, description: preferred });
   }
   if (preferred && [...sel.options].some((o) => o.value === preferred)) sel.value = preferred;
-  if (!sel.options.length) {
-    const opt = document.createElement("option");
-    opt.value = "";
-    opt.textContent = "no serial devices";
-    sel.appendChild(opt);
-  }
+  else sel.value = "";
 }
 
 async function refreshPorts() {
@@ -6391,6 +6744,8 @@ async function refreshPorts() {
       leader.connected ? leader.port : "",
       uiHw.leader_port || (meta.leader && meta.leader.port) || "",
     );
+    setPortToggle("arm", Boolean(robot.connected));
+    setPortToggle("leader", Boolean(leader.connected));
   } catch { /* ignore */ }
 }
 refreshPorts();
@@ -6409,7 +6764,21 @@ fetch(BASE + "/api/meta")
   .then((m) => {
     meta = m;
     ensureJointRows(meta.joints || JOINT_FALLBACK);
-    savedPresets = m.saved_presets || savedPresets;
+    savedPresets = {
+      record: {},
+      rollout: {},
+      pose: {},
+      debug: {},
+      hardware: {},
+      ...(m.saved_presets || {}),
+    };
+    if (!presetSelections.hardware && m.active_hardware_preset) {
+      presetSelections.hardware = m.active_hardware_preset;
+    }
+    if (!presetSelections.hardware && savedPresets.hardware["Disconnected"]) {
+      presetSelections.hardware = "Disconnected";
+    }
+    saveJsonStorage(PRESET_SELECTION_KEY, presetSelections);
     refreshPresetSelects();
     if (m.ui) {
       applyRecordFields(m.ui.record);

@@ -54,6 +54,22 @@ class RuntimeHub:
     def start(self) -> None:
         self.cameras.start()
         self.loop.start()
+        self._restore_active_hardware_preset()
+
+    def _restore_active_hardware_preset(self) -> None:
+        ui = self.store.ui()
+        name = str(ui.get("active_hardware_preset") or "").strip()
+        if not name:
+            self.loop.log("info", "hardware preset auto-restore skipped: no active preset")
+            return
+        preset = self.store.presets("hardware").get(name)
+        if not isinstance(preset, dict):
+            self.loop.log(
+                "error",
+                f'hardware preset auto-restore skipped: "{name}" no longer exists',
+            )
+            return
+        self.loop.submit_nowait("hardware_apply", {"name": name, "preset": preset})
 
     def stop(self) -> None:
         try:
@@ -84,6 +100,7 @@ class RuntimeHub:
             "presets": PRESETS,
             "saved_presets": self.store.presets(),
             "ui": self.store.ui(),
+            "active_hardware_preset": self.store.ui().get("active_hardware_preset"),
             "cameras": self.cameras.snapshots(),
             "recording_root": str(self.config.recording.root),
             "control_fps": self.config.control.fps,

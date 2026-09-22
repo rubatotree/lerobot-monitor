@@ -319,6 +319,11 @@ def test_inference_config_from_extra_parses_rtc_fields(monkeypatch) -> None:
 def test_resolve_cached_policy_path_uses_local_snapshot(tmp_path: Path, monkeypatch) -> None:
     snapshot = tmp_path / "hub" / "models--user--policy" / "snapshots" / "abc"
     snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        '{"input_features":{"observation.state":{}},"output_features":{"action":{}}}',
+        encoding="utf-8",
+    )
+    (snapshot / "model.safetensors").write_bytes(b"weights")
     monkeypatch.setenv("HF_HOME", str(tmp_path))
     monkeypatch.setattr(
         model_hub,
@@ -331,6 +336,29 @@ def test_resolve_cached_policy_path_uses_local_snapshot(tmp_path: Path, monkeypa
     )
 
     assert resolve_cached_policy_path("user/policy") == str(snapshot.resolve())
+
+
+def test_resolve_cached_policy_path_ignores_incomplete_snapshot(tmp_path: Path, monkeypatch) -> None:
+    snapshot = tmp_path / "hub" / "models--user--policy" / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        '{"input_features":{"observation.state":{}},"output_features":{"action":{}}}',
+        encoding="utf-8",
+    )
+    (snapshot / "policy_preprocessor_step_5_normalizer_processor.safetensors").write_bytes(b"x")
+    (snapshot / "policy_postprocessor_step_0_unnormalizer_processor.safetensors").write_bytes(b"x")
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        model_hub,
+        "parse_remote",
+        lambda path, revision="": SimpleNamespace(
+            source="huggingface",
+            repo_id="user/policy",
+            revision=revision,
+        ),
+    )
+
+    assert resolve_cached_policy_path("user/policy") is None
 
 
 def test_resolve_cached_policy_path_accepts_existing_directory(tmp_path: Path) -> None:

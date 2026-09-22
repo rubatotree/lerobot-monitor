@@ -33,6 +33,57 @@ Browser  --HTTP/WS/MJPEG-->  FastAPI
 7. 本机 policy 扫描：HF hub cache、HF_LEROBOT_HOME、outputs/checkpoints
 8. Episode 管理：独立 Episode 列、命名/任务/备注编辑、逐条播放，回放时下方 Joint state / Control state 时间条
 
+## 已完成（2026-09-22）：Hardware preset、固定工具栏与设备身份恢复
+
+目标：让右侧五个任务页共享一致的 preset 交互，并把 Hardware preset 作为可跨进程
+恢复的完整硬件配置，而不是依赖相机名称或当前 COM 号的弱引用。
+
+实现边界：
+
+- 左侧 Library 在标签栏下使用固定共享搜索框；四个标签各自持久化关键词，Models 本地
+  过滤与 Hub 搜索保持独立。
+- 右侧五页共用固定 preset 工具栏：下拉选择加 Load / Save / Rename / Duplicate /
+  Delete 图标按钮；新建和重命名使用内联名称弹层。切换下拉项只选择，点击 Load 才应用。
+- 每个右侧标签独立保存 preset 选择和滚动位置；浏览器刷新后恢复，不自动应用普通表单
+  preset。
+- 新增只读系统 preset `Disconnected`，用于显式断开 arm/leader 并停用全部相机；
+  首次运行默认选中但不执行，禁止覆盖、重命名和删除。
+- Hardware preset 以 `identity` 记录设备：真机串口优先匹配 `hwid`，同 hwid 时用 port
+  区分；虚拟设备匹配 role + robot_id；远程相机匹配 robot_id + camera_id；本地相机
+  匹配 index/name。label 只作为设置保存，不参与匹配。
+- `POST /api/hardware/apply` 在控制线程中串行执行硬件变更，返回逐项 success / skipped /
+  failed；每个设备与相机的动作和原因都写入 UI 日志及 `run.log`。
+- 活动 Hardware preset 写入后端 `ui.active_hardware_preset`；Monitor 启动后自动排队
+  恢复，首次没有活动 preset 时不产生硬件副作用。
+- arm/leader 端口下拉提供空选项 `No device`；设备选择与连接状态分离，右侧电源图标
+  单独显示并切换实际连接，旧按钮不再占用额外行。
+- Hardware 页面提供 `Force disconnect`，直接释放 arm/leader，不执行 relax 软断开。
+  Hardware preset 载入期间 Load 图标变黄；再次点击会发送 force 信号，跳过当前
+  relax 等待并继续载入。
+- Arm 与 Leader 各自使用一行 `标题 + 设备选择 + 连接电源图标 + force disconnect
+  图标`，连接信息固定显示在该行下方；force 接口支持按 role 单独释放。
+
+验证：排除缺少 `scservo_sdk` 的仿真测试后为 `148 passed, 2 skipped`；`node --check`、
+Python compile 与浏览器 smoke 通过。浏览器覆盖固定搜索/工具栏、per-tab 搜索与 preset
+状态、内联重命名、显式 Load 日志、刷新恢复、服务重启自动恢复，以及 1024/390px
+无横向溢出。真实串口与相机的换端口连接仍需在硬件现场做最终 soak 验证。
+
+## 已完成（2026-09-22）：Action 序列图可读性
+
+目标：让底部 `Commanded action` 图在遥操作、录制与 rollout 时保持稳定的时间语义，并在不改变关节控制值的前提下限制视觉范围。
+
+实现边界：
+
+- Joint state 与 Commanded action 的 Y 轴统一固定为 `[-180, 180]`，超出曲线在绘图区边缘硬裁切；原始关节值和策略输出不做 clamp。
+- 图例从 Chart.js 内置图例移出，固定在两张图最左侧窄列并共用一组；关节颜色按 Joints 面板顺序从 gripper 到 shoulder_pan 排列，图例只保留实线、虚线、预测断档背景和当前时间线的简短说明。
+- Prediction gap 不再使用红色菱形点，而是在断档起止时间之间绘制横跨绘图区的半透明红色背景带。
+- teleop、record、loading、rollout 与 jog 使用快照 `ts` 的绝对时间戳作为横轴；空闲/离线时继续使用原有无时间轴的紧凑模式。
+- 白色竖线标记当前时间但不显示 `now` 文案；rollout 的未来窗口由最新 action chunk 的 `step_s × actions.length` 估算，relax/jog 等非 rollout 行为不预留未来时间。
+- `loading → rollout` 保持同一时间轴和实时缓存，不因任务切换清空已有历史曲线；实时缓存扩展到约 60 秒，避免实线提前消失。
+- Joint state 与 Commanded action 标题固定展开，不再提供收起按钮。
+
+验收：静态 DOM、JS 语法、非仿真测试和浏览器 smoke 覆盖图例、固定 Y 范围、固定 now 线、rollout 未来窗口与窄屏布局。
+
 ## 已完成（2026-09-22）：工作区标签化
 
 目标：在不改变机器人控制、Library 数据契约和异步刷新语义的前提下，将侧栏从纵向堆叠改为接近 VS Code 的单面板工作区。Library 的 Videos、Datasets、Snapshots、Models 使用同一内容区的标签页；右侧 Joints、Tasks、Hardware、Debug 同样每个任务一个标签页。
@@ -434,3 +485,51 @@ snapshot 路径，并可从 cached policy 候选列表直接选择。
   `blender_sim_follower_camera_1`，成功收到 `640×480` JPEG 帧。
 - 新增测试覆盖多相机解析、单相机回退、远程注册与移除、本地重扫不误删、
   MJPEG 分帧、远程只读 API 返回 400。
+
+## 2026-09-22（Library 搜索与实时图表时间语义）
+
+状态：已完成实现、静态回归与 Chrome 浏览器验证。
+
+### 目标
+
+把 Library 从“每个分组各自滚动”收敛为单一工作区滚动，并让四类资源都能按标题或
+note 即时过滤。底部实时图表不再把模式切换当作数据边界：所有控制模式共享同一段
+绝对时间历史，只有 rollout 需要白色 `current time` 线与预测未来窗口。
+
+### 实现
+
+- Library 列表移除 `max-height` 与内部 `overflow-y`，由 `#library` 独占滚动；
+  Videos、Datasets、Snapshots、Models 各自增加标题/note 搜索框，Models 页的本地
+  过滤与 Hugging Face Hub 搜索保持分离。
+- Joint state 与 Commanded action 的实时点统一使用快照 `ts` 写入时间轴。模式从
+  jog、teleop、record 切到 rollout 时保留已有曲线，不再因轴类型变化清空缓存。
+- 模式切换写入灰色竖线，并在底部 action 时间轴内以竖排标签记录模式名；标签不会在
+  连续切换时横向重叠。
+- `current time` 白线只在 rollout 中显示；relax、teleop、record 与 jog 直接沿时间
+  轴追加。replay 使用秒数，live 使用本地 `HH:MM:SS`，时间刻度始终可见。
+- prediction gap 继续使用半透明红色背景带；图例文案修正为 `command`、`prediction`，
+  并补充 `prediction gap`、`mode change` 与 rollout 专用的 `current time`。
+- 图表悬停改为自定义时间提示卡：同一时间同时列出 actual 与 prediction；悬停在红色
+  gap 内且没有预测点时，仍回退显示该时间之前最近的 actual。提示卡时间与底部刻度
+  共用同一个格式化函数，因此 wall clock、mode age、since start 三种单位完全同步。
+- 左侧图例新增 `Time` 区：可切换 `wall`、`mode`、`start` 时间单位；`mode` 单位会在
+  每条模式切换线上标记 `0s`，后续刻度从该次切换重新计时。
+- 监控窗口新增 `2s / 10s / 30s / 1m / 10m` scale 选择并持久化。原始历史最多保留
+  36k 点，绘制前按当前窗口降采样到 1200 点以内，避免 10min 视图把全部高频点交给
+  Chart.js。图例不再显示 `mode age` 与 `total`。
+- 图表只绘制真实采样点，右侧新采样延迟一帧进入画布；画布按 60Hz 每帧重绘。降采样
+  使用固定绝对时间桶，窗口左端单独用真实相邻采样插值出边界点，使曲线始终连到左边缘。
+  时间刻度文字使用 140ms 交叉淡化，曲线改为零张力并使用 butt cap，避免边缘变粗。
+
+### 验证
+
+- 非仿真回归：`134 passed, 2 skipped`。完整测试为 `160 passed, 2 skipped`，其余
+  5 个失败/错误均来自当前 venv 缺少 `scservo_sdk`。
+- `node --check` 与 `git diff --check` 通过。
+- Chrome 浏览器 smoke 14/14 + 7/7 通过：前一组覆盖 Library、历史与布局；后一组覆盖
+  actual/prediction 同屏、gap 内 actual 回退、tooltip/底部时间戳一致性、时间单位切换
+  与紧凑图例布局。
+- scale 专项 smoke 5/5 通过：五档选项、移除 mode age/total、2s 与 10m 轴范围以及
+  长时间窗口的 1200 点降采样上限。
+- 刷新专项通过：右尾延迟一帧、左边界点精确落在 `scales.x.min`、tooltip 相邻采样
+  插值得到连续数值、时间刻度淡入淡出，并确认曲线 tension 为 0 且 cap 为 butt。

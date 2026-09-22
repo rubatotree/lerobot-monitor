@@ -7,9 +7,10 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .hardware import DEFAULT_HARDWARE_PRESETS, SYSTEM_HARDWARE_PRESET_NAME
 from .types import RELAX_POSE, ZERO_POSE
 
-PRESET_KINDS = ("record", "rollout", "pose", "debug")
+PRESET_KINDS = ("record", "rollout", "pose", "debug", "hardware")
 EPISODE_KINDS = ("video", "dataset")
 LIBRARY_KINDS = ("video", "dataset")
 DEFAULT_POSE_PRESETS: dict[str, dict[str, float]] = {
@@ -32,6 +33,7 @@ class JsonStore:
         }
         self._load()
         self._ensure_default_poses()
+        self._ensure_default_hardware_presets()
 
     def _load(self) -> None:
         try:
@@ -72,6 +74,25 @@ class JsonStore:
         for name, joints in DEFAULT_POSE_PRESETS.items():
             if name not in pose:
                 pose[name] = dict(joints)
+                changed = True
+        if changed and self.path.parent:
+            try:
+                self._write()
+            except OSError:
+                pass
+
+    def _ensure_default_hardware_presets(self) -> None:
+        hardware = self._data["presets"].setdefault("hardware", {})
+        changed = False
+        legacy_name = "Nothing connected"
+        if legacy_name in hardware and SYSTEM_HARDWARE_PRESET_NAME not in hardware:
+            hardware[SYSTEM_HARDWARE_PRESET_NAME] = hardware.pop(legacy_name)
+            if self._data["ui"].get("active_hardware_preset") == legacy_name:
+                self._data["ui"]["active_hardware_preset"] = SYSTEM_HARDWARE_PRESET_NAME
+            changed = True
+        for name, preset in DEFAULT_HARDWARE_PRESETS.items():
+            if name not in hardware:
+                hardware[name] = json.loads(json.dumps(preset))
                 changed = True
         if changed and self.path.parent:
             try:
@@ -123,9 +144,14 @@ class JsonStore:
         if kind not in PRESET_KINDS:
             raise KeyError(kind)
         with self._lock:
-            self._data["presets"][kind][key] = dict(payload)
+            existing = self._data["presets"][kind].get(key)
+            if isinstance(existing, dict) and existing.get("system"):
+                raise ValueError("cannot overwrite a system preset")
+            saved = dict(payload)
+            saved.pop("system", None)
+            self._data["presets"][kind][key] = saved
             self._write()
-            return dict(self._data["presets"][kind][key])
+            return dict(saved)
 
     def delete_preset(self, kind: str, name: str) -> None:
         if kind not in PRESET_KINDS:
@@ -133,8 +159,36 @@ class JsonStore:
         if kind == "pose" and name == "relax":
             raise ValueError("cannot delete the relax preset")
         with self._lock:
+            existing = self._data["presets"][kind].get(name)
+            if isinstance(existing, dict) and existing.get("system"):
+                raise ValueError("cannot delete a system preset")
             self._data["presets"][kind].pop(name, None)
+            if kind == "hardware" and self._data["ui"].get("active_hardware_preset") == name:
+                self._data["ui"].pop("active_hardware_preset", None)
             self._write()
+
+    def rename_preset(self, kind: str, name: str, new_name: str) -> dict[str, Any]:
+        if kind not in PRESET_KINDS:
+            raise KeyError(kind)
+        key = str(new_name).strip()
+        if not key:
+            raise ValueError("preset name is empty")
+        if kind == "pose" and name == "relax":
+            raise ValueError("cannot rename the relax preset")
+        with self._lock:
+            presets = self._data["presets"][kind]
+            existing = presets.get(name)
+            if not isinstance(existing, dict):
+                raise KeyError(name)
+            if existing.get("system"):
+                raise ValueError("cannot rename a system preset")
+            if key != name and key in presets:
+                raise ValueError("preset name already exists")
+            presets[key] = presets.pop(name)
+            if kind == "hardware" and self._data["ui"].get("active_hardware_preset") == name:
+                self._data["ui"]["active_hardware_preset"] = key
+            self._write()
+            return dict(presets[key])
 
     def episode_overrides(self, kind: str, source_id: str) -> dict[str, dict[str, Any]]:
         """Per-episode name / task / note for one video or dataset, keyed by episode index."""

@@ -42,6 +42,13 @@ def list_serial_ports() -> list[dict[str, Any]]:
     for item in comports() if comports else []:
         description = item.description or item.device
         hwid = getattr(item, "hwid", "") or ""
+        identity = {
+            "kind": "serial",
+            "hwid": hwid,
+            "port": item.device,
+            "manufacturer": getattr(item, "manufacturer", "") or "",
+            "description": description,
+        }
         ports.append(
             {
                 "port": item.device,
@@ -50,6 +57,8 @@ def list_serial_ports() -> list[dict[str, Any]]:
                 "hwid": hwid,
                 "manufacturer": getattr(item, "manufacturer", "") or "",
                 "likely": _likely(description, hwid, getattr(item, "manufacturer", "") or ""),
+                "identity": identity,
+                "device_key": f"serial:{hwid}" if hwid else f"port:{item.device}",
             }
         )
     ports.extend(_virtual_ports())

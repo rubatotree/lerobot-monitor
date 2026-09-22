@@ -232,6 +232,47 @@ def discover_sim_robots(use_cache: bool = True) -> list[dict[str, Any]]:
     return robots
 
 
+def sim_cameras(robot: dict[str, Any]) -> list[dict[str, Any]]:
+    """返回一台仿真机械臂公布的相机列表。
+
+    新协议使用复数 ``cameras``；旧注册表只有单数 ``camera``。这里把两者
+    归一化成同一形状，让相机管理器不需要理解协议版本。
+    """
+    raw = robot.get("cameras")
+    rows = raw if isinstance(raw, list) else []
+    if not rows:
+        single = robot.get("camera")
+        rows = [single] if isinstance(single, dict) else []
+
+    cameras: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get("url") or "").strip()
+        if not url:
+            continue
+        camera_id = str(row.get("id") or row.get("label") or f"camera_{index + 1}")
+        label = str(row.get("label") or camera_id)
+        target_fps = _positive_float(row.get("target_fps", row.get("fps")), 10.0)
+        cameras.append(
+            {
+                "id": camera_id,
+                "label": label,
+                "object_name": str(row.get("object_name") or ""),
+                "type": str(row.get("type") or "mjpeg"),
+                "url": url,
+                "width": _positive_int(row.get("width"), 640),
+                "height": _positive_int(row.get("height"), 480),
+                "fps": _positive_float(row.get("fps"), target_fps),
+                "target_fps": target_fps,
+                "quality": _positive_int(row.get("quality"), 80),
+                "enabled": bool(row.get("enabled", True)),
+                "clients": max(0, _positive_int(row.get("clients"), 0)),
+            }
+        )
+    return cameras
+
+
 def list_virtual_ports() -> list[dict[str, Any]]:
     """把仿真机械臂伪装成串口，形状与 :func:`ports.list_serial_ports` 一致。
 
@@ -243,22 +284,32 @@ def list_virtual_ports() -> list[dict[str, Any]]:
         if not is_virtual_port(port):
             continue
         status = robot.get("status") or {}
-        camera = robot.get("camera") or {}
+        cameras = sim_cameras(robot)
         rows.append(
             {
                 "port": port,
                 "name": f"{robot.get('type', 'sim')} ({robot.get('id', '?')})",
-                "description": _describe(robot, status, camera),
+                "description": _describe(robot, status, cameras),
                 "hwid": f"sim:{robot.get('type', '')}",
                 "manufacturer": "Blender",
                 "likely": True,
+                "identity": {
+                    "kind": "virtual",
+                    "role": str(robot.get("role", "robot")),
+                    "robot_id": str(robot.get("id") or ""),
+                    "robot_type": str(robot.get("type") or ""),
+                    "port": str(port),
+                },
+                "device_key": f"virtual:{robot.get('role', 'robot')}:{robot.get('id') or 'unknown'}",
                 # 以下字段超出真机串口的形状，前端可以忽略，调试面板会用到。
                 "virtual": True,
                 "role": robot.get("role", "robot"),
                 "robot_type": robot.get("type"),
                 "robot_id": robot.get("id"),
                 "busy": bool(status.get("connected")),
-                "camera_url": camera.get("url"),
+                "camera_url": cameras[0]["url"] if cameras else None,
+                "camera_count": len(cameras),
+                "cameras": cameras,
             }
         )
     rows.sort(key=lambda row: row["port"])
@@ -273,13 +324,32 @@ def describe_port(port: str) -> dict[str, Any] | None:
     return None
 
 
-def _describe(robot: dict[str, Any], status: dict[str, Any], camera: dict[str, Any]) -> str:
+def _describe(
+    robot: dict[str, Any], status: dict[str, Any], cameras: list[dict[str, Any]]
+) -> str:
     parts = [f"仿真 {robot.get('label') or robot.get('type', '?')}"]
     parts.append("主臂" if robot.get("role") == "leader" else "从臂")
     parts.append("已连接" if status.get("connected") else "空闲")
-    if camera.get("url"):
-        parts.append(f"相机 {camera['url']}")
+    if cameras:
+        parts.append(f"相机 {len(cameras)} 路")
+        parts.append(str(cameras[0]["url"]))
     return " · ".join(parts)
+
+
+def _positive_int(value: Any, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+def _positive_float(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
 
 
 def _now() -> float:

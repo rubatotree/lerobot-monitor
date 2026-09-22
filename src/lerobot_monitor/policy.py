@@ -127,7 +127,7 @@ def resolve_cached_policy_path(path: str, revision: str = "") -> str | None:
     if local_path.is_dir():
         return str(local_path.resolve())
     try:
-        from .library import cached_hub_snapshot
+        from .library import cached_hub_snapshot, is_policy_dir
         from .model_hub import parse_remote
 
         parsed = parse_remote(path, revision=revision)
@@ -135,7 +135,10 @@ def resolve_cached_policy_path(path: str, revision: str = "") -> str | None:
         return None
     if parsed.source != "huggingface":
         return None
-    return cached_hub_snapshot(parsed.repo_id, parsed.revision)
+    snapshot = cached_hub_snapshot(parsed.repo_id, parsed.revision)
+    if snapshot is None or not is_policy_dir(Path(snapshot)):
+        return None
+    return snapshot
 
 
 def load_policy(

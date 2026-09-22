@@ -17,6 +17,7 @@ from typing import Any, Callable, TextIO
 
 from .cameras import CameraHub
 from .config import MonitorConfig
+from .hardware import apply_hardware_preset
 from .leader import LeaderArm
 from .library import DatasetRecorder, VideoLibrary
 from .policy import (
@@ -204,6 +205,8 @@ class ControlLoop:
         self._last_bus_use = 0.0
         self._pending_release: str | None = None
         self._pending_release_reply: queue.Queue[dict[str, Any]] | None = None
+        self._hardware_apply_active = threading.Event()
+        self._hardware_apply_force = threading.Event()
         self._estop = threading.Event()
         self._ui_log_handler: logging.Handler | None = None
 
@@ -334,6 +337,22 @@ class ControlLoop:
         if self.on_snapshot is not None:
             self.on_snapshot(self.snapshot())
         return {"ok": True, "pending": pending, "mode": self.mode}
+
+    def force_current_hardware_apply(self) -> bool:
+        """Ask an in-flight hardware preset to skip relax waits immediately."""
+        if not self._hardware_apply_active.is_set():
+            return False
+        self._hardware_apply_force.set()
+        return True
+
+    def request_force_disconnect(
+        self,
+        role: str = "all",
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Release the selected bus immediately, without a relax pose."""
+        self._hardware_apply_force.set()
+        return self.submit("force_disconnect", {"role": role}, timeout=timeout)
 
     def _start_token(self, payload: dict[str, Any]) -> int:
         token = payload.get("_start_generation")
@@ -969,6 +988,9 @@ class ControlLoop:
             duration = max(self.config.control.jog_duration_s, 2.0)
             t0 = time.perf_counter()
             while True:
+                if self._hardware_apply_force.is_set():
+                    self.log("info", "relax wait interrupted by force request")
+                    break
                 alpha = (time.perf_counter() - t0) / max(duration, 1e-3)
                 pose = lerp_pose(current, goal, alpha)
                 self.follower.send_pose(pose)
@@ -1061,6 +1083,42 @@ class ControlLoop:
                 self.mode = "idle"
             self.leader.disconnect()
             self._reply(cmd, ok=True)
+        elif kind == "hardware_apply":
+            force = bool(p.get("force"))
+            self._hardware_apply_active.set()
+            if force:
+                self._hardware_apply_force.set()
+            else:
+                self._hardware_apply_force.clear()
+            try:
+                result = apply_hardware_preset(
+                    self,
+                    str(p.get("name") or "unnamed"),
+                    p.get("preset") if isinstance(p.get("preset"), dict) else {},
+                    force=force,
+                )
+            finally:
+                self._hardware_apply_active.clear()
+                self._hardware_apply_force.clear()
+            self._reply(cmd, **result)
+        elif kind == "force_disconnect":
+            role = str(p.get("role") or "all")
+            if role not in {"arm", "leader", "all"}:
+                raise ValueError(f"unknown force disconnect role '{role}'")
+            self._cancel.set()
+            with self._start_lock:
+                self._start_generation += 1
+            self.pending = None
+            self._close_writer()
+            self._end_rollout()
+            if role in {"arm", "all"}:
+                self._release_follower("force disconnect")
+            if role in {"leader", "all"}:
+                self.leader.disconnect()
+            if not self.follower.connected and self.mode != "estop":
+                self.mode = "offline"
+            self._hardware_apply_force.clear()
+            self._reply(cmd, ok=True, role=role)
         elif kind == "jog":
             self._require_no_debug_lease("jog")
             if self.pending in {"teleop_start", "record_start", "rollout_start", "capture_start"}:

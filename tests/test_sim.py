@@ -27,6 +27,7 @@ from lerobot_monitor.sim import (
     read_registry,
     registry_dir,
     registry_path,
+    sim_cameras,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -166,6 +167,60 @@ def test_list_virtual_ports_survives_robot_without_status_or_camera(registry_hom
     assert row["camera_url"] is None
     assert row["busy"] is False
     assert row["role"] == "robot"  # 缺省按从臂描述，不影响连接
+
+
+def test_sim_cameras_prefers_the_multi_camera_payload() -> None:
+    cameras = sim_cameras(
+        _robot_row(
+            cameras=[
+                {
+                    "id": "front",
+                    "label": "Front",
+                    "object_name": "Camera_Front",
+                    "url": "http://127.0.0.1:9300/video",
+                    "width": 1280,
+                    "height": 720,
+                    "target_fps": 15,
+                    "quality": 82,
+                },
+                {
+                    "id": "side",
+                    "url": "http://127.0.0.1:9301/video",
+                    "enabled": False,
+                },
+            ]
+        )
+    )
+    assert [camera["id"] for camera in cameras] == ["front", "side"]
+    assert cameras[0]["label"] == "Front"
+    assert cameras[0]["object_name"] == "Camera_Front"
+    assert cameras[0]["width"] == 1280
+    assert cameras[0]["target_fps"] == 15.0
+    assert cameras[1]["enabled"] is False
+
+
+def test_sim_cameras_falls_back_to_the_legacy_single_camera() -> None:
+    cameras = sim_cameras(_robot_row())
+    assert len(cameras) == 1
+    assert cameras[0]["url"] == "http://127.0.0.1:9300/stream"
+    assert cameras[0]["enabled"] is True
+
+
+def test_list_virtual_ports_reports_camera_count(registry_home: Path) -> None:
+    _write_registry(
+        [
+            _robot_row(
+                cameras=[
+                    {"id": "front", "url": "http://127.0.0.1:9300/video"},
+                    {"id": "side", "url": "http://127.0.0.1:9301/video"},
+                ]
+            )
+        ]
+    )
+    row = list_virtual_ports()[0]
+    assert row["camera_count"] == 2
+    assert len(row["cameras"]) == 2
+    assert "相机 2 路" in row["description"]
 
 
 def test_describe_port_finds_by_port(registry_home: Path) -> None:

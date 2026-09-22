@@ -27,6 +27,7 @@ from .preview import (
     local_episode_payload,
 )
 from .snapshots import SnapshotTooLargeError, _decode_camera_payloads
+from .store import PRESET_KINDS
 from .types import JOINT_ORDER
 
 STATIC_DIR = Path(__file__).resolve().parent / "web" / "static"
@@ -41,6 +42,19 @@ class JogBody(BaseModel):
 class PresetBody(BaseModel):
     name: str = "home"
     duration_s: float | None = None
+
+
+class PresetRenameBody(BaseModel):
+    name: str
+
+
+class HardwareApplyBody(BaseModel):
+    name: str
+    force: bool = False
+
+
+class ForceDisconnectBody(BaseModel):
+    role: str = "all"
 
 
 class HoldBody(BaseModel):
@@ -229,6 +243,7 @@ class UiStateBody(BaseModel):
     auto_record: bool | None = None
     selected_dataset: str | None = None
     selected_video: str | None = None
+    active_hardware_preset: str | None = None
 
 
 def _normalize_prefix(base_path: str) -> str:
@@ -1107,6 +1122,49 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         except (KeyError, ValueError) as exc:
             raise HTTPException(400, str(exc)) from exc
         return {"ok": True}
+
+    @router.post("/api/presets/{kind}/{name}/rename")
+    async def rename_preset(kind: str, name: str, body: PresetRenameBody) -> dict[str, Any]:
+        if kind not in PRESET_KINDS:
+            raise HTTPException(400, f"unknown preset kind '{kind}'")
+        try:
+            saved = await asyncio.to_thread(hub.store.rename_preset, kind, name, body.name)
+        except KeyError:
+            raise HTTPException(404, f"preset '{name}' not found") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return saved
+
+    @router.post("/api/hardware/apply")
+    async def apply_hardware(body: HardwareApplyBody) -> dict[str, Any]:
+        name = body.name.strip()
+        presets = hub.store.presets("hardware")
+        preset = presets.get(name)
+        if not isinstance(preset, dict):
+            raise HTTPException(404, f"hardware preset '{name}' not found")
+        if body.force and await asyncio.to_thread(hub.loop.force_current_hardware_apply):
+            return {"ok": True, "accepted": True, "forced": True}
+        result = await asyncio.to_thread(
+            hub.loop.submit,
+            "hardware_apply",
+            {"name": name, "preset": preset, "force": body.force},
+            45.0,
+        )
+        if not result.get("ok", False):
+            raise HTTPException(400, result.get("error") or "hardware preset failed")
+        ui = hub.store.ui()
+        ui["active_hardware_preset"] = name
+        await asyncio.to_thread(hub.store.save_ui, ui)
+        return result
+
+    @router.post("/api/hardware/force_disconnect")
+    async def force_disconnect(
+        body: ForceDisconnectBody = ForceDisconnectBody(),
+    ) -> dict[str, Any]:
+        result = await asyncio.to_thread(hub.loop.request_force_disconnect, body.role)
+        if not result.get("ok", False):
+            raise HTTPException(400, result.get("error") or "force disconnect failed")
+        return result
 
     @router.get("/api/ui")
     async def get_ui() -> dict[str, Any]:

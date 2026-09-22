@@ -292,6 +292,20 @@ def test_list_local_models_skips_dir_without_weights(tmp_path: Path, monkeypatch
     assert list_local_models([tmp_path / "models"]) == []
 
 
+def test_list_local_models_ignores_processor_safetensors(tmp_path: Path, monkeypatch) -> None:
+    _isolate_hf_home(tmp_path, monkeypatch)
+    partial = tmp_path / "models" / "partial"
+    partial.mkdir(parents=True)
+    (partial / "config.json").write_text(
+        '{"type": "smolvla", "input_features": {"observation.state": {}}, '
+        '"output_features": {"action": {}}}\n',
+        encoding="utf-8",
+    )
+    (partial / "policy_preprocessor_step_5_normalizer_processor.safetensors").write_bytes(b"x")
+    (partial / "policy_postprocessor_step_0_unnormalizer_processor.safetensors").write_bytes(b"x")
+    assert list_local_models([tmp_path / "models"]) == []
+
+
 def test_list_local_models_skips_generic_hf_model(tmp_path: Path, monkeypatch) -> None:
     hf = _isolate_hf_home(tmp_path, monkeypatch)
     generic = hf / "hub" / "models--openai--gpt2" / "snapshots" / "rev1"

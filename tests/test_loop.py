@@ -381,6 +381,42 @@ def test_disconnect_releases_directly_if_relax_send_fails(tmp_path: Path) -> Non
     assert reply.get(timeout=1) == {"ok": True}
 
 
+def test_force_disconnect_skips_relax_and_releases_both_buses(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop._park_relax_blocking = MagicMock()
+    loop.leader.connected = True
+
+    result = _dispatch(loop, "force_disconnect")
+
+    assert result == {"ok": True, "role": "all"}
+    loop._park_relax_blocking.assert_not_called()
+    loop.follower.disconnect.assert_called_once_with()
+    loop.leader.disconnect.assert_called_once_with()
+    assert loop.mode == "offline"
+
+
+def test_force_hardware_apply_only_signals_when_one_is_active(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+
+    assert loop.force_current_hardware_apply() is False
+    assert loop._hardware_apply_force.is_set() is False
+
+    loop._hardware_apply_active.set()
+    assert loop.force_current_hardware_apply() is True
+    assert loop._hardware_apply_force.is_set() is True
+
+
+def test_force_disconnect_leader_only_keeps_arm_connected(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.leader.connected = True
+
+    result = _dispatch(loop, "force_disconnect", {"role": "leader"})
+
+    assert result == {"ok": True, "role": "leader"}
+    loop.follower.disconnect.assert_not_called()
+    loop.leader.disconnect.assert_called_once_with()
+
+
 @pytest.mark.parametrize("kind,payload", [("record_start", {}), ("teleop_start", {"auto_record": True})])
 def test_stop_during_recorder_open_discards_unpublished_writer(
     tmp_path: Path,

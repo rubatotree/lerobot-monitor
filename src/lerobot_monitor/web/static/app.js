@@ -4,8 +4,10 @@ const JOINT_FALLBACK = [
 ];
 
 const PAL = ["#8b7cf7", "#6ea8ff", "#c084fc", "#5dba9a", "#e06b7a", "#7dd3fc"];
-const HIST = 180;
+const HISTORY_CAPACITY = 36000;
+const CHART_MAX_POINTS = 1200;
 const BASE = (document.documentElement.dataset.base || "/lerobot").replace(/\/$/, "");
+const WALL_CLOCK_OFFSET_S = Date.now() / 1000 - performance.now() / 1000;
 
 let meta = { joints: JOINT_FALLBACK, limits: {}, presets: {}, cameras: [] };
 let targets = {};
@@ -29,6 +31,12 @@ let videosCache = [];
 let datasetsCache = [];
 let snapshotsCache = [];
 let modelsCache = [];
+const librarySearch = {
+  videos: "",
+  datasets: "",
+  snapshots: "",
+  models: "",
+};
 let activeSnapshot = null;
 let snapshotActive = false;
 let snapshotCaptureBusy = false;
@@ -114,9 +122,51 @@ function observeMjpeg(img) {
   activateMjpeg(img);
 }
 
-const CHART_UPDATE_INTERVAL_MS = 150;
+const CHART_UPDATE_INTERVAL_MS = 16;
+const CHART_Y_LIMIT = 180;
+const LIVE_MODE_HISTORY_S = 600;
+const CHART_TOOLTIP_TOLERANCE_S = 0.35;
+const CHART_TIME_AXIS_FADE_MS = 140;
+const CHART_TIME_AXIS_PADDING = 18;
+const LIVE_RIGHT_PADDING_S = 0.2;
+const LIVE_FRAME_RATE = 30;
+const TIME_LABEL_EDGE_FADE_PX = 24;
+const TIME_LABEL_EDGE_GAP_PX = 8;
+const MODE_MARKER_LABEL_OFFSET_PX = 10;
+const TIME_TICK_STEPS_S = [
+  0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60,
+  120, 300, 600, 1200, 1800, 3600,
+];
+const chartLegendVisibility = {
+  command: true,
+  prediction: true,
+  gap: true,
+  mode: true,
+  now: true,
+  joints: new Map(),
+};
+const CHART_SCALE_OPTIONS = [
+  { seconds: 2, label: "2s" },
+  { seconds: 10, label: "10s" },
+  { seconds: 30, label: "30s" },
+  { seconds: 60, label: "1m" },
+  { seconds: 600, label: "10m" },
+];
+const CHART_SCALE_STORAGE_KEY = "lerobot-monitor-chart-scale";
 let chartUpdateTimer = null;
 const pendingChartUpdates = new Set();
+let liveModeMarkers = [];
+let lastDisplayMode = "";
+let chartTimeBasis = "wall";
+let chartScaleSeconds = 10;
+let chartAnimationFrame = null;
+let lastChartAnimationMs = 0;
+try {
+  const savedScale = Number(localStorage.getItem(CHART_SCALE_STORAGE_KEY));
+  if (CHART_SCALE_OPTIONS.some((option) => option.seconds === savedScale)) {
+    chartScaleSeconds = savedScale;
+  }
+} catch { /* ignore */ }
 
 function flushChartUpdates() {
   chartUpdateTimer = null;
@@ -127,6 +177,7 @@ function flushChartUpdates() {
 
 function scheduleChartUpdate(chart) {
   if (!chart || document.hidden) return;
+  if (!replayActive && chart.$timeAxis === true) return;
   pendingChartUpdates.add(chart);
   if (chartUpdateTimer) return;
   chartUpdateTimer = setTimeout(flushChartUpdates, CHART_UPDATE_INTERVAL_MS);
@@ -238,6 +289,895 @@ function positionReplayChartCursor(chart) {
   cursor.hidden = false;
 }
 
+function positionLiveNowCursor(chart) {
+  const cursor = chart && chart.$replayCursorElement;
+  const x = chart && chart.scales && chart.scales.x;
+  const area = chart && chart.chartArea;
+  const canvas = chart && chart.canvas;
+  const host = cursor && cursor.parentElement;
+  const time = Number(chart && chart.$nowTime);
+  if (
+    !cursor
+    || !x
+    || !area
+    || !canvas
+    || !host
+    || replayActive
+    || !chart.$showNowLine
+    || !Number.isFinite(time)
+  ) {
+    if (cursor) cursor.hidden = true;
+    return;
+  }
+  const canvasRect = canvas.getBoundingClientRect();
+  const hostRect = host.getBoundingClientRect();
+  if (!canvasRect.width || !canvasRect.height || !chart.width || !chart.height) {
+    cursor.hidden = true;
+    return;
+  }
+  const scaleX = canvasRect.width / chart.width;
+  const scaleY = canvasRect.height / chart.height;
+  let pixel = x.getPixelForValue(time);
+  if (!Number.isFinite(pixel) || pixel < area.left) {
+    cursor.hidden = true;
+    return;
+  }
+  pixel = Math.min(pixel, area.right);
+  cursor.style.left = `${canvasRect.left - hostRect.left + pixel * scaleX}px`;
+  cursor.style.top = `${canvasRect.top - hostRect.top + area.top * scaleY}px`;
+  cursor.style.height = `${Math.max(0, (area.bottom - area.top) * scaleY)}px`;
+  cursor.hidden = false;
+}
+
+function formatWallClockTime(seconds, milliseconds = false) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return "—";
+  const date = new Date(value * 1000);
+  const time = date.toLocaleTimeString([], {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  if (!milliseconds) return time;
+  return `${time}.${String(date.getMilliseconds()).padStart(3, "0")}`;
+}
+
+function formatDurationCompact(seconds, digits = 1) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return "—";
+  const duration = Math.max(0, value);
+  if (duration < 60) return `${duration.toFixed(digits)}s`;
+  const minutes = Math.floor(duration / 60);
+  const remainder = duration - minutes * 60;
+  return `${minutes}:${remainder.toFixed(digits).padStart(digits + 3, "0")}`;
+}
+
+function formatRelativeDuration(seconds, digits = 1) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return "—";
+  return value < 0
+    ? `-${formatDurationCompact(-value, digits)}`
+    : formatDurationCompact(value, digits);
+}
+
+function chartModeEpoch(chart, seconds) {
+  const value = Number(seconds);
+  let epoch = Number(chart && chart.$historyStart);
+  (chart && chart.$modeMarkers || []).forEach((marker) => {
+    const markerTime = Number(marker.x);
+    if (!Number.isFinite(markerTime) || markerTime > value) return;
+    if (!Number.isFinite(epoch) || markerTime > epoch) epoch = markerTime;
+  });
+  return Number.isFinite(epoch) ? epoch : value;
+}
+
+function formatChartTimeValue(seconds, chart, milliseconds = false) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return "—";
+  const basis = replayActive ? "start" : ((chart && chart.$timeBasis) || chartTimeBasis);
+  const digits = milliseconds ? 3 : 1;
+  if (basis === "wall") return formatWallClockTime(value, milliseconds);
+  if (basis === "mode") {
+    const elapsed = value - chartModeEpoch(chart, value);
+    return `${elapsed >= 0 ? "+" : ""}${formatRelativeDuration(elapsed, digits)}`;
+  }
+  const historyStart = Number(chart && chart.$historyStart);
+  const start = Number.isFinite(historyStart) ? historyStart : (replayActive ? 0 : value);
+  const elapsed = value - start;
+  const formatted = formatRelativeDuration(elapsed, digits);
+  return replayActive ? formatted : `${elapsed >= 0 ? "+" : ""}${formatted}`;
+}
+
+function chartTimeTicks(chart, scale) {
+  const min = Number(scale && scale.min);
+  const max = Number(scale && scale.max);
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return [];
+  const span = max - min;
+  const targetStep = span / 6;
+  const step = TIME_TICK_STEPS_S.find((candidate) => candidate >= targetStep)
+    || 10 ** Math.ceil(Math.log10(targetStep));
+  const basis = replayActive ? "start" : ((chart && chart.$timeBasis) || chartTimeBasis);
+  let origin = 0;
+  if (basis === "mode") origin = chartModeEpoch(chart, min);
+  else if (basis === "start") {
+    const historyStart = Number(chart && chart.$historyStart);
+    origin = Number.isFinite(historyStart) ? historyStart : 0;
+  }
+  const first = origin + Math.ceil((min - origin) / step) * step;
+  const ticks = [];
+  for (let value = first; value <= max + step * 1e-6 && ticks.length < 20; value += step) {
+    ticks.push({
+      value,
+      x: scale.getPixelForValue(value),
+      label: formatChartTimeValue(value, chart),
+    });
+  }
+  return ticks;
+}
+
+function nearestChartPoint(points, seconds, tolerance, endIndex = points.length) {
+  if (!Array.isArray(points) || !points.length) return null;
+  const limit = Math.max(0, Math.min(endIndex, points.length));
+  if (!limit) return null;
+  const target = Number(seconds);
+  if (!Number.isFinite(target)) return null;
+  let low = 0;
+  let high = limit - 1;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    const middleTime = Number(points[middle] && points[middle].x);
+    if (!Number.isFinite(middleTime) || middleTime < target) low = middle + 1;
+    else high = middle;
+  }
+  let nearest = null;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (let index = Math.max(0, low - 1); index <= Math.min(limit - 1, low + 1); index += 1) {
+    const point = points[index];
+    const pointTime = Number(point && point.x);
+    const pointValue = Number(point && point.y);
+    if (!Number.isFinite(pointTime) || !Number.isFinite(pointValue)) continue;
+    const distance = Math.abs(pointTime - target);
+    if (distance < nearestDistance) {
+      nearest = point;
+      nearestDistance = distance;
+    }
+  }
+  return nearestDistance <= Number(tolerance) ? nearest : null;
+}
+
+function interpolatedChartPoint(points, seconds, endIndex = points.length, tolerance = Number.POSITIVE_INFINITY) {
+  if (!Array.isArray(points) || !points.length) return null;
+  const limit = Math.max(0, Math.min(endIndex, points.length));
+  if (!limit) return null;
+  const target = Number(seconds);
+  if (!Number.isFinite(target)) return null;
+  const nextIndex = lowerBoundPointTime(points, target, limit);
+  if (nextIndex <= 0 || nextIndex >= limit) {
+    return nearestChartPoint(points, target, tolerance, limit);
+  }
+  const previous = points[nextIndex - 1];
+  const next = points[nextIndex];
+  const previousTime = Number(previous && previous.x);
+  const nextTime = Number(next && next.x);
+  const previousValue = Number(previous && previous.y);
+  const nextValue = Number(next && next.y);
+  if (
+    !Number.isFinite(previousTime)
+    || !Number.isFinite(nextTime)
+    || !Number.isFinite(previousValue)
+    || !Number.isFinite(nextValue)
+    || nextTime <= previousTime
+  ) {
+    return nearestChartPoint(points, target, tolerance, limit);
+  }
+  const ratio = Math.max(0, Math.min(1, (target - previousTime) / (nextTime - previousTime)));
+  return {
+    x: target,
+    y: previousValue + ratio * (nextValue - previousValue),
+  };
+}
+
+function lastChartPointAtOrBefore(points, seconds) {
+  if (!Array.isArray(points) || !points.length) return null;
+  const target = Number(seconds);
+  if (!Number.isFinite(target)) return null;
+  let low = 0;
+  let high = points.length - 1;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const middleTime = Number(points[middle] && points[middle].x);
+    if (!Number.isFinite(middleTime) || middleTime <= target) low = middle;
+    else high = middle - 1;
+  }
+  for (let index = low; index >= 0; index -= 1) {
+    const point = points[index];
+    if (Number.isFinite(Number(point && point.y))) return point;
+  }
+  return null;
+}
+
+function lowerBoundPointTime(points, target, endIndex = points.length) {
+  let low = 0;
+  let high = Math.max(0, Math.min(endIndex, points.length));
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (Number(points[middle].x) < target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function interpolateScaleValueFromTicks(scale, pixel) {
+  const targetPixel = Number(pixel);
+  if (!scale || !Number.isFinite(targetPixel)) return Number.NaN;
+  const ticks = (scale.ticks || [])
+    .map((tick) => ({
+      value: Number(tick.value),
+      pixel: scale.getPixelForValue(Number(tick.value)),
+    }))
+    .filter((tick) => Number.isFinite(tick.value) && Number.isFinite(tick.pixel))
+    .sort((left, right) => left.pixel - right.pixel);
+  if (!ticks.length) return scale.getValueForPixel(targetPixel);
+  if (targetPixel <= ticks[0].pixel) return ticks[0].value;
+  for (let index = 1; index < ticks.length; index += 1) {
+    const previous = ticks[index - 1];
+    const next = ticks[index];
+    if (targetPixel > next.pixel) continue;
+    if (next.pixel <= previous.pixel) return previous.value;
+    const ratio = (targetPixel - previous.pixel) / (next.pixel - previous.pixel);
+    return previous.value + ratio * (next.value - previous.value);
+  }
+  return ticks[ticks.length - 1].value;
+}
+
+function leftBoundaryPoint(points, minTime, endIndex = points.length) {
+  if (!Array.isArray(points) || !points.length) return null;
+  const limit = Math.max(0, Math.min(endIndex, points.length));
+  if (!limit) return null;
+  const index = lowerBoundPointTime(points, minTime, limit);
+  if (index <= 0) return null;
+  const previous = points[index - 1];
+  const next = index < limit ? points[index] : previous;
+  const previousTime = Number(previous.x);
+  const nextTime = Number(next.x);
+  const previousValue = Number(previous.y);
+  const nextValue = Number(next.y);
+  if (!Number.isFinite(previousTime) || !Number.isFinite(nextTime)) return null;
+  if (!Number.isFinite(previousValue) || !Number.isFinite(nextValue)) return null;
+  if (nextTime <= previousTime) return { x: minTime, y: previousValue };
+  const ratio = Math.max(0, Math.min(1, (minTime - previousTime) / (nextTime - previousTime)));
+  return { x: minTime, y: previousValue + ratio * (nextValue - previousValue) };
+}
+
+function decimateVisibleSeries(
+  points,
+  minTime,
+  maxTime,
+  maxPoints = CHART_MAX_POINTS,
+  endIndex = points.length,
+) {
+  if (!Array.isArray(points) || !points.length) return [];
+  const limit = Math.max(0, Math.min(endIndex, points.length));
+  if (!limit) return [];
+  const start = lowerBoundPointTime(points, minTime, limit);
+  let low = start;
+  let high = limit;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (Number(points[middle].x) <= maxTime) low = middle + 1;
+    else high = middle;
+  }
+  const end = Math.min(low, limit);
+  const count = end - start;
+  if (count <= 0) return [];
+  if (count <= maxPoints) return points.slice(start, end);
+  const sampled = [];
+  const bucketSize = Math.max(chartScaleSeconds / maxPoints, 0.001);
+  let previousBucket = null;
+  for (let index = start; index < end; index += 1) {
+    const point = points[index];
+    const bucket = Math.floor(Number(point.x) / bucketSize);
+    if (bucket !== previousBucket) {
+      sampled.push(point);
+      previousBucket = bucket;
+    } else {
+      sampled[sampled.length - 1] = point;
+    }
+  }
+  return sampled;
+}
+
+function applyLeftBoundary(dataset, minTime, endIndex) {
+  const data = dataset.data || (dataset.data = []);
+  if (data.length && data[0].$boundary) data.shift();
+  while (data.length && Number(data[0].x) < minTime) data.shift();
+  const boundary = leftBoundaryPoint(dataset.$raw || [], minTime, endIndex);
+  if (!boundary) return;
+  if (data.length && Number(data[0].x) <= minTime + 1e-6) return;
+  data.unshift({ x: boundary.x, y: boundary.y, $boundary: true });
+}
+
+function refreshLiveChartSeries(chart, now) {
+  if (!chart || chart.$timeAxis !== true) return;
+  const future = rolloutFutureWindowS(now);
+  const minTime = now - chartScaleSeconds;
+  const maxTime = now + future;
+  (chart.$live || []).forEach((dataset) => {
+    const raw = dataset.$raw || [];
+    const visible = decimateVisibleSeries(raw, minTime, maxTime);
+    const lastVisible = visible.length ? visible[visible.length - 1] : null;
+    if (lastVisible && Number.isFinite(lastVisible.y) && lastVisible.x < now) {
+      visible.push({ x: now, y: lastVisible.y, $hold: true });
+    }
+    dataset.data = visible;
+    applyLeftBoundary(dataset, minTime, raw.length);
+  });
+  chart.$historyEnd = now;
+}
+
+function liveWallClockNow() {
+  return WALL_CLOCK_OFFSET_S + performance.now() / 1000;
+}
+
+function animateLiveCharts(frameMs) {
+  if (document.hidden || replayActive) {
+    [stateChart, actionChart].forEach((chart) => {
+      if (!chart) return;
+      chart.$lastAnimationNow = Number.NaN;
+      chart.$pendingAnimationNow = Number.NaN;
+      chart.$lastRenderedNow = Number.NaN;
+    });
+  } else if (frameMs - lastChartAnimationMs >= CHART_UPDATE_INTERVAL_MS) {
+    lastChartAnimationMs = frameMs;
+    const now = liveWallClockNow();
+    const currentSlot = Math.floor(now * LIVE_FRAME_RATE) / LIVE_FRAME_RATE;
+    [stateChart, actionChart].forEach((chart) => {
+      if (!chart || chart.$timeAxis !== true) return;
+      const renderNow = Number.isFinite(Number(chart.$pendingAnimationNow))
+        ? Number(chart.$pendingAnimationNow)
+        : currentSlot - 1 / LIVE_FRAME_RATE;
+      chart.$pendingAnimationNow = currentSlot;
+      chart.$lastAnimationNow = currentSlot;
+      if (renderNow === Number(chart.$lastRenderedNow)) return;
+      chart.$lastRenderedNow = renderNow;
+      refreshLiveChartSeries(chart, renderNow);
+      chart.$nowTime = renderNow;
+      chart.$showNowLine = showLiveNowLine();
+      chart.options.scales.x = liveTimeAxis(renderNow);
+      chart.update("none");
+      positionLiveNowCursor(chart);
+    });
+  }
+  chartAnimationFrame = requestAnimationFrame(animateLiveCharts);
+}
+
+function chartTooltipModel(chart, seconds) {
+  const rawTarget = Number(seconds);
+  if (!chart || !Number.isFinite(rawTarget)) return null;
+  const target = snapChartTimeToFrame(chart, rawTarget);
+  const fixedFrames = chart.$timeAxis === false;
+  const tolerance = Number(chart.$tooltipToleranceS) || CHART_TOOLTIP_TOLERANCE_S;
+  const actualCutoff = chartActualCutoff(chart);
+  const actualEligible = rawTarget <= actualCutoff + 1e-6;
+  const gap = (chart.$predictionGaps || []).find((entry) => {
+    const start = Math.min(Number(entry.start), Number(entry.end));
+    const end = Math.max(Number(entry.start), Number(entry.end));
+    return target >= start && target <= end;
+  });
+  const actual = new Map();
+  const predicted = new Map();
+  const actualVisible = new Map();
+  const predictedVisible = new Map();
+  (chart.data.datasets || []).forEach((dataset) => {
+    if (!dataset || !Array.isArray(dataset.data) || !dataset.data.length) return;
+    const label = String(dataset.label || "");
+    const isPrediction = !!dataset.$prediction || label.endsWith(" · pred");
+    const name = label.replace(/ · pred$/, "");
+    if (!name) return;
+    const visible = isDatasetLegendVisible(dataset);
+    const points = dataset.$raw || dataset.data;
+    let point = null;
+    if (!isPrediction && actualEligible) {
+      point = fixedFrames
+        ? nearestChartPoint(points, target, Number.POSITIVE_INFINITY, points.length)
+        : interpolatedChartPoint(points, target, points.length, tolerance);
+      if (!point && !fixedFrames) point = lastChartPointAtOrBefore(points, target);
+    } else if (isPrediction) {
+      point = fixedFrames
+        ? nearestChartPoint(
+          dataset.data,
+          target,
+          Math.max(tolerance * 2, 0.1),
+          dataset.data.length,
+        )
+        : interpolatedChartPoint(dataset.data, target, dataset.data.length, tolerance * 2);
+    }
+    if (!point) return;
+    (isPrediction ? predicted : actual).set(name, point);
+    (isPrediction ? predictedVisible : actualVisible).set(name, visible);
+  });
+  const known = jointNames();
+  const names = [...new Set([...actual.keys(), ...predicted.keys()])]
+    .sort((left, right) => {
+      const leftIndex = known.indexOf(left);
+      const rightIndex = known.indexOf(right);
+      return (leftIndex < 0 ? known.length : leftIndex) - (rightIndex < 0 ? known.length : rightIndex);
+    });
+  if (!names.length) return null;
+  return {
+    gap: !!gap,
+    rows: names.map((name) => ({
+      name,
+      actual: actual.get(name) || null,
+      predicted: predicted.get(name) || null,
+      actualVisible: actual.has(name) && actualVisible.get(name) !== false,
+      predictedVisible: predicted.has(name) && predictedVisible.get(name) !== false,
+    })),
+    time: target,
+  };
+}
+
+function chartActualCutoff(chart) {
+  const liveNow = Number(chart && chart.$nowTime);
+  if (chart && chart.$timeAxis === true && Number.isFinite(liveNow)) return liveNow;
+  let cutoff = Number.NEGATIVE_INFINITY;
+  (chart && chart.data.datasets || []).forEach((dataset) => {
+    if (!dataset || dataset.$prediction || String(dataset.label || "").endsWith(" · pred")) return;
+    const points = dataset.$raw || dataset.data || [];
+    for (let index = points.length - 1; index >= 0; index -= 1) {
+      const pointTime = Number(points[index] && points[index].x);
+      if (!Number.isFinite(pointTime)) continue;
+      cutoff = Math.max(cutoff, pointTime);
+      break;
+    }
+  });
+  return cutoff;
+}
+
+function snapChartTimeToFrame(chart, seconds) {
+  const target = Number(seconds);
+  if (!chart || chart.$timeAxis !== false || !Number.isFinite(target)) return target;
+  const frames = Array.isArray(chart.$frameTimes) ? chart.$frameTimes : [];
+  if (!frames.length) return target;
+  let low = 0;
+  let high = frames.length - 1;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (Number(frames[middle]) < target) low = middle + 1;
+    else high = middle;
+  }
+  const next = Number(frames[low]);
+  const previous = Number(frames[Math.max(0, low - 1)]);
+  if (!Number.isFinite(previous)) return next;
+  if (!Number.isFinite(next)) return previous;
+  return Math.abs(target - previous) <= Math.abs(next - target) ? previous : next;
+}
+
+function hideChartHoverTooltip(chart) {
+  const tooltip = chart && chart.$hoverTooltipElement;
+  if (!tooltip) return;
+  if (chart.$tooltipFrame) {
+    cancelAnimationFrame(chart.$tooltipFrame);
+    chart.$tooltipFrame = null;
+  }
+  chart.$tooltipRequest = null;
+  tooltip.hidden = true;
+  delete tooltip.dataset.timeValue;
+}
+
+function positionChartHoverTooltip(chart, pointerX, pointerY) {
+  const tooltip = chart && chart.$hoverTooltipElement;
+  const host = tooltip && tooltip.parentElement;
+  const canvas = chart && chart.canvas;
+  if (!tooltip || !host || !canvas) return;
+  const canvasRect = canvas.getBoundingClientRect();
+  const hostRect = host.getBoundingClientRect();
+  const tooltipWidth = tooltip.offsetWidth;
+  const tooltipHeight = tooltip.offsetHeight;
+  let left = canvasRect.left - hostRect.left + pointerX + 12;
+  let top = canvasRect.top - hostRect.top + pointerY + 12;
+  if (left + tooltipWidth > hostRect.width - 4) {
+    left = canvasRect.left - hostRect.left + pointerX - tooltipWidth - 12;
+  }
+  if (top + tooltipHeight > hostRect.height - 4) {
+    top = canvasRect.top - hostRect.top + pointerY - tooltipHeight - 12;
+  }
+  tooltip.style.left = `${Math.max(4, Math.min(left, hostRect.width - tooltipWidth - 4))}px`;
+  tooltip.style.top = `${Math.max(4, Math.min(top, hostRect.height - tooltipHeight - 4))}px`;
+}
+
+function formatTooltipValue(value) {
+  if (value == null || value === "") return "—";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  const magnitude = Math.abs(number);
+  const digits = magnitude >= 100 ? 2 : magnitude >= 10 ? 3 : 4;
+  return number.toFixed(digits);
+}
+
+function buildChartHoverTooltip(chart, model) {
+  const tooltip = chart.$hoverTooltipElement;
+  tooltip.replaceChildren();
+  const header = document.createElement("div");
+  header.className = "chart-tooltip-header";
+  const time = document.createElement("span");
+  time.className = "chart-tooltip-time";
+  time.textContent = formatChartTimeValue(model.time, chart, true);
+  header.appendChild(time);
+  if (model.gap) {
+    const gap = document.createElement("span");
+    gap.className = "chart-tooltip-gap";
+    gap.textContent = "gap";
+    header.appendChild(gap);
+  }
+  const grid = document.createElement("div");
+  grid.className = "chart-tooltip-grid";
+  ["joint", "actual", "pred"].forEach((label) => {
+    const cell = document.createElement("span");
+    cell.className = "chart-tooltip-head";
+    cell.textContent = label;
+    grid.appendChild(cell);
+  });
+  chart.$tooltipActualCells = [];
+  chart.$tooltipPredictionCells = [];
+  model.rows.forEach((row) => {
+    const name = document.createElement("span");
+    name.textContent = row.name;
+    const actual = document.createElement("span");
+    actual.className = "chart-tooltip-actual";
+    const predicted = document.createElement("span");
+    predicted.className = "chart-tooltip-pred";
+    grid.append(name, actual, predicted);
+    chart.$tooltipActualCells.push(actual);
+    chart.$tooltipPredictionCells.push(predicted);
+  });
+  tooltip.append(header, grid);
+}
+
+function renderChartHoverTooltip(chart, seconds, pointerX, pointerY) {
+  const tooltip = chart && chart.$hoverTooltipElement;
+  if (!tooltip || chart.$tooltipVisible === false) return;
+  const model = chartTooltipModel(chart, seconds);
+  if (!model) {
+    hideChartHoverTooltip(chart);
+    return;
+  }
+  const structure = [
+    model.gap ? "gap" : "no-gap",
+    model.rows.map((row) => row.name).join("|"),
+  ].join("::");
+  if (tooltip.dataset.structure !== structure) {
+    buildChartHoverTooltip(chart, model);
+    tooltip.dataset.structure = structure;
+  }
+  const time = tooltip.querySelector(".chart-tooltip-time");
+  if (time) time.textContent = formatChartTimeValue(model.time, chart, true);
+  const gap = tooltip.querySelector(".chart-tooltip-gap");
+  if (gap) gap.hidden = !model.gap;
+  model.rows.forEach((row, index) => {
+    const actual = chart.$tooltipActualCells && chart.$tooltipActualCells[index];
+    const predicted = chart.$tooltipPredictionCells && chart.$tooltipPredictionCells[index];
+    if (actual) {
+      actual.textContent = formatTooltipValue(row.actual && row.actual.y);
+      actual.title = row.actual ? "Latest actual value at or before this time" : "";
+      actual.classList.toggle("muted", !row.actualVisible);
+    }
+    if (predicted) {
+      predicted.textContent = formatTooltipValue(row.predicted && row.predicted.y);
+      predicted.classList.toggle("muted", !row.predictedVisible);
+    }
+  });
+  tooltip.dataset.timeValue = String(model.time);
+  tooltip.hidden = false;
+  positionChartHoverTooltip(chart, pointerX, pointerY);
+}
+
+function scheduleChartHoverTooltip(chart, seconds, pointerX, pointerY) {
+  if (chart.$tooltipVisible === false) return;
+  chart.$tooltipRequest = { seconds, pointerX, pointerY };
+  if (chart.$tooltipFrame) return;
+  chart.$tooltipFrame = requestAnimationFrame(() => {
+    chart.$tooltipFrame = null;
+    const request = chart.$tooltipRequest;
+    chart.$tooltipRequest = null;
+    if (!request || !chart.$pointerPosition || !chart.$pointerPosition.inside) return;
+    renderChartHoverTooltip(chart, request.seconds, request.pointerX, request.pointerY);
+  });
+}
+
+const chartHoverTooltipPlugin = {
+  id: "hoverTooltip",
+  afterEvent(chart, args) {
+    const event = args.event;
+    if (!event) return;
+    if (event.type === "mouseout") {
+      chart.$pointerPosition = null;
+      hideChartHoverTooltip(chart);
+      if (chart.$timeAxis === false) chart.draw();
+      return;
+    }
+    if (!["mousemove", "mouseover", "touchstart", "touchmove"].includes(event.type)) return;
+    const xScale = chart.scales && chart.scales.x;
+    const area = chart.chartArea;
+    const pointerX = Number(event.x);
+    const pointerY = Number(event.y);
+    if (!xScale || !area || !Number.isFinite(pointerX) || !Number.isFinite(pointerY)) {
+      chart.$pointerPosition = null;
+      hideChartHoverTooltip(chart);
+      return;
+    }
+    if (pointerX < area.left || pointerX > area.right || pointerY < area.top || pointerY > area.bottom) {
+      chart.$pointerPosition = null;
+      hideChartHoverTooltip(chart);
+      return;
+    }
+    chart.$pointerPosition = { x: pointerX, y: pointerY, inside: true };
+    const seconds = snapChartTimeToFrame(chart, xScale.getValueForPixel(pointerX));
+    scheduleChartHoverTooltip(chart, seconds, pointerX, pointerY);
+    if (chart.$timeAxis === false) chart.draw();
+  },
+};
+
+const predictionGapPlugin = {
+  id: "predictionGap",
+  beforeDatasetsDraw(chart) {
+    if (chartLegendVisibility.gap === false) return;
+    const gaps = chart.$predictionGaps || [];
+    if (!gaps.length) return;
+    const xScale = chart.scales && chart.scales.x;
+    const area = chart.chartArea;
+    if (!xScale || !area) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.fillStyle = "rgba(224, 107, 122, 0.16)";
+    gaps.forEach((gap) => {
+      const start = Number(gap.start);
+      const end = Number(gap.end);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+      const left = Math.max(area.left, Math.min(xScale.getPixelForValue(start), xScale.getPixelForValue(end)));
+      const right = Math.min(area.right, Math.max(xScale.getPixelForValue(start), xScale.getPixelForValue(end)));
+      if (right <= left) return;
+      ctx.fillRect(left, area.top, right - left, area.bottom - area.top);
+    });
+    ctx.restore();
+  },
+};
+
+const modeMarkerPlugin = {
+  id: "modeMarkers",
+  beforeDatasetsDraw(chart) {
+    if (replayActive || chartLegendVisibility.mode === false) return;
+    const markers = chart.$modeMarkers || [];
+    if (!markers.length) return;
+    const xScale = chart.scales && chart.scales.x;
+    const area = chart.chartArea;
+    if (!xScale || !area) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.strokeStyle = "rgba(168, 166, 184, 0.72)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([]);
+    markers.forEach((marker) => {
+      const x = xScale.getPixelForValue(Number(marker.x));
+      if (!Number.isFinite(x) || x < area.left || x > area.right) return;
+      ctx.beginPath();
+      ctx.moveTo(x, area.top);
+      ctx.lineTo(x, area.bottom);
+      ctx.stroke();
+      if (chart.canvas.id !== "chart-action") return;
+      const label = String(marker.mode || "");
+      if (!label) return;
+      ctx.save();
+      ctx.fillStyle = "rgba(197, 195, 210, 0.92)";
+      ctx.font = "8px IBM Plex Mono";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "bottom";
+      ctx.translate(x + MODE_MARKER_LABEL_OFFSET_PX, area.bottom - 4);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText(label, 0, 0);
+      ctx.restore();
+    });
+    ctx.restore();
+  },
+  afterDatasetsDraw(chart) {
+    if (replayActive || chartLegendVisibility.mode === false || chart.$timeBasis !== "mode") return;
+    const markers = chart.$modeMarkers || [];
+    if (!markers.length) return;
+    const xScale = chart.scales && chart.scales.x;
+    const area = chart.chartArea;
+    if (!xScale || !area) return;
+    const ctx = chart.ctx;
+    chart.$modeZeroLabels = [];
+    ctx.save();
+    ctx.fillStyle = "rgba(211, 208, 224, 0.96)";
+    ctx.font = "8px IBM Plex Mono";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    markers.forEach((marker) => {
+      const x = xScale.getPixelForValue(Number(marker.x));
+      if (!Number.isFinite(x) || x < area.left || x > area.right) return;
+      const labelX = Math.max(area.left + 6, Math.min(area.right - 6, x));
+      ctx.fillText("0s", labelX, area.top + 2);
+      chart.$modeZeroLabels.push({ x: labelX, mode: marker.mode });
+    });
+    ctx.restore();
+  },
+};
+
+const pixelAlignedLinePlugin = {
+  id: "pixelAlignedLine",
+  beforeDatasetsDraw(chart) {
+    const devicePixelRatio = Math.max(1, Number(chart.currentDevicePixelRatio) || 1);
+    chart.data.datasets.forEach((_dataset, datasetIndex) => {
+      const meta = chart.getDatasetMeta(datasetIndex);
+      if (!meta || meta.hidden) return;
+      meta.data.forEach((element) => {
+        const x = Number(element && element.x);
+        const y = Number(element && element.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        element.x = Math.round(x * devicePixelRatio) / devicePixelRatio;
+        element.y = (Math.round(y * devicePixelRatio) + 0.5) / devicePixelRatio;
+      });
+    });
+  },
+};
+
+const timeAxisFadePlugin = {
+  id: "timeAxisFade",
+  beforeDatasetsDraw(chart) {
+    const scale = chart.scales && chart.scales.x;
+    const area = chart.chartArea;
+    if (!scale || !area) return;
+    const ticks = chartTimeTicks(chart, scale);
+    if (!ticks.length) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.strokeStyle = "#171a28";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([]);
+    ticks.forEach((tick) => {
+      const x = Math.round(tick.x) + 0.5;
+      if (x < area.left || x > area.right) return;
+      ctx.beginPath();
+      ctx.moveTo(x, area.top);
+      ctx.lineTo(x, area.bottom);
+      ctx.stroke();
+    });
+    ctx.restore();
+  },
+  afterDraw(chart) {
+    const scale = chart.scales && chart.scales.x;
+    const area = chart.chartArea;
+    if (!scale || !area) return;
+    const ticks = chartTimeTicks(chart, scale);
+    if (!ticks.length) return;
+    chart.$drawnTimeTicks = ticks;
+    const font = scale.options.ticks.font || {};
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.fillStyle = "#85819c";
+    ctx.font = `${font.size || 9}px ${font.family || "IBM Plex Mono"}`;
+    ctx.textBaseline = "top";
+    const leftLabel = formatChartTimeValue(scale.min, chart);
+    const rightLabel = formatChartTimeValue(scale.max, chart);
+    const leftEndpointRight = area.left + 2 + ctx.measureText(leftLabel).width;
+    const rightEndpointLeft = area.right - 2 - ctx.measureText(rightLabel).width;
+    const tickHalfWidth = ticks.reduce(
+      (halfWidth, tick) => Math.max(halfWidth, ctx.measureText(tick.label).width / 2),
+      0,
+    );
+    const leftClear = leftEndpointRight + TIME_LABEL_EDGE_GAP_PX + tickHalfWidth;
+    const rightClear = rightEndpointLeft - TIME_LABEL_EDGE_GAP_PX - tickHalfWidth;
+    ctx.textAlign = "center";
+    ticks.forEach((tick) => {
+      const x = Math.round(tick.x);
+      const leftAlpha = Math.max(
+        0,
+        Math.min(1, (x - leftClear) / TIME_LABEL_EDGE_FADE_PX),
+      );
+      const rightAlpha = Math.max(
+        0,
+        Math.min(1, (rightClear - x) / TIME_LABEL_EDGE_FADE_PX),
+      );
+      const alpha = Math.min(leftAlpha, rightAlpha);
+      if (alpha <= 0.01) return;
+      ctx.globalAlpha = alpha;
+      ctx.fillText(tick.label, x, area.bottom + 7);
+    });
+    ctx.globalAlpha = 1;
+    ctx.textAlign = "left";
+    ctx.fillText(leftLabel, area.left + 2, area.bottom + 7);
+    ctx.textAlign = "right";
+    ctx.fillText(rightLabel, area.right - 2, area.bottom + 7);
+    ctx.restore();
+  },
+};
+
+const pointerValuePlugin = {
+  id: "pointerValue",
+  afterDatasetsDraw(chart) {
+    const pointer = chart.$pointerPosition;
+    const xScale = chart.scales && chart.scales.x;
+    const yScale = chart.scales && chart.scales.y;
+    const area = chart.chartArea;
+    if (!pointer || !pointer.inside || !xScale || !yScale || !area) return;
+    const value = interpolateScaleValueFromTicks(yScale, pointer.y);
+    if (!Number.isFinite(value)) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.strokeStyle = "rgba(205, 202, 220, 0.28)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(area.left, pointer.y);
+    ctx.lineTo(area.right, pointer.y);
+    ctx.stroke();
+    const rawTarget = xScale.getValueForPixel(pointer.x);
+    const target = snapChartTimeToFrame(chart, rawTarget);
+    const targetX = chart.$timeAxis === false ? xScale.getPixelForValue(target) : pointer.x;
+    ctx.beginPath();
+    ctx.moveTo(targetX, area.top);
+    ctx.lineTo(targetX, area.bottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const tolerance = Number(chart.$tooltipToleranceS) || CHART_TOOLTIP_TOLERANCE_S;
+    const actualCutoff = chartActualCutoff(chart);
+    const actualEligible = rawTarget <= actualCutoff + 1e-6;
+    const fixedFrames = chart.$timeAxis === false;
+    (chart.data.datasets || []).forEach((dataset) => {
+      if (!dataset || !Array.isArray(dataset.data) || !dataset.data.length) return;
+      if (!isDatasetLegendVisible(dataset)) return;
+      const label = String(dataset.label || "");
+      const isPrediction = !!dataset.$prediction || label.endsWith(" · pred");
+      if (!isPrediction && !actualEligible) return;
+      const points = isPrediction ? dataset.data : (dataset.$raw || dataset.data);
+      let point = fixedFrames
+        ? nearestChartPoint(
+          points,
+          target,
+          isPrediction ? Math.max(tolerance * 2, 0.1) : Number.POSITIVE_INFINITY,
+          points.length,
+        )
+        : interpolatedChartPoint(
+          points,
+          target,
+          points.length,
+          tolerance * (isPrediction ? 2 : 1),
+        );
+      if (!point && !isPrediction && !fixedFrames) point = lastChartPointAtOrBefore(points, target);
+      if (!point || !Number.isFinite(Number(point.y))) return;
+      const pointY = yScale.getPixelForValue(Number(point.y));
+      if (!Number.isFinite(pointY)) return;
+      ctx.save();
+      ctx.globalAlpha = isPrediction ? 0.78 : 1;
+      ctx.beginPath();
+      ctx.arc(targetX, pointY, 3, 0, Math.PI * 2);
+      ctx.fillStyle = "#0a0b14";
+      ctx.fill();
+      ctx.strokeStyle = dataset.borderColor || "#d7d4e6";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.restore();
+    });
+    const label = formatTooltipValue(value);
+    ctx.font = "9px IBM Plex Mono";
+    const labelWidth = ctx.measureText(label).width + 8;
+    const labelHeight = 14;
+    const labelX = area.left + 4;
+    const labelY = Math.max(area.top + 2, Math.min(pointer.y - labelHeight / 2, area.bottom - labelHeight - 2));
+    ctx.fillStyle = "rgba(10, 11, 20, 0.92)";
+    ctx.fillRect(labelX, labelY, labelWidth, labelHeight);
+    ctx.strokeStyle = "rgba(112, 108, 140, 0.72)";
+    ctx.strokeRect(labelX + 0.5, labelY + 0.5, labelWidth - 1, labelHeight - 1);
+    ctx.fillStyle = "#d7d4e6";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(label, labelX + 4, labelY + labelHeight / 2 + 0.5);
+    ctx.restore();
+  },
+};
+
 function mkChart(id) {
   const canvas = $(id);
   const panel = canvas && canvas.closest(".chart-wrap");
@@ -261,26 +1201,72 @@ function mkChart(id) {
       animation: false,
       responsive: true,
       maintainAspectRatio: false,
-      elements: { point: { radius: 0 }, line: { borderWidth: 1.4 } },
+      clip: 0,
+      layout: { padding: { bottom: CHART_TIME_AXIS_PADDING } },
+      elements: {
+        point: { radius: 0, hoverRadius: 0, hoverBorderWidth: 0 },
+        line: {
+          borderWidth: 1,
+          borderCapStyle: "butt",
+          borderJoinStyle: "bevel",
+          tension: 0,
+        },
+      },
       interaction: { mode: "nearest", axis: "x", intersect: false },
       plugins: {
         legend: { display: false },
+        tooltip: { enabled: false },
       },
       scales: {
         x: { display: false },
         y: {
+          min: -CHART_Y_LIMIT,
+          max: CHART_Y_LIMIT,
           ticks: { color: "#6a6780", font: { size: 9, family: "IBM Plex Mono" } },
           grid: { color: "#171a28" },
           border: { color: "#2c3148" },
         },
       },
     },
+    plugins: [
+      predictionGapPlugin,
+      modeMarkerPlugin,
+      timeAxisFadePlugin,
+      pixelAlignedLinePlugin,
+      pointerValuePlugin,
+      chartHoverTooltipPlugin,
+    ],
     });
     const cursor = document.createElement("span");
     cursor.className = "chart-replay-cursor";
     cursor.hidden = true;
     canvas.parentElement.appendChild(cursor);
     chart.$replayCursorElement = cursor;
+    const tooltip = document.createElement("div");
+    tooltip.className = "chart-hover-tooltip";
+    tooltip.hidden = true;
+    canvas.parentElement.appendChild(tooltip);
+    chart.$hoverTooltipElement = tooltip;
+    chart.$tooltipVisible = true;
+    canvas.addEventListener("pointerdown", (event) => {
+      if (event.button !== 1) return;
+      event.preventDefault();
+      chart.$tooltipVisible = !chart.$tooltipVisible;
+      if (!chart.$tooltipVisible) {
+        hideChartHoverTooltip(chart);
+        return;
+      }
+      const xScale = chart.scales && chart.scales.x;
+      const pointer = chart.$pointerPosition;
+      if (xScale && pointer && pointer.inside) {
+        scheduleChartHoverTooltip(
+          chart,
+          xScale.getValueForPixel(pointer.x),
+          pointer.x,
+          pointer.y,
+        );
+      }
+    });
     if (typeof ResizeObserver === "function") {
       chart.$replayResizeObserver = new ResizeObserver(() => {
         requestAnimationFrame(() => positionReplayChartCursor(chart));
@@ -297,21 +1283,351 @@ const stateChart = mkChart("chart-state");
 const actionChart = mkChart("chart-action");
 
 const ROLLOUT_WINDOW_S = 20;
-const PREDICTION_BREAK_COLOR = "#ff5a6a";
+const ROLLOUT_FUTURE_MAX_S = 8;
+const ROLLOUT_FUTURE_RATIO = 0.25;
+let actionLegendNames = [...JOINT_FALLBACK];
+let actionLegendSignature = "";
 
-function liveTimeScale() {
+function legendItemVisible(group, key) {
+  if (group === "joints") return chartLegendVisibility.joints.get(key) !== false;
+  return chartLegendVisibility[key] !== false;
+}
+
+function setLegendItemVisible(group, key, visible) {
+  if (group === "joints") chartLegendVisibility.joints.set(key, visible);
+  else chartLegendVisibility[key] = visible;
+}
+
+function isDatasetLegendVisible(dataset) {
+  const label = String(dataset && dataset.label || "");
+  const isPrediction = !!dataset.$prediction || label.endsWith(" · pred");
+  const name = label.replace(/ · pred$/, "");
+  if (isPrediction && chartLegendVisibility.prediction === false) return false;
+  if (!isPrediction && chartLegendVisibility.command === false) return false;
+  return chartLegendVisibility.joints.get(name) !== false;
+}
+
+function applyChartLegendVisibilityToChart(chart) {
+  if (!chart) return;
+  (chart.data.datasets || []).forEach((dataset, index) => {
+    const visible = isDatasetLegendVisible(dataset);
+    const meta = chart.getDatasetMeta(index);
+    if (meta) meta.hidden = !visible;
+  });
+  chart.$predictionGapsVisible = chartLegendVisibility.gap !== false;
+  chart.$modeMarkersVisible = chartLegendVisibility.mode !== false;
+  chart.$showNowLine = showLiveNowLine();
+}
+
+function applyChartLegendVisibility() {
+  [stateChart, actionChart].forEach((chart) => {
+    if (!chart) return;
+    applyChartLegendVisibilityToChart(chart);
+    chart.update("none");
+    const pointer = chart.$pointerPosition;
+    const xScale = chart.scales && chart.scales.x;
+    if (pointer && pointer.inside && xScale) {
+      scheduleChartHoverTooltip(
+        chart,
+        snapChartTimeToFrame(chart, xScale.getValueForPixel(pointer.x)),
+        pointer.x,
+        pointer.y,
+      );
+    }
+  });
+}
+
+function appendLegendItem(section, className, label, color = "", visibility = null) {
+  const item = document.createElement("div");
+  item.className = "chart-legend-item";
+  const toggle = document.createElement("input");
+  toggle.type = "checkbox";
+  toggle.className = "chart-legend-toggle";
+  toggle.checked = visibility ? legendItemVisible(visibility.group, visibility.key) : true;
+  toggle.setAttribute("aria-label", `Show ${label}`);
+  if (visibility) {
+    toggle.addEventListener("change", () => {
+      setLegendItemVisible(visibility.group, visibility.key, toggle.checked);
+      applyChartLegendVisibility();
+    });
+  }
+  const swatch = document.createElement("span");
+  swatch.className = className;
+  if (color) swatch.style.backgroundColor = color;
+  const text = document.createElement("span");
+  text.className = "chart-legend-label";
+  text.textContent = label;
+  text.title = label;
+  item.append(toggle, swatch, text);
+  section.appendChild(item);
+}
+
+function bindChartTimeBasisSelect(select) {
+  select.addEventListener("change", () => {
+    if (replayActive) return;
+    chartTimeBasis = select.value;
+    [stateChart, actionChart].forEach((chart) => {
+      if (!chart) return;
+      chart.$timeBasis = chartTimeBasis;
+      const now = Number.isFinite(Number(chart.$nowTime)) ? Number(chart.$nowTime) : liveTimestamp(last);
+      chart.options.scales.x = liveTimeAxis(now);
+      hideChartHoverTooltip(chart);
+      chart.update("none");
+    });
+    updateLegendTimeInfo();
+  });
+}
+
+function bindChartScaleSelect(select) {
+  select.addEventListener("change", () => {
+    if (replayActive) return;
+    const nextScale = Number(select.value);
+    if (!CHART_SCALE_OPTIONS.some((option) => option.seconds === nextScale)) return;
+    chartScaleSeconds = nextScale;
+    try { localStorage.setItem(CHART_SCALE_STORAGE_KEY, String(chartScaleSeconds)); } catch { /* ignore */ }
+    [stateChart, actionChart].forEach((chart) => {
+      if (!chart) return;
+      chart.$scaleSeconds = chartScaleSeconds;
+      const now = Number.isFinite(Number(chart.$nowTime)) ? Number(chart.$nowTime) : liveTimestamp(last);
+      refreshLiveChartSeries(chart, now, true);
+      chart.options.scales.x = liveTimeAxis(now);
+      hideChartHoverTooltip(chart);
+      chart.update("none");
+    });
+    updateLegendTimeInfo();
+  });
+}
+
+function updateLegendTimeInfo() {
+  const unitSelect = $("chart-time-basis");
+  if (unitSelect) {
+    unitSelect.disabled = replayActive;
+    unitSelect.value = replayActive ? "start" : chartTimeBasis;
+  }
+  const scaleSelect = $("chart-scale");
+  if (scaleSelect) {
+    scaleSelect.disabled = replayActive;
+    scaleSelect.value = String(chartScaleSeconds);
+  }
+}
+
+function renderActionLegend(names = actionLegendNames) {
+  const legend = $("action-legend");
+  if (!legend) return;
+  const seriesNames = names && names.length ? names : jointNames();
+  const rolloutMode = !replayActive && currentControlMode() === "rollout";
+  const signature = [
+    seriesNames.join("|"),
+    replayActive ? "replay" : "live",
+    rolloutMode ? "rollout" : "other",
+  ].join("::");
+  if (signature === actionLegendSignature) return;
+  actionLegendSignature = signature;
+  const colorIndex = new Map(seriesNames.map((name, index) => [name, index]));
+  const canonical = jointNames().filter((name) => colorIndex.has(name));
+  const extras = seriesNames.filter((name) => !canonical.includes(name));
+  const displayNames = [...canonical, ...extras].reverse();
+  legend.replaceChildren();
+
+  const series = document.createElement("section");
+  series.className = "chart-legend-section";
+  const seriesTitle = document.createElement("div");
+  seriesTitle.className = "chart-legend-title";
+  seriesTitle.textContent = "Joint colors";
+  series.appendChild(seriesTitle);
+  displayNames.forEach((name) => {
+    const index = colorIndex.get(name) || 0;
+    appendLegendItem(
+      series,
+      "chart-legend-color",
+      name,
+      PAL[index % PAL.length],
+      { group: "joints", key: name },
+    );
+  });
+
+  const lines = document.createElement("section");
+  lines.className = "chart-legend-section";
+  const linesTitle = document.createElement("div");
+  linesTitle.className = "chart-legend-title";
+  linesTitle.textContent = "Line style";
+  lines.appendChild(linesTitle);
+  appendLegendItem(lines, "chart-legend-line", "command", "", { group: "style", key: "command" });
+  appendLegendItem(lines, "chart-legend-line dashed", "prediction", "", { group: "style", key: "prediction" });
+  appendLegendItem(lines, "chart-legend-band", "prediction gap", "", { group: "style", key: "gap" });
+  if (!replayActive) {
+    appendLegendItem(lines, "chart-legend-line mode", "mode change", "", { group: "style", key: "mode" });
+  }
+  if (rolloutMode) {
+    appendLegendItem(lines, "chart-legend-line now", "current time", "", { group: "style", key: "now" });
+  }
+
+  const time = document.createElement("section");
+  time.className = "chart-legend-section";
+  const timeTitle = document.createElement("div");
+  timeTitle.className = "chart-legend-title";
+  timeTitle.textContent = "Time";
+  time.appendChild(timeTitle);
+  const timeControl = document.createElement("label");
+  timeControl.className = "chart-time-control";
+  const timeLabel = document.createElement("span");
+  timeLabel.className = "chart-time-unit";
+  timeLabel.textContent = "unit";
+  const select = document.createElement("select");
+  select.id = "chart-time-basis";
+  select.setAttribute("aria-label", "Chart time unit");
+  [
+    ["wall", "wall"],
+    ["mode", "mode"],
+    ["start", "start"],
+  ].forEach(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  });
+  bindChartTimeBasisSelect(select);
+  timeControl.append(timeLabel, select);
+  time.appendChild(timeControl);
+  const scaleControl = document.createElement("label");
+  scaleControl.className = "chart-time-control";
+  const scaleLabel = document.createElement("span");
+  scaleLabel.className = "chart-time-unit";
+  scaleLabel.textContent = "scale";
+  const scaleSelect = document.createElement("select");
+  scaleSelect.id = "chart-scale";
+  scaleSelect.setAttribute("aria-label", "Chart time scale");
+  CHART_SCALE_OPTIONS.forEach(({ seconds, label }) => {
+    const option = document.createElement("option");
+    option.value = String(seconds);
+    option.textContent = label;
+    scaleSelect.appendChild(option);
+  });
+  bindChartScaleSelect(scaleSelect);
+  scaleControl.append(scaleLabel, scaleSelect);
+  time.appendChild(scaleControl);
+  legend.append(series, lines, time);
+  updateLegendTimeInfo();
+}
+
+function currentControlMode() {
+  return (last && (last.display_mode || last.mode)) || "";
+}
+
+function liveTimestamp(status) {
+  const timestamp = Number(status && status.ts);
+  return Number.isFinite(timestamp)
+    ? timestamp
+    : WALL_CLOCK_OFFSET_S + performance.now() / 1000;
+}
+
+function showLiveNowLine() {
+  return !replayActive
+    && currentControlMode() === "rollout"
+    && chartLegendVisibility.now !== false;
+}
+
+function rolloutFutureWindowS(now) {
+  if (currentControlMode() !== "rollout") return 0;
+  return Math.min(
+    ROLLOUT_FUTURE_MAX_S,
+    Math.max(1, chartScaleSeconds * ROLLOUT_FUTURE_RATIO),
+  );
+}
+
+function liveTimeWindow(now) {
+  const future = rolloutFutureWindowS(now);
+  const padding = future > 0
+    ? future
+    : Math.min(LIVE_RIGHT_PADDING_S, Math.max(0.05, chartScaleSeconds * 0.02));
+  return { min: now - chartScaleSeconds, max: now + padding };
+}
+
+function liveTimeScale(showTicks = true) {
   return {
     type: "linear",
-    display: false,
+    display: showTicks,
     min: 0,
     ticks: {
-      color: "#85819c",
+      display: false,
       font: { size: 9, family: "IBM Plex Mono" },
-      callback: (value) => `${Number(value).toFixed(1)}s`,
+      maxTicksLimit: 7,
     },
-    grid: { color: "#171a28" },
+    grid: { display: false },
     border: { color: "#2c3148" },
   };
+}
+
+function liveTimeAxis(now) {
+  const window = liveTimeWindow(now);
+  return {
+    ...liveTimeScale(true),
+    min: window.min,
+    max: window.max,
+  };
+}
+
+function syncLiveChartChrome(now) {
+  const timestamp = Number(now);
+  if (!Number.isFinite(timestamp)) return;
+  const latestMarker = liveModeMarkers.length ? liveModeMarkers[liveModeMarkers.length - 1] : null;
+  liveModeMarkers = liveModeMarkers.filter(
+    (marker) => marker === latestMarker || marker.x >= timestamp - LIVE_MODE_HISTORY_S,
+  );
+  [stateChart, actionChart].forEach((chart) => {
+    if (!chart || chart.$timeAxis !== true) return;
+    if (Number.isFinite(Number(chart.$historyStart))) chart.$historyEnd = timestamp;
+    chart.$modeMarkers = liveModeMarkers;
+    chart.$nowTime = timestamp;
+    chart.$showNowLine = showLiveNowLine();
+    chart.options.scales.x = liveTimeAxis(timestamp);
+    scheduleChartUpdate(chart);
+  });
+  renderActionLegend();
+  updateLegendTimeInfo(timestamp);
+}
+
+function recordModeTransition(mode, now) {
+  const timestamp = Number(now);
+  const nextMode = String(mode || "");
+  if (!nextMode || !Number.isFinite(timestamp)) return;
+  if (lastDisplayMode && nextMode !== lastDisplayMode) {
+    liveModeMarkers.push({ x: timestamp, mode: nextMode });
+    const latest = liveModeMarkers[liveModeMarkers.length - 1];
+    liveModeMarkers = liveModeMarkers
+      .filter((marker) => marker === latest || marker.x >= timestamp - LIVE_MODE_HISTORY_S)
+      .slice(-200);
+  }
+  lastDisplayMode = nextMode;
+}
+
+function initializeLiveChartAxes() {
+  const now = liveTimestamp(last);
+  [stateChart, actionChart].forEach((chart) => {
+    if (!chart) return;
+    chart.$timeAxis = true;
+    chart.$live = [];
+    chart.$predictions = [];
+    chart.$predictionGaps = [];
+    chart.$modeMarkers = [];
+    chart.$nowTime = now;
+    chart.$showNowLine = false;
+    chart.$timeBasis = chartTimeBasis;
+    chart.$historyStart = Number.NaN;
+    chart.$historyEnd = Number.NaN;
+    chart.$tooltipToleranceS = CHART_TOOLTIP_TOLERANCE_S;
+    chart.$scaleSeconds = chartScaleSeconds;
+    chart.$lastAnimationNow = Number.NaN;
+    chart.$pendingAnimationNow = Number.NaN;
+    chart.$lastRenderedNow = Number.NaN;
+    chart.options.scales.x = liveTimeAxis(now);
+  });
+}
+
+initializeLiveChartAxes();
+renderActionLegend();
+if (typeof requestAnimationFrame === "function") {
+  chartAnimationFrame = requestAnimationFrame(animateLiveCharts);
 }
 
 // Live charts own `$live` (measured values) and `$predictions` (dashed overlays)
@@ -321,45 +1637,66 @@ function syncChartDatasets(chart) {
   const current = chart.data.datasets;
   const unchanged = current.length === next.length && next.every((ds, i) => current[i] === ds);
   if (!unchanged) chart.data.datasets = next;
+  applyChartLegendVisibilityToChart(chart);
 }
 
 function pushChart(chart, scalars, timeS = null) {
   if (!chart) return;
   const keys = Object.keys(scalars);
-  const timeAxis = Number.isFinite(timeS);
-  if (chart.$timeAxis !== timeAxis) {
-    chart.$timeAxis = timeAxis;
+  if (chart === actionChart && keys.length) {
+    actionLegendNames = keys;
+    renderActionLegend(actionLegendNames);
+  }
+  const now = Number.isFinite(Number(timeS)) ? Number(timeS) : liveTimestamp(last);
+  if (chart.$timeAxis !== true) {
+    chart.$timeAxis = true;
     chart.data.labels = [];
     chart.$live = [];
     chart.$predictions = [];
-    chart.options.scales.x = timeAxis ? liveTimeScale() : { display: false, type: "category" };
+    chart.$predictionGaps = [];
+    chart.$modeMarkers = [];
+    chart.$historyStart = Number.NaN;
+    chart.$historyEnd = Number.NaN;
+    chart.data.datasets = [];
     syncChartDatasets(chart);
   }
+  chart.$historyStart = Number.isFinite(Number(chart.$historyStart)) ? Number(chart.$historyStart) : now;
+  chart.$historyEnd = now;
+  chart.$showNowLine = showLiveNowLine();
+  chart.$modeMarkers = liveModeMarkers;
   const live = chart.$live || (chart.$live = []);
   while (live.length < keys.length) {
     live.push({
       label: "",
       data: [],
+      $raw: [],
       borderColor: PAL[live.length % PAL.length],
-      tension: 0.2,
+      borderWidth: 1,
+      borderCapStyle: "butt",
+      borderJoinStyle: "bevel",
+      pointRadius: 0,
+      pointHoverRadius: 0,
+      tension: 0,
+      clip: 0,
     });
   }
   live.forEach((ds, i) => { if (keys[i]) ds.label = keys[i]; });
-  if (timeAxis) {
-    keys.forEach((k, i) => {
-      const ds = live[i];
-      ds.data.push({ x: Number(timeS), y: Number(scalars[k]) });
-      if (ds.data.length > HIST) ds.data.shift();
-    });
-  } else {
-    chart.data.labels.push("");
-    if (chart.data.labels.length > HIST) chart.data.labels.shift();
-    keys.forEach((k, i) => {
-      const ds = live[i];
-      ds.data.push(scalars[k]);
-      if (ds.data.length > HIST) ds.data.shift();
-    });
-  }
+  chart.$nowTime = now;
+  chart.options.scales.x = liveTimeAxis(now);
+  keys.forEach((k, i) => {
+    const ds = live[i];
+    const raw = ds.$raw || (ds.$raw = []);
+    const value = Number(scalars[k]);
+    const last = raw[raw.length - 1];
+    if (last && Math.abs(Number(last.x) - now) < 1e-6) {
+      last.y = value;
+    } else {
+      raw.push({ x: now, y: value });
+    }
+    if (raw.length > HISTORY_CAPACITY + 512) {
+      raw.splice(0, raw.length - HISTORY_CAPACITY);
+    }
+  });
   syncChartDatasets(chart);
   scheduleChartUpdate(chart);
 }
@@ -369,11 +1706,14 @@ function rolloutPredictionList() {
   return vizState.rolloutPredictions;
 }
 
-function recordRolloutPrediction(prediction, now) {
+function recordRolloutPrediction(prediction, now, taskElapsed = now) {
   const actions = prediction && Array.isArray(prediction.actions) ? prediction.actions : [];
   const start = Number(prediction && prediction.t_s);
   if (!actions.length || !Number.isFinite(start)) return;
   const step = Number(prediction.step_s) > 0 ? Number(prediction.step_s) : 1 / 30;
+  const elapsed = Number(taskElapsed);
+  const publishedAfterStatus = Number.isFinite(elapsed) ? Math.max(0, start - elapsed) : 0;
+  const chartStart = now + publishedAfterStatus;
   const key = String(prediction.id || `${start.toFixed(3)}#${actions.length}`);
   const list = rolloutPredictionList();
   if (list.some((chunk) => chunk.key === key)) return;
@@ -381,19 +1721,19 @@ function recordRolloutPrediction(prediction, now) {
   actions.forEach((action, index) => {
     const joints = action && action.joints ? action.joints : action;
     if (!joints || typeof joints !== "object") return;
-    points.push({ x: start + (index + 1) * step, joints });
+    points.push({ x: chartStart + (index + 1) * step, joints });
   });
   if (!points.length) return;
   const end = points[points.length - 1].x;
   // A newer chunk replaces the older predictions inside the window it covers.
   const kept = [];
   list.forEach((chunk) => {
-    const surviving = chunk.points.filter((point) => point.x < start || point.x > end);
+    const surviving = chunk.points.filter((point) => point.x < chartStart || point.x > end);
     if (surviving.length) kept.push({ ...chunk, points: surviving });
   });
   kept.push({
     key,
-    start,
+    start: chartStart,
     end,
     step,
     points,
@@ -415,7 +1755,7 @@ function rolloutOverlaySeries(now) {
       Object.entries(point.joints || {}).forEach(([name, value]) => {
         const y = Number(value);
         if (!Number.isFinite(y)) return;
-        if (!series.has(name)) series.set(name, { points: [], breaks: [] });
+        if (!series.has(name)) series.set(name, { points: [], gaps: [] });
         series.get(name).points.push({ x: point.x, y, step: chunk.step });
       });
     });
@@ -429,15 +1769,14 @@ function rolloutOverlaySeries(now) {
     ordered.forEach((point) => {
       if (previous && point.x - previous.x > 2.5 * Math.max(previous.step || 0, point.step || 0)) {
         merged.push({ x: (previous.x + point.x) / 2, y: null });
-        entry.breaks.push({ x: previous.x, y: previous.y });
-        entry.breaks.push({ x: point.x, y: point.y });
+        entry.gaps.push({ start: previous.x, end: point.x });
       }
       merged.push(point);
       previous = point;
     });
     // A horizon that lapsed without a fresh chunk is a break too.
     if (previous && Number.isFinite(now) && now - previous.x > 2.5 * (previous.step || 0)) {
-      entry.breaks.push({ x: previous.x, y: previous.y });
+      entry.gaps.push({ start: previous.x, end: now });
     }
     entry.points = merged;
   });
@@ -449,44 +1788,41 @@ function applyRolloutOverlay(chart, now) {
   const colorByName = new Map((chart.$live || []).map((ds) => [ds.label, ds.borderColor]));
   const names = jointNames();
   const datasets = [];
-  let overlayEnd = 0;
+  const gapByTime = new Map();
   rolloutOverlaySeries(now).forEach((entry, name) => {
+    entry.gaps.forEach((gap) => {
+      gapByTime.set(`${gap.start}:${gap.end}`, gap);
+    });
     if (!entry.points.length) return;
     const color = colorByName.get(name) || PAL[Math.max(0, names.indexOf(name)) % PAL.length];
     datasets.push({
       label: `${name} · pred`,
       data: entry.points,
       borderColor: color,
-      borderWidth: 1.3,
+      borderWidth: 1,
+      borderCapStyle: "butt",
+      borderJoinStyle: "bevel",
       borderDash: [4, 3],
       pointRadius: 0,
-      tension: 0.15,
+      pointHoverRadius: 0,
+      tension: 0,
       spanGaps: false,
+      clip: 0,
       $prediction: true,
     });
-    entry.points.forEach((point) => {
-      if (Number.isFinite(point.y)) overlayEnd = Math.max(overlayEnd, point.x);
-    });
-    if (entry.breaks.length) {
-      datasets.push({
-        label: `${name} · prediction gap`,
-        data: entry.breaks,
-        borderColor: PREDICTION_BREAK_COLOR,
-        backgroundColor: PREDICTION_BREAK_COLOR,
-        borderWidth: 1.2,
-        pointRadius: 3,
-        pointStyle: "rectRot",
-        showLine: false,
-        $prediction: true,
-      });
-    }
   });
+  chart.$predictionGaps = [...gapByTime.values()];
   chart.$predictions = datasets;
   syncChartDatasets(chart);
+  const window = liveTimeWindow(now);
+  chart.$nowTime = now;
+  chart.$showNowLine = showLiveNowLine();
+  chart.$modeMarkers = liveModeMarkers;
+  chart.$historyEnd = now;
   chart.options.scales.x = {
-    ...liveTimeScale(),
-    min: Math.max(0, now - ROLLOUT_WINDOW_S),
-    max: Math.max(now, overlayEnd) + 0.25,
+    ...liveTimeScale(true),
+    min: window.min,
+    max: window.max,
   };
   scheduleChartUpdate(chart);
 }
@@ -497,13 +1833,17 @@ function renderRolloutOverlays(now) {
 }
 
 function clearRolloutPredictions() {
-  const hasOverlay = (chart) => !!(chart && (chart.$predictions || []).length);
+  const hasOverlay = (chart) => !!(
+    chart
+    && ((chart.$predictions || []).length || (chart.$predictionGaps || []).length)
+  );
   const hasChunks = rolloutPredictionList().length > 0;
   if (!hasChunks && !hasOverlay(stateChart) && !hasOverlay(actionChart)) return;
   vizState.rolloutPredictions = [];
   [stateChart, actionChart].forEach((chart) => {
     if (!hasOverlay(chart)) return;
     chart.$predictions = [];
+    chart.$predictionGaps = [];
     syncChartDatasets(chart);
     scheduleChartUpdate(chart);
   });
@@ -941,23 +2281,31 @@ function applyStatus(d) {
   renderMainCameras(d.cameras || []);
   renderCamMenu(d.cameras || []);
 
-  // During rollout the charts switch to a time axis so the predicted chunk can be
-  // drawn ahead of "now" and kept afterwards for comparison with the real curve.
+  // Live charts share one absolute-time history. Mode changes are annotations,
+  // not reasons to discard the curves already on screen.
   const rolloutLive = !replayActive && mode === "rollout";
-  const elapsedS = Number(task.elapsed_s) || 0;
+  const taskElapsedS = Number(task.elapsed_s) || 0;
+  const liveNowS = liveTimestamp(d);
+  if (!replayActive) recordModeTransition(mode, liveNowS);
   if (d.joints && Object.keys(d.joints).length) {
     updateJoints(d.joints);
-    if (!replayActive) pushChart(stateChart, d.joints, rolloutLive ? elapsedS : null);
+    if (!replayActive) pushChart(stateChart, d.joints, liveNowS);
   }
   if (!replayActive && d.action && Object.keys(d.action).length) {
-    pushChart(actionChart, d.action, rolloutLive ? elapsedS : null);
+    pushChart(actionChart, d.action, liveNowS);
   }
   if (rolloutLive) {
-    recordRolloutPrediction(d.prediction, elapsedS);
-    renderRolloutOverlays(elapsedS);
+    const chartNow = Number(actionChart && actionChart.$nowTime);
+    recordRolloutPrediction(
+      d.prediction,
+      Number.isFinite(chartNow) ? chartNow : liveNowS - 1 / LIVE_FRAME_RATE,
+      taskElapsedS,
+    );
+    renderRolloutOverlays(liveNowS);
   } else {
     clearRolloutPredictions();
   }
+  if (!replayActive) syncLiveChartChrome(liveNowS);
   if (armReplay && (!robot.connected || mode === "estop")) {
     armReplay = false;
     syncArmToggle();
@@ -1923,6 +3271,26 @@ function appendLibraryNote(li, kind, sourceId, row) {
   li.append(noteButton, editor);
 }
 
+function libraryTitle(kind, row) {
+  if (kind === "dataset") {
+    return String(row.title || row.repo_id || row.id || "");
+  }
+  return String(row.name || row.title || row.id || "");
+}
+
+function filterLibraryRows(kind, rows) {
+  const query = String(librarySearch[kind] || "").trim().toLowerCase();
+  if (!query) return rows;
+  return rows.filter((row) => {
+    const haystack = `${libraryTitle(kind, row)}\n${row.note || ""}`.toLowerCase();
+    return haystack.includes(query);
+  });
+}
+
+function libraryFilterMessage(kind) {
+  return `No ${kind} title or note matches this search`;
+}
+
 function renderVideos() {
   const ol = $("vid-list");
   if (!ol) return;
@@ -1933,7 +3301,12 @@ function renderVideos() {
     ol.innerHTML = `<li class="library-message${state.error ? " error" : ""}">${message}</li>`;
     return;
   }
-  videosCache.forEach((vid) => {
+  const rows = filterLibraryRows("videos", videosCache);
+  if (!rows.length) {
+    ol.innerHTML = `<li class="library-message">${libraryFilterMessage("video")}</li>`;
+    return;
+  }
+  rows.forEach((vid) => {
     const li = document.createElement("li");
     if (episodeSource && episodeSource.kind === "video" && episodeSource.id === vid.id) li.className = "sel";
     const n = (vid.episodes || []).length;
@@ -1960,7 +3333,12 @@ function renderDatasets() {
     ol.innerHTML = `<li class="library-message${state.error ? " error" : ""}">${message}</li>`;
     return;
   }
-  datasetsCache.forEach((ds) => {
+  const rows = filterLibraryRows("datasets", datasetsCache);
+  if (!rows.length) {
+    ol.innerHTML = `<li class="library-message">${libraryFilterMessage("dataset")}</li>`;
+    return;
+  }
+  rows.forEach((ds) => {
     const li = document.createElement("li");
     const id = ds.repo_id || ds.id;
     if (episodeSource && episodeSource.kind === "dataset" && episodeSource.id === id) li.className = "sel";
@@ -2022,7 +3400,12 @@ function renderSnapshots() {
     ol.innerHTML = `<li class="library-message${state.error ? " error" : ""}">${message}</li>`;
     return;
   }
-  snapshotsCache.forEach((snapshot) => {
+  const rows = filterLibraryRows("snapshots", snapshotsCache);
+  if (!rows.length) {
+    ol.innerHTML = `<li class="library-message">${libraryFilterMessage("snapshot")}</li>`;
+    return;
+  }
+  rows.forEach((snapshot) => {
     const li = document.createElement("li");
     if (snapshotActive && activeSnapshot && activeSnapshot.id === snapshot.id) li.className = "sel";
     const head = document.createElement("div");
@@ -3651,11 +5034,77 @@ function seekReplayFromChart(chart, event) {
   const area = chart && chart.chartArea;
   const canvas = chart && chart.canvas;
   if (!xScale || !area || !canvas) return;
+  updateChartHoverFromClient(chart, event);
   const rect = canvas.getBoundingClientRect();
   if (!rect.width) return;
   const canvasX = ((event.clientX - rect.left) * chart.width) / rect.width;
   const pixel = Math.min(area.right, Math.max(area.left, canvasX));
-  seekViz(xScale.getValueForPixel(pixel));
+  seekViz(snapChartTimeToFrame(chart, xScale.getValueForPixel(pixel)));
+}
+
+function updateChartHoverFromClient(chart, event) {
+  const canvas = chart && chart.canvas;
+  const xScale = chart && chart.scales && chart.scales.x;
+  const area = chart && chart.chartArea;
+  if (!canvas || !xScale || !area) return;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height || !chart.width || !chart.height) return;
+  const pointerX = ((event.clientX - rect.left) * chart.width) / rect.width;
+  const pointerY = ((event.clientY - rect.top) * chart.height) / rect.height;
+  if (
+    pointerX < area.left
+    || pointerX > area.right
+    || pointerY < area.top
+    || pointerY > area.bottom
+  ) {
+    chart.$pointerPosition = null;
+    hideChartHoverTooltip(chart);
+    if (chart.$timeAxis === false) chart.draw();
+    return;
+  }
+  chart.$pointerPosition = { x: pointerX, y: pointerY, inside: true };
+  const seconds = snapChartTimeToFrame(chart, xScale.getValueForPixel(pointerX));
+  scheduleChartHoverTooltip(chart, seconds, pointerX, pointerY);
+  if (chart.$timeAxis === false) chart.draw();
+}
+
+function stepReplayFrame(chart, direction) {
+  const frames = Array.isArray(chart && chart.$frameTimes) ? chart.$frameTimes : [];
+  if (!frames.length) return;
+  const current = snapChartTimeToFrame(chart, vizState.elapsed);
+  let low = 0;
+  let high = frames.length - 1;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (Number(frames[middle]) < current) low = middle + 1;
+    else high = middle;
+  }
+  const currentIndex = low;
+  const nextIndex = Math.max(0, Math.min(frames.length - 1, currentIndex + direction));
+  if (nextIndex === currentIndex) return;
+  if (vizState.playing) pauseVizVideos();
+  seekViz(Number(frames[nextIndex]));
+}
+
+function bindReplayChartWheel(chart) {
+  if (!chart || !chart.canvas) return;
+  const canvas = chart.canvas;
+  let accumulatedDelta = 0;
+  canvas.addEventListener("wheel", (event) => {
+    if (!replayActive || !vizState.previewReady || chart.$timeAxis !== false) return;
+    event.preventDefault();
+    updateChartHoverFromClient(chart, event);
+    const unit = event.deltaMode === 1 ? 16 : (event.deltaMode === 2 ? 100 : 1);
+    const delta = Number(event.deltaY) * unit;
+    if (!Number.isFinite(delta) || delta === 0) return;
+    if (Math.sign(delta) !== Math.sign(accumulatedDelta)) accumulatedDelta = 0;
+    accumulatedDelta += delta;
+    const threshold = 100;
+    if (Math.abs(accumulatedDelta) < threshold) return;
+    const direction = accumulatedDelta < 0 ? -1 : 1;
+    stepReplayFrame(chart, direction);
+    accumulatedDelta = 0;
+  }, { passive: false });
 }
 
 function bindReplayChartSeek(chart, id) {
@@ -3830,7 +5279,29 @@ function fillReplayChart(chart, times, series, prefix, overlay = [], overlayStar
   chart.$timeAxis = false;
   chart.$live = [];
   chart.$predictions = [];
+  chart.$predictionGaps = [];
+  chart.$showNowLine = false;
+  chart.$nowTime = Number.NaN;
+  chart.$timeBasis = "start";
+  chart.$historyStart = 0;
+  chart.$tooltipToleranceS = CHART_TOOLTIP_TOLERANCE_S;
+  chart.$scaleSeconds = chartScaleSeconds;
+  const frameTimeSet = new Set(
+    times.map(Number).filter((value) => Number.isFinite(value)),
+  );
+  (overlay || []).forEach((point) => {
+    const value = overlayStart + (Number(point.x) || 0);
+    if (Number.isFinite(value)) frameTimeSet.add(value);
+  });
+  const frameTimes = [...frameTimeSet].sort((left, right) => left - right);
+  chart.$frameTimes = frameTimes.length
+    ? frameTimes
+    : (chart === actionChart && stateChart ? stateChart.$frameTimes || [] : []);
   const keys = Object.keys(series).filter((key) => key.startsWith(prefix));
+  if (chart === actionChart) {
+    actionLegendNames = keys.map((key) => key.slice(prefix.length));
+    renderActionLegend(actionLegendNames);
+  }
   const overlaySeries = new Map();
   (overlay || []).forEach((point) => {
     const x = overlayStart + (Number(point.x) || 0);
@@ -3853,9 +5324,13 @@ function fillReplayChart(chart, times, series, prefix, overlay = [], overlayStar
       label: name,
       data: times.map((time, index) => ({ x: Number(time), y: Number(series[key][index]) })),
       borderColor: PAL[seriesIndex.get(name) % PAL.length],
-      borderWidth: 1.2,
+      borderWidth: 1,
+      borderCapStyle: "butt",
+      borderJoinStyle: "bevel",
       pointRadius: 0,
-      tension: 0.15,
+      pointHoverRadius: 0,
+      tension: 0,
+      clip: 0,
     });
   });
   overlaySeries.forEach((points, name) => {
@@ -3863,11 +5338,14 @@ function fillReplayChart(chart, times, series, prefix, overlay = [], overlayStar
       label: `${name} · pred`,
       data: points,
       borderColor: PAL[seriesIndex.get(name) % PAL.length],
-      borderWidth: 1.3,
+      borderWidth: 1,
+      borderCapStyle: "butt",
+      borderJoinStyle: "bevel",
       borderDash: [4, 3],
       pointRadius: 0,
-      tension: 0.15,
-      // Predictions stay out of the legend: the dashed style already says "prediction".
+      pointHoverRadius: 0,
+      tension: 0,
+      clip: 0,
       $prediction: true,
     });
   });
@@ -3877,52 +5355,58 @@ function fillReplayChart(chart, times, series, prefix, overlay = [], overlayStar
   const domainMax = Math.max(1, vizState.duration || 0, seriesEnd);
   chart.$replaySeriesEnd = seriesEnd;
   chart.$replayCursorTime = Math.min(domainMax, Math.max(0, vizState.elapsed || 0));
+  chart.$historyEnd = domainMax;
   chart.options.scales.x = {
     type: "linear",
     display: true,
     min: 0,
     max: domainMax,
-    ticks: { color: "#85819c", font: { size: 9, family: "IBM Plex Mono" }, callback: (value) => `${Number(value).toFixed(2)}s` },
-    grid: { color: "#171a28" },
+    ticks: {
+      display: false,
+      font: { size: 9, family: "IBM Plex Mono" },
+    },
+    grid: { display: false },
     border: { color: "#2c3148" },
   };
-  chart.options.plugins.tooltip = {
-    mode: "index",
-    intersect: false,
-    callbacks: {
-      title: (items) => items.length ? `t = ${Number(items[0].parsed.x).toFixed(3)} s` : "",
-      label: (context) => `${context.dataset.label}: ${Number(context.parsed.y).toFixed(4)}`,
-    },
-  };
-  chart.options.plugins.legend = {
-    display: chart.data.datasets.some((dataset) => !dataset.$prediction),
-    labels: {
-      filter: (item) => {
-        const dataset = chart.data.datasets[item.datasetIndex];
-        return !dataset || !dataset.$prediction;
-      },
-    },
-  };
+  chart.options.plugins.tooltip = { enabled: false };
+  chart.options.plugins.legend = { display: false };
+  applyChartLegendVisibilityToChart(chart);
+  hideChartHoverTooltip(chart);
   chart.update("none");
   positionReplayChartCursor(chart);
+  updateLegendTimeInfo();
 }
 
 function resetReplayCharts() {
   [stateChart, actionChart].forEach((chart) => {
     if (!chart) return;
-    chart.$timeAxis = false;
+    chart.$timeAxis = true;
     chart.$live = [];
     chart.$predictions = [];
+    chart.$predictionGaps = [];
+    chart.$modeMarkers = [];
     chart.data.labels = [];
     chart.data.datasets = [];
     chart.options.plugins.legend.display = false;
     chart.$replayCursorTime = Number.NaN;
+    chart.$showNowLine = false;
+    chart.$nowTime = Number.NaN;
+    chart.$timeBasis = chartTimeBasis;
+    chart.$historyStart = Number.NaN;
+    chart.$historyEnd = Number.NaN;
+    chart.$tooltipToleranceS = CHART_TOOLTIP_TOLERANCE_S;
+    chart.$scaleSeconds = chartScaleSeconds;
+    chart.$frameTimes = [];
     chart.$replaySeriesEnd = 0;
-    chart.options.scales.x = { display: false, type: "category" };
-    chart.options.plugins.tooltip = {};
+    chart.options.scales.x = liveTimeAxis(liveTimestamp(last));
+    chart.options.plugins.tooltip = { enabled: false };
+    hideChartHoverTooltip(chart);
     chart.update("none");
     positionReplayChartCursor(chart);
   });
+  liveModeMarkers = [];
+  lastDisplayMode = "";
+  updateLegendTimeInfo();
 }
 
 function renderVizChart(data) {
@@ -4234,6 +5718,7 @@ if ($("ep-description")) {
 bindReplaySeek("replay-seek");
 bindReplayChartSeek(stateChart, "chart-state");
 bindReplayChartSeek(actionChart, "chart-action");
+bindReplayChartWheel(actionChart);
 
 async function moveEpisode(videoId, from, delta) {
   if (episodeMutationPending) return;
@@ -4294,7 +5779,22 @@ function renderModels() {
     ol.innerHTML = `<li class="library-message${state.error ? " error" : ""}">${message}</li>`;
     return;
   }
+  const visibleModels = filterLibraryRows("models", modelsCache);
+  const visibleIds = new Set(visibleModels.map((model) => model.id));
+  if (!visibleModels.length) {
+    ol.innerHTML = `<li class="library-message">${libraryFilterMessage("model")}</li>`;
+  }
   modelsCache.forEach((m) => {
+    if (select) {
+      const source = m.source === "hub" ? "hf cache" : m.source || "local";
+      const parts = [m.name, m.policy_type, source].filter(Boolean);
+      const option = document.createElement("option");
+      option.value = m.path;
+      option.textContent = parts.join("  ·  ");
+      option.disabled = !m.path;
+      select.appendChild(option);
+    }
+    if (!visibleIds.has(m.id)) return;
     const li = document.createElement("li");
     const source = m.source === "hub" ? "hf cache" : m.source || "local";
     const parts = [m.name, m.policy_type, source].filter(Boolean);
@@ -4348,13 +5848,6 @@ function renderModels() {
       appendLibraryNote(li, "model", m.id, m);
     }
     ol.appendChild(li);
-    if (select) {
-      const option = document.createElement("option");
-      option.value = m.path;
-      option.textContent = label;
-      option.disabled = !m.path;
-      select.appendChild(option);
-    }
   });
   if (select && selected) select.value = selected;
 }
@@ -4727,6 +6220,33 @@ const LIBRARY_CONFIG = {
   snapshots: { path: "/api/snapshots", group: "lib-snapshots", list: "snap-list", status: "snap-status", button: "btn-snap-refresh", render: renderSnapshots },
   models: { path: "/api/models", group: "lib-models", list: "md-list", status: "md-status", button: "btn-md-refresh", render: renderModels },
 };
+
+function bindLibrarySearchInputs() {
+  const inputs = {
+    videos: "vid-search",
+    datasets: "ds-search",
+    snapshots: "snap-search",
+    models: "md-library-search",
+  };
+  Object.entries(inputs).forEach(([kind, id]) => {
+    const input = $(id);
+    if (!input) return;
+    input.value = librarySearch[kind];
+    input.addEventListener("input", () => {
+      librarySearch[kind] = input.value;
+      LIBRARY_CONFIG[kind].render();
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape" || !input.value) return;
+      event.preventDefault();
+      input.value = "";
+      librarySearch[kind] = "";
+      LIBRARY_CONFIG[kind].render();
+    });
+  });
+}
+
+bindLibrarySearchInputs();
 
 function setLibrarySectionState(kind) {
   const config = LIBRARY_CONFIG[kind];

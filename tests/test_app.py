@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -807,6 +808,10 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'data-tab-panel="videos"',
         'id="lib-snapshots"',
         'id="snap-list"',
+        'id="vid-search"',
+        'id="ds-search"',
+        'id="snap-search"',
+        'id="md-library-search"',
         'id="btn-snap-edit"',
         'id="side-tabs"',
         'data-tab="joints"',
@@ -817,6 +822,7 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="btn-dbg-send"',
         'id="dbg-cam-map"',
         'id="dbg-eval"',
+        'id="action-legend"',
         'id="md-file-input"',
         'id="pol-path-menu"',
     ):
@@ -895,3 +901,79 @@ def test_static_css_owns_hidden_replay_badges(tmp_path: Path, monkeypatch) -> No
     assert ".replay-tag.hidden" in css.text
     assert ".panel-tab.active" in css.text
     assert ".side-tab-panel[hidden]" in css.text
+    assert ".chart-legend" in css.text
+    assert ".chart-legend-toggle" in css.text
+    assert "#6ea8ff" in css.text
+    assert ".chart-tooltip-actual.muted" in css.text
+    assert ".chart-wrap.replay canvas { cursor: crosshair;" in css.text
+    assert ".bottom-legend" in css.text
+
+
+def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        css = client.get("/lerobot/static/styles.css")
+        script = client.get("/lerobot/static/app.js")
+
+    assert css.status_code == 200
+    assert script.status_code == 200
+    assert ".library-search" in css.text
+    assert ".chart-hover-tooltip" in css.text
+    assert ".chart-time-control" in css.text
+    list_rule = re.search(r"\.lib-list\s*\{(?P<body>.*?)\}", css.text, re.DOTALL)
+    assert list_rule is not None
+    assert "max-height" not in list_rule.group("body")
+    assert "overflow-y" not in list_rule.group("body")
+
+    assert 'key: "command"' in script.text
+    assert 'key: "prediction"' in script.text
+    assert "chart-legend-toggle" in script.text
+    assert "function applyChartLegendVisibility" in script.text
+    assert 'id: "modeMarkers"' in script.text
+    assert "MODE_MARKER_LABEL_OFFSET_PX" in script.text
+    assert 'currentControlMode() === "rollout"' in script.text
+    assert 'id: "hoverTooltip"' in script.text
+    assert 'select.id = "chart-time-basis"' in script.text
+    assert 'scaleSelect.id = "chart-scale"' in script.text
+    assert 'option.textContent = label' in script.text
+    assert '["joint", "actual", "pred"]' in script.text
+    assert "chart.$modeZeroLabels.push" in script.text
+    assert "decimateVisibleSeries" in script.text
+    assert "const CHART_UPDATE_INTERVAL_MS = 16;" in script.text
+    assert '{ seconds: 2, label: "2s" }' in script.text
+    assert '{ seconds: 600, label: "10m" }' in script.text
+    assert "function positionLiveNowCursor" in script.text
+    assert "function animateLiveCharts" in script.text
+    assert "function leftBoundaryPoint" in script.text
+    assert "function interpolatedChartPoint" in script.text
+    assert "const timeAxisFadePlugin" in script.text
+    assert "chart.$lastAnimationNow" in script.text
+    assert "function interpolateScaleValueFromTicks" in script.text
+    assert "function chartActualCutoff" in script.text
+    assert "actualVisible" in script.text
+    assert "predictedVisible" in script.text
+    assert "const pointerValuePlugin" in script.text
+    assert "CHART_TIME_AXIS_FADE_MS" in script.text
+    assert "TIME_TICK_STEPS_S" in script.text
+    assert "TIME_LABEL_EDGE_FADE_PX" in script.text
+    assert "TIME_LABEL_EDGE_GAP_PX" in script.text
+    assert "leftEndpointRight" in script.text
+    assert "rightEndpointLeft" in script.text
+    assert "LIVE_FRAME_RATE" in script.text
+    assert "LIVE_RIGHT_PADDING_S" in script.text
+    assert "ROLLOUT_FUTURE_RATIO" in script.text
+    assert "const pixelAlignedLinePlugin" in script.text
+    assert "chart.$drawnTimeTicks" in script.text
+    assert "formatChartTimeValue(model.time, chart, true)" in script.text
+    assert "pointHoverRadius: 0" in script.text
+    assert "chart.$tooltipVisible" in script.text
+    assert "function snapChartTimeToFrame" in script.text
+    assert "chart.$frameTimes" in script.text
+    assert "event.button !== 1" in script.text
+    assert "publishedAfterStatus" in script.text
+    assert "function stepReplayFrame" in script.text
+    assert 'canvas.addEventListener("wheel"' in script.text
+    assert "function updateChartHoverFromClient" in script.text
+    assert "const threshold = 100;" in script.text

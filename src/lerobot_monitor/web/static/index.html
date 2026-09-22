@@ -96,6 +96,10 @@
             <h3 id="lib-videos-title">Videos</h3>
             <button type="button" id="btn-vid-refresh" class="ghost">Refresh</button>
           </div>
+          <label class="sr-only" for="vid-search">Search videos by title or note</label>
+          <div class="library-search">
+            <input id="vid-search" type="search" placeholder="Search title or note" autocomplete="off"/>
+          </div>
           <p id="vid-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="vid-list" class="lib-list" aria-busy="false"></ol>
         </section>
@@ -103,6 +107,10 @@
           <div class="library-heading">
             <h3 id="lib-datasets-title">Datasets</h3>
             <button type="button" id="btn-ds-refresh" class="ghost">Scan cache</button>
+          </div>
+          <label class="sr-only" for="ds-search">Search datasets by title or note</label>
+          <div class="library-search">
+            <input id="ds-search" type="search" placeholder="Search title or note" autocomplete="off"/>
           </div>
           <p id="ds-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="ds-list" class="lib-list" aria-busy="false"></ol>
@@ -112,6 +120,10 @@
             <h3 id="lib-snapshots-title">Snapshots</h3>
             <button type="button" id="btn-snap-refresh" class="ghost">Refresh</button>
           </div>
+          <label class="sr-only" for="snap-search">Search snapshots by title or note</label>
+          <div class="library-search">
+            <input id="snap-search" type="search" placeholder="Search title or note" autocomplete="off"/>
+          </div>
           <p id="snap-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="snap-list" class="lib-list" aria-busy="false"></ol>
         </section>
@@ -119,6 +131,10 @@
           <div class="library-heading">
             <h3 id="lib-models-title">Models</h3>
             <button type="button" id="btn-md-refresh" class="ghost">Rescan</button>
+          </div>
+          <label class="sr-only" for="md-library-search">Search local models by title or note</label>
+          <div class="library-search">
+            <input id="md-library-search" type="search" placeholder="Filter local models by title or note" autocomplete="off"/>
           </div>
           <div id="md-drop" class="model-drop" tabindex="0" role="region" aria-label="Add model from Hugging Face or a dropped model card">
             <p class="model-drop-hint">
@@ -486,22 +502,23 @@
 
     <div id="split-h" class="split row" role="separator" aria-orientation="horizontal"></div>
     <section id="bottom">
+      <aside id="action-legend" class="chart-legend bottom-legend" aria-label="Joint chart legend"></aside>
       <div class="chart-wrap panel" data-panel="chart-state">
-        <button type="button" class="panel-toggle" aria-expanded="true">
+        <div class="panel-heading">
           <h2>Joint state</h2>
-          <span class="chevron" aria-hidden="true">▾</span>
-        </button>
+        </div>
         <div class="panel-body">
           <canvas id="chart-state"></canvas>
         </div>
       </div>
       <div class="chart-wrap panel" data-panel="chart-action">
-        <button type="button" class="panel-toggle" aria-expanded="true">
+        <div class="panel-heading">
           <h2 id="chart-action-title">Commanded action</h2>
-          <span class="chevron" aria-hidden="true">▾</span>
-        </button>
+        </div>
         <div class="panel-body">
-          <canvas id="chart-action"></canvas>
+          <div class="chart-canvas">
+            <canvas id="chart-action"></canvas>
+          </div>
         </div>
       </div>
       <div id="split-log" class="split col" role="separator" aria-orientation="vertical"></div>

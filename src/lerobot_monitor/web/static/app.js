@@ -6781,6 +6781,13 @@ function fillPortSelect(id, ports, connectedPort, fallback) {
   else sel.value = "";
 }
 
+function savedPortValue(uiHw, key, fallback) {
+  if (Object.prototype.hasOwnProperty.call(uiHw, key)) {
+    return String(uiHw[key] ?? "");
+  }
+  return String(fallback || "");
+}
+
 async function refreshPorts() {
   try {
     const ports = await fetch(BASE + "/api/ports").then((r) => r.json());
@@ -6792,13 +6799,13 @@ async function refreshPorts() {
       "arm-port",
       lastPorts,
       robot.connected ? robot.port : "",
-      uiHw.arm_port || (meta.robot && meta.robot.port) || "",
+      savedPortValue(uiHw, "arm_port", meta.robot && meta.robot.port),
     );
     fillPortSelect(
       "leader-port",
       lastPorts,
       leader.connected ? leader.port : "",
-      uiHw.leader_port || (meta.leader && meta.leader.port) || "",
+      savedPortValue(uiHw, "leader_port", meta.leader && meta.leader.port),
     );
     syncDevicePowerButtons(robot, leader);
   } catch { /* ignore */ }

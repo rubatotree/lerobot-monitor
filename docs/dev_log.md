@@ -42,6 +42,11 @@
   rollout，不再等待后续 tick。
 - 顶栏 F/L 改为设备名电源按钮，bus/mode 文本移除；顶栏与 Hardware 面板共用
   `disconnectPending`，第一次软断开、第二次 force disconnect，独立 force 按钮删除。
+- F/L 标签移出按钮，按钮宽度随设备名收缩且高度与 HOLD pill 对齐。`refreshPorts`
+  使用 `savedPortValue` 区分“字段缺失”和显式空字符串，修复选择 `No device` 后刷新
+  又被默认 COM6/COM5 覆盖的问题。
+- `.brand` 固定为 260px 轨道（600px 以下为 220px），状态 pill 切换不再改变 F/L
+  按钮的横向位置。
 - 验证：排除 `test_sim.py` 后 `155 passed, 2 skipped`；`node --check`、Python compile
   通过。浏览器 smoke 覆盖系统 preset、显式 Load 日志、图标 Save/Rename、刷新持久化、
   服务重启自动恢复、1024/390px 无横向溢出；未使用真实串口和相机做换端口 soak。

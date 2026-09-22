@@ -1083,3 +1083,4 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert 'const endpointRole = role === "arm" ? "robot" : "leader";' in script.text
     assert 'lbl.textContent = label;' in script.text
     assert 'id="st-bus"' not in script.text
+    assert "function savedPortValue" in script.text

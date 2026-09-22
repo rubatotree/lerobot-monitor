@@ -20,14 +20,18 @@
         <span id="mode-pill" class="pill idle">offline</span>
       </div>
       <div class="header-status" aria-label="System status">
-        <button type="button" id="btn-hdr-arm-power" class="hdr-device-power" aria-pressed="false" title="Connect follower arm">
-          <span class="hdr-device-role">F</span>
-          <span id="st-robot" class="hdr-device-name">No device</span>
-        </button>
-        <button type="button" id="btn-hdr-leader-power" class="hdr-device-power" aria-pressed="false" title="Connect leader arm">
-          <span class="hdr-device-role">L</span>
-          <span id="st-leader" class="hdr-device-name">No device</span>
-        </button>
+        <span class="hdr-device-power-wrap">
+          <span class="hdr-stat">F</span>
+          <button type="button" id="btn-hdr-arm-power" class="hdr-device-power" aria-pressed="false" title="Connect follower arm">
+            <span id="st-robot" class="hdr-device-name">No device</span>
+          </button>
+        </span>
+        <span class="hdr-device-power-wrap">
+          <span class="hdr-stat">L</span>
+          <button type="button" id="btn-hdr-leader-power" class="hdr-device-power" aria-pressed="false" title="Connect leader arm">
+            <span id="st-leader" class="hdr-device-name">No device</span>
+          </button>
+        </span>
         <span class="hdr-stat" id="st-env" title="python / torch">env —</span>
         <span class="hdr-stat" id="st-elapsed">—</span>
         <span class="hdr-stat" id="st-episode">—</span>

@@ -68,6 +68,10 @@ Browser  --HTTP/WS/MJPEG-->  FastAPI
 - 顶栏任务按钮不再切换成 Stop 文案，只在任务激活时点亮。Stop 对 teleop/record/
   rollout 使用两阶段停止：第一次请求软停止并变黄，第二次发送 force stop，立即脱离
   推理引擎。Follower/leader 的顶栏与 Hardware 电源按钮共用软断开/强制断开逻辑。
+- 顶栏 F/L 标签移到按钮外，设备名按钮宽度随文字收缩并保持与 HOLD pill 同高；
+  Hardware 保存的空端口不再被默认 COM 口回退覆盖，刷新后保持 `No device`。
+- 左侧品牌区固定占用 260px（窄屏 220px）布局轨道，模式 pill 文字变化不会推动
+  右侧设备按钮。
 
 验证：排除缺少 `scservo_sdk` 的仿真测试后为 `155 passed, 2 skipped`；`node --check`、
 Python compile 与浏览器 smoke 通过。浏览器覆盖固定搜索/工具栏、per-tab 搜索与 preset

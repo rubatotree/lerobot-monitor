@@ -1367,18 +1367,21 @@ function updateTaskInfo() {
   ]);
   set("info-roll", [
     ...envLines,
-    "# in-process  equivalent CLI",
+    "# direct lerobot-rollout CLI",
     "lerobot-rollout",
-    flag("strategy.type", "base"),
+    flag("strategy.type", autoRecord ? "sentry" : "base"),
     flag("policy.path", roll.policy_path || ""),
-    flag("policy.device", roll.device),
+    flag("device", roll.device),
     ...robotFlags,
     flag("task", roll.task || ""),
     flag("duration", roll.duration_s),
-    flag("policy_fps", roll.policy_fps),
-    flag("record", autoRecord),
-    autoRecord ? flag("action_fps", actionFps) : null,
-    autoRecord ? flag("video_fps", videoFps) : null,
+    flag("fps", roll.policy_fps),
+    autoRecord ? flag("dataset.repo_id", rec.repo_id || "") : null,
+    autoRecord ? flag("dataset.single_task", roll.task || rec.task || "") : null,
+    autoRecord ? flag("dataset.fps", actionFps) : null,
+    autoRecord ? flag("dataset.video", rec.video) : null,
+    autoRecord ? flag("dataset.streaming_encoding", rec.streaming_encoding) : null,
+    autoRecord ? flag("dataset.encoder_threads", rec.encoder_threads) : null,
     ...extraFlags(roll.extra),
   ]);
 }

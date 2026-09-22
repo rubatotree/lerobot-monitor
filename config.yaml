@@ -58,7 +58,5 @@ rollout:
   device: cuda
   default_duration_s: 60
   default_fps: 15
-  prediction_interval_s: 0.5
-  prediction_chunk_size: 16
   rename_map:
     "observation.images.0": "observation.images.front"

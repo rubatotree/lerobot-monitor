@@ -9,6 +9,7 @@ import queue
 import sys
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,7 +19,16 @@ from .cameras import CameraHub
 from .config import MonitorConfig
 from .leader import LeaderArm
 from .library import DatasetRecorder, VideoLibrary
-from .policy import ActionChunk, LoadedPolicy, load_policy, predict_action_chunk, predict_pose
+from .policy import (
+    ActionChunk,
+    LoadedPolicy,
+    create_monitor_inference_engine,
+    inference_leftover_poses,
+    inference_config_from_extra,
+    load_policy,
+    pose_from_action_tensor,
+    predict_action_chunk,
+)
 from .robot import FollowerArm
 from .store import JsonStore
 from .types import JOINT_ORDER, RELAX_POSE, lerp_pose, merge_partial
@@ -170,11 +180,10 @@ class ControlLoop:
         # Latest rollout action-chunk preview for the charts (telemetry only).
         self._rollout_prediction: dict[str, Any] | None = None
         self._prediction_sequence = 0
+        self._inference_engine: Any | None = None
+        self._rollout_hw_feature_spec: dict = {}
         self._next_prediction_t = 0.0
-        prediction_interval = float(getattr(config.rollout, "prediction_interval_s", 0.5))
-        # A non-positive interval disables the preview inference entirely.
-        self._prediction_interval = max(0.1, prediction_interval) if prediction_interval > 0 else 0.0
-        self._prediction_warned = False
+        self._prediction_interval = 0.5
         self._policy_cache: dict[tuple[Any, ...], LoadedPolicy] = {}
         self._debug_lease_token: str | None = None
         self._policy_generation = 0
@@ -224,6 +233,7 @@ class ControlLoop:
                 thread.join(timeout=10.0)
                 if not thread.is_alive():
                     self._thread = None
+            self._end_rollout()
             try:
                 self._close_writer()
             finally:
@@ -346,7 +356,6 @@ class ControlLoop:
         first = self.mode != "estop"
         self.mode = "estop"
         self._clear_debug_lease()
-        self._clear_rollout_prediction()
         self.hold_when_idle = False
         self._slew_goal = None
         self._pending_release = None
@@ -360,6 +369,8 @@ class ControlLoop:
                 self.follower.disable_torque()
             except Exception:
                 pass
+        finally:
+            self._end_rollout()
         try:
             self._close_writer()
         except Exception as exc:  # noqa: BLE001
@@ -514,6 +525,7 @@ class ControlLoop:
             self.pending = None
             self.log("info", "rollout cancelled")
             return False
+        self._end_rollout()
         loaded.reset()
         loaded.task = str(payload.get("task") or loaded.task)
         self.loaded_policy = loaded
@@ -524,8 +536,6 @@ class ControlLoop:
         self.policy_fps, self.effective_policy_fps = self._policy_rates(payload)
         self._policy_interval = 1.0 / self.effective_policy_fps
         self._next_policy_t = self.task_t0
-        self._clear_rollout_prediction()
-        self._next_prediction_t = self.task_t0
         if payload.get("auto_record") is not None:
             self.auto_record = bool(payload.get("auto_record"))
         want_record = bool(payload.get("record")) if payload.get("record") is not None else self.auto_record
@@ -553,6 +563,8 @@ class ControlLoop:
                 recorder.close()
             self.pending = None
             self.log("info", "rollout cancelled")
+            return False
+        if not self._start_inference_engine(loaded):
             return False
         self._touch_bus()
         self.log("info", f"rollout started ({loaded.policy.__class__.__name__})")
@@ -900,9 +912,9 @@ class ControlLoop:
 
     def _release_follower(self, reason: str) -> None:
         self._clear_debug_lease()
-        self._clear_rollout_prediction()
         if self.follower.connected:
             self.follower.disconnect()
+        self._end_rollout()
         self._slew_goal = None
         self._slew_start = None
         self.mode = "estop" if reason == "estop" or self._estop.is_set() else "offline"
@@ -1133,7 +1145,7 @@ class ControlLoop:
             elif stopped == "rollout":
                 path = self._close_writer()
                 self.loaded_policy = None
-                self._clear_rollout_prediction()
+                self._end_rollout()
                 self.mode = "idle" if self.follower.connected else "offline"
                 if self.joints:
                     self.latched = dict(self.joints)
@@ -1314,7 +1326,7 @@ class ControlLoop:
             self._invalidate_policy_load()
             path = self._close_writer()
             self.loaded_policy = None
-            self._clear_rollout_prediction()
+            self._end_rollout()
             self.mode = "idle" if self.follower.connected else "offline"
             if self.joints:
                 self.latched = dict(self.joints)
@@ -1392,6 +1404,8 @@ class ControlLoop:
             if self.mode == "jogging" and self._pending_release:
                 self._release_follower(self._pending_release)
             elif self.mode in {"rollout", "record", "teleop"}:
+                if self.mode == "rollout":
+                    self._end_rollout()
                 self._close_writer()
                 self.mode = "idle"
 
@@ -1453,7 +1467,7 @@ class ControlLoop:
 
     def _tick_rollout(self) -> None:
         if self._cancel.is_set() or self.loaded_policy is None:
-            self._clear_rollout_prediction()
+            self._end_rollout()
             self.mode = "idle"
             return
         now = time.perf_counter()
@@ -1461,7 +1475,7 @@ class ControlLoop:
             self.log("info", "rollout duration reached")
             self._close_writer()
             self.loaded_policy = None
-            self._clear_rollout_prediction()
+            self._end_rollout()
             self.mode = "idle"
             self.latched = dict(self.joints)
             return
@@ -1469,72 +1483,117 @@ class ControlLoop:
             self._maybe_record("rollout")
             return
         self._next_policy_t = self._advance_deadline(self._next_policy_t, self._policy_interval, now)
-        images = self.cameras.latest_rgb_map()
-        pose = predict_pose(self.loaded_policy, self.joints, images)
+        engine = self._inference_engine
+        if engine is None:
+            raise RuntimeError("rollout inference engine is not running")
+        if engine.failed:
+            raise RuntimeError(engine.failure_traceback or "rollout inference engine failed")
+
+        observation = dict(self.joints or {})
+        observation.update(self.cameras.latest_rgb_map())
+        engine.notify_observation(observation)
+        obs_frame = self._build_rollout_obs_frame(observation)
+        action = engine.get_action(obs_frame)
+        if action is None:
+            self._maybe_record("rollout")
+            return
+        pose = pose_from_action_tensor(self.loaded_policy, action, self.joints)
         if self._cancel.is_set() or self._estop.is_set() or self.mode != "rollout":
             return
         self.follower.send_pose(pose)
         self.action = dict(pose)
         self.latched = dict(pose)
         self._maybe_record("rollout")
-        if self._prediction_interval > 0 and now >= self._next_prediction_t:
-            self._capture_rollout_prediction(now, images)
+        if now >= self._next_prediction_t:
+            queued = inference_leftover_poses(engine, self.loaded_policy, self.joints)
+            if queued:
+                self._record_rollout_prediction(queued)
+            self._next_prediction_t = now + self._prediction_interval
+
+    def _rollout_hw_features(self) -> dict:
+        """Describe the raw observation keys consumed by LeRobot's engine."""
+        from lerobot.utils.constants import OBS_STR
+        from lerobot.utils.feature_utils import hw_to_dataset_features
+
+        hardware: dict[str, Any] = {name: float for name in JOINT_ORDER}
+        for camera in self.cameras.snapshots():
+            if not (camera.get("enabled") and camera.get("feed_robot")):
+                continue
+            hardware[str(camera["name"])] = (
+                int(camera.get("height") or 480),
+                int(camera.get("width") or 640),
+                3,
+            )
+        return hw_to_dataset_features(hardware, OBS_STR, use_video=False)
+
+    def _build_rollout_obs_frame(self, observation: dict[str, Any]) -> dict[str, Any]:
+        """Build the dataset frame passed to LeRobot's inference engine."""
+        from lerobot.utils.constants import OBS_STR
+        from lerobot.utils.feature_utils import build_dataset_frame
+
+        return build_dataset_frame(self._rollout_hw_feature_spec, observation, prefix=OBS_STR)
+
+    def _start_inference_engine(self, loaded: LoadedPolicy) -> bool:
+        """Build and start LeRobot's sync or RTC inference engine."""
+        self._end_rollout()
+        try:
+            config = inference_config_from_extra(self.rollout_extra)
+            rtc = getattr(config, "rtc", None)
+            self.log(
+                "info",
+                f"rollout inference config: type={config.type}"
+                + (f", rtc={rtc}" if rtc is not None else ""),
+            )
+            hw_features = self._rollout_hw_features()
+            engine = create_monitor_inference_engine(
+                loaded,
+                inference_config=config,
+                hw_features=hw_features,
+                task=loaded.task,
+                fps=self.effective_policy_fps,
+            )
+            engine.reset()
+            engine.start()
+            engine.resume()
+        except Exception as exc:  # noqa: BLE001 - report engine setup failures to the UI
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.log("error", f"inference engine setup failed: {self.last_error}")
+            self.log("error", traceback.format_exc())
+            self._close_writer()
+            self.loaded_policy = None
+            self.mode = "idle" if self.follower.connected else "offline"
+            return False
+        self._inference_engine = engine
+        self._rollout_hw_feature_spec = hw_features
+        self._next_prediction_t = self.task_t0
+        self.log("info", f"rollout inference engine started ({config.type})")
+        return True
+
+    def _end_rollout(self) -> None:
+        """Stop background inference and clear chart state for the current rollout."""
+        engine = self._inference_engine
+        self._inference_engine = None
+        self._rollout_hw_feature_spec = {}
+        if engine is not None:
+            engine.stop()
+        self._clear_rollout_prediction()
 
     def _clear_rollout_prediction(self) -> None:
         self._rollout_prediction = None
-        self._prediction_warned = False
 
-    def _capture_rollout_prediction(self, now: float, images: Mapping[str, np.ndarray]) -> None:
-        """Store a chunk preview for the charts.
-
-        Rollout execution keeps using ``predict_pose``/``select_action``, so this
-        is a second, throttled inference purely for the dashed overlay. It never
-        resets the running policy and never falls back to sequential
-        ``select_action`` calls, so a failure or an unsupported policy only drops
-        the overlay instead of disturbing the actions being sent.
-        """
-        loaded = self.loaded_policy
-        if loaded is None:
-            self._next_prediction_t = time.perf_counter() + self._prediction_interval
-            return
-        started = time.perf_counter()
-        observed_t_s = now - self.task_t0
-        try:
-            with _POLICY_INFER_LOCK, self._capture_task_output():
-                chunk: ActionChunk = predict_action_chunk(
-                    loaded,
-                    self.joints,
-                    images,
-                    self.config.rollout.prediction_chunk_size,
-                    reset=False,
-                    allow_sequential=False,
-                )
-        except Exception as exc:  # noqa: BLE001 - a preview must never stop a rollout
-            if not self._prediction_warned:
-                self._prediction_warned = True
-                self.log("error", f"rollout chunk preview unavailable: {exc}")
-            self._rollout_prediction = None
-            self._next_prediction_t = time.perf_counter() + self._prediction_interval
-            return
-        finished = time.perf_counter()
-        # Schedule from completion so a slow preview cannot build an
-        # immediate backlog of extra inferences.
-        self._next_prediction_t = finished + self._prediction_interval
-        latency_ms = (finished - started) * 1000.0
+    def _record_rollout_prediction(self, actions: list[dict[str, float]]) -> None:
+        """Publish the future actions already held by LeRobot's RTC action queue."""
         step_s = 1.0 / max(1.0, float(self.policy_fps))
         self._prediction_sequence += 1
-        self._prediction_warned = False
         self._rollout_prediction = {
             "id": self._prediction_sequence,
-            # The chunk only becomes actionable after inference completes.
-            "t_s": round(finished - self.task_t0, 3),
-            "observed_t_s": round(observed_t_s, 3),
+            "t_s": round(time.perf_counter() - self.task_t0, 3),
             "step_s": round(step_s, 6),
-            "strategy": chunk.strategy,
-            "degraded": chunk.degraded,
-            "latency_ms": round(latency_ms, 2),
+            "strategy": "policy_queue",
+            "degraded": False,
+            "latency_ms": 0.0,
             "actions": [
                 {name: round(float(value), 6) for name, value in action.items()}
-                for action in chunk.actions
+                for action in actions
             ],
         }

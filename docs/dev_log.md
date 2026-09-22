@@ -1,5 +1,33 @@
 # Dev log
 
+## 2026-09-22（Rollout 连续推理回归修复）
+
+- 修复 rollout 预测图引入的实时推理回归：控制循环不再每 0.5 s 额外调用一次
+  `predict_action_chunk()`。SmolVLA 等 chunking policy 的 `select_action()` 本来就会
+  填充 action queue，现在 overlay 直接读取该队列中尚未执行的同批动作。
+- 预测 chunk 仍以单调 ID、真实推理完成时间和 policy FPS 发布，但只在主推理刷新 action
+  queue 时更新；模型调用次数与未启用 overlay 时相同。
+- 删除 `rollout.prediction_interval_s` 与 `rollout.prediction_chunk_size`：前者会制造额外
+  VLA 推理并挤占控制线程，后者会截短真实队列、在两次刷新之间误报预测断档。
+- 删除上一轮手写的异步 producer，rollout 改为通过 LeRobot 的
+  `create_inference_engine()` 创建 `SyncInferenceEngine` 或 `RTCInferenceEngine`。
+- `inference.type`、`inference.rtc.*` 和 `inference.queue_threshold` 现在会解析为
+  `RTCInferenceConfig`。RTC 路径会把 `rtc_config` 安装到 policy，并调用
+  `init_rtc_processor()`，因此 UI 参数不再被静默忽略。
+- 已用缓存中的 `rubatotree/so101_classify_the_blocks_smolvla_512` 在 CUDA 环境验证
+  `load_policy → create_monitor_inference_engine → reset/start/resume/stop`，实际得到
+  `RTCInferenceEngine`。engine setup 异常现在同时记录完整 traceback。
+- 修复 `_rollout_hw_features` 实例字典遮蔽同名方法导致的
+  `TypeError: 'dict' object is not callable`；缓存字段更名为
+  `_rollout_hw_feature_spec`，并增加真实覆盖 `_start_inference_engine` 的回归测试。
+- 恢复非 RTC 的虚线预测：同步 engine 没有 `ActionQueue`，现在回退读取 policy 自身的
+  `select_action()` action queue；该路径只做 telemetry 映射，不执行额外推理。
+- E-STOP 和 Disconnect 调整为先关闭力矩/释放串口，再收后台 producer，避免线程 join
+  延迟安全动作。
+- 验证：`tests/test_policy.py` 与 `tests/test_loop.py` 共 41 项通过；排除当前 venv
+  缺少 `scservo_sdk` 的 `test_sim.py` 后，全套为 `129 passed, 2 skipped`。尚未执行
+  SmolVLA + 真实 SO-101 的长时 rollout，需在硬件侧确认动作连续性。
+
 ## 2026-09-21（Monitor 页面 GPU 降载）
 
 - 相机 MJPEG 改为可视区懒加载：主相机与 Hardware 小图只有进入视口且页面可见时才设置

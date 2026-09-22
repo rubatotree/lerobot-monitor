@@ -9,12 +9,19 @@ observation state ``(J,)`` and action chunk ``(B, T, A)``.
 import contextlib
 import sys
 import types
+from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
-from lerobot_monitor.policy import LoadedPolicy, predict_action_chunk
+from lerobot_monitor.policy import (
+    LoadedPolicy,
+    create_monitor_inference_engine,
+    inference_config_from_extra,
+    predict_action_chunk,
+)
 
 ACTION = "action"
 OBS_STR = "observation"
@@ -261,3 +268,92 @@ def test_non_positive_chunk_size_is_rejected(fake_lerobot) -> None:
 
     with pytest.raises(ValueError, match="chunk_size must be positive"):
         predict_action_chunk(loaded, observation_joints(), {}, 0)
+
+
+def test_inference_config_from_extra_parses_rtc_fields(monkeypatch) -> None:
+    @dataclass
+    class FakeRTCConfig:
+        enabled: bool = True
+        mode: str = "guided"
+        prefix_attention_schedule: str = "LINEAR"
+        max_guidance_weight: float = 10.0
+        execution_horizon: int = 10
+        debug: bool = False
+        debug_maxlen: int = 100
+
+    @dataclass
+    class FakeRTCInferenceConfig:
+        rtc: FakeRTCConfig
+        queue_threshold: int = 30
+
+    @dataclass
+    class FakeSyncInferenceConfig:
+        pass
+
+    rtc_module = types.ModuleType("lerobot.policies.rtc.configuration_rtc")
+    rtc_module.RTCConfig = FakeRTCConfig
+    inference_module = types.ModuleType("lerobot.rollout.inference")
+    inference_module.RTCInferenceConfig = FakeRTCInferenceConfig
+    inference_module.SyncInferenceConfig = FakeSyncInferenceConfig
+    monkeypatch.setitem(sys.modules, "lerobot.policies.rtc.configuration_rtc", rtc_module)
+    monkeypatch.setitem(sys.modules, "lerobot.rollout.inference", inference_module)
+
+    config = inference_config_from_extra(
+        {
+            "inference.type": "rtc",
+            "inference.rtc.execution_horizon": "15",
+            "inference.rtc.max_guidance_weight": "5.0",
+            "inference.queue_threshold": "12",
+        }
+    )
+
+    assert isinstance(config, FakeRTCInferenceConfig)
+    assert config.rtc.execution_horizon == 15
+    assert config.rtc.max_guidance_weight == pytest.approx(5.0)
+    assert config.queue_threshold == 12
+
+
+def test_create_monitor_engine_installs_rtc_processor(monkeypatch) -> None:
+    class FakePolicyConfig:
+        rtc_config = None
+
+    class FakeRTCInferenceConfig:
+        def __init__(self, rtc) -> None:
+            self.rtc = rtc
+
+    rtc_config = SimpleNamespace(enabled=True, execution_horizon=15)
+    policy = SimpleNamespace(
+        config=FakePolicyConfig(),
+        init_rtc_processor=MagicMock(),
+    )
+    loaded = loaded_policy(policy)
+    captured: dict[str, object] = {}
+    engine = object()
+
+    def fake_create_inference_engine(config, **kwargs):
+        captured["config"] = config
+        captured.update(kwargs)
+        return engine
+
+    inference_module = types.ModuleType("lerobot.rollout.inference")
+    inference_module.RTCInferenceConfig = FakeRTCInferenceConfig
+    inference_module.create_inference_engine = fake_create_inference_engine
+    rtc_module = types.ModuleType("lerobot.rollout.inference.rtc")
+    rtc_module.supports_rtc_inference = lambda _policy: True
+    monkeypatch.setitem(sys.modules, "lerobot.rollout.inference", inference_module)
+    monkeypatch.setitem(sys.modules, "lerobot.rollout.inference.rtc", rtc_module)
+
+    result = create_monitor_inference_engine(
+        loaded,
+        inference_config=FakeRTCInferenceConfig(rtc_config),
+        hw_features={"observation.state": {"names": ACTION_NAMES}},
+        task="pick cube",
+        fps=15,
+    )
+
+    assert result is engine
+    assert policy.config.rtc_config is rtc_config
+    policy.init_rtc_processor.assert_called_once_with()
+    assert captured["task"] == "pick cube"
+    assert captured["fps"] == 15
+    assert captured["robot_wrapper"].robot_type == loaded.robot_type

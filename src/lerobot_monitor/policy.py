@@ -9,8 +9,10 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from enum import Enum
 from typing import Any, Iterator, Mapping
 
 import numpy as np
@@ -44,6 +46,8 @@ def _coerce_override(raw: str, current: Any) -> Any:
         return int(float(text))
     if isinstance(current, float):
         return float(text)
+    if isinstance(current, Enum):
+        return type(current)(text.upper())
     lower = text.lower()
     if current is None and lower in {"true", "false"}:
         return lower == "true"
@@ -185,56 +189,163 @@ def load_policy(
         return _load(local_only=False)
 
 
-def predict_pose(
+@dataclass
+class InferenceRobotAdapter:
+    """Minimal robot metadata consumed by LeRobot's inference-engine factory."""
+
+    robot_type: str
+    action_features: dict[str, float]
+
+
+def inference_config_from_extra(extra: Mapping[str, str] | None):
+    """Parse monitor ``inference.*`` extras into LeRobot's engine config."""
+    ensure_lerobot_on_path()
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout.inference import RTCInferenceConfig, SyncInferenceConfig
+
+    values = {
+        str(key).removeprefix("--"): str(value)
+        for key, value in (extra or {}).items()
+        if str(key).strip()
+    }
+    if values.get("inference.type", "sync").strip().lower() != "rtc":
+        return SyncInferenceConfig()
+
+    defaults = RTCConfig()
+    rtc_values: dict[str, Any] = {}
+    for field in fields(RTCConfig):
+        key = f"inference.rtc.{field.name}"
+        if key in values:
+            rtc_values[field.name] = _coerce_override(values[key], getattr(defaults, field.name))
+    queue_threshold = _coerce_override(
+        values.get("inference.queue_threshold", "30"),
+        30,
+    )
+    return RTCInferenceConfig(
+        rtc=RTCConfig(**rtc_values),
+        queue_threshold=int(queue_threshold),
+    )
+
+
+def create_monitor_inference_engine(
     loaded: LoadedPolicy,
-    joints: Mapping[str, float],
-    images_rgb: Mapping[str, np.ndarray],
+    *,
+    inference_config: Any,
+    hw_features: dict,
+    task: str,
+    fps: float,
+    shutdown_event: Any | None = None,
+):
+    """Build LeRobot's sync or RTC inference engine for the monitor rollout."""
+    ensure_lerobot_on_path()
+    from lerobot.rollout.inference import RTCInferenceConfig, create_inference_engine
+    from lerobot.rollout.inference.rtc import supports_rtc_inference
+
+    if isinstance(inference_config, RTCInferenceConfig):
+        if not supports_rtc_inference(loaded.policy):
+            raise ValueError(
+                "RTC inference is not supported by this policy: predict_action_chunk() must accept "
+                "inference_delay and prev_chunk_left_over."
+            )
+        loaded.policy.config.rtc_config = inference_config.rtc
+        if hasattr(loaded.policy, "init_rtc_processor"):
+            loaded.policy.init_rtc_processor()
+    else:
+        if hasattr(loaded.policy.config, "rtc_config"):
+            loaded.policy.config.rtc_config = None
+        if hasattr(loaded.policy, "init_rtc_processor"):
+            loaded.policy.init_rtc_processor()
+
+    robot = InferenceRobotAdapter(
+        robot_type=loaded.robot_type,
+        action_features={name: float for name in loaded.ordered_action_keys},
+    )
+    return create_inference_engine(
+        inference_config,
+        policy=loaded.policy,
+        preprocessor=loaded.preprocessor,
+        postprocessor=loaded.postprocessor,
+        robot_wrapper=robot,
+        hw_features=hw_features,
+        dataset_features=loaded.dataset_features,
+        ordered_action_keys=loaded.ordered_action_keys,
+        task=task,
+        fps=fps,
+        device=loaded.device,
+        shutdown_event=shutdown_event,
+    )
+
+
+def pose_from_action_tensor(
+    loaded: LoadedPolicy,
+    action: Any,
+    fallback_joints: Mapping[str, float],
 ) -> dict[str, float]:
-    """Run one policy step.
+    """Map an inference-engine action tensor to a complete monitor pose."""
+    return _action_pose(action, loaded, fallback_joints)
 
-    Observation layout:
-        observation.state           (J,) float32  — joints in JOINT_ORDER
-        observation.images.<name>   (H, W, 3) uint8 RGB
-    Action layout:
-        tensor [action_dim] mapped via dataset_features names → joint pose.
-    """
-    import torch
 
-    from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
-    from lerobot.utils.constants import ACTION, OBS_STR
-
-    state = np.array([float(joints[name]) for name in JOINT_ORDER if name in joints], dtype=np.float32)
-    observation: dict[str, np.ndarray] = {f"{OBS_STR}.state": state}
-    for cam_name, rgb in images_rgb.items():
-        observation[f"{OBS_STR}.images.{cam_name}"] = np.ascontiguousarray(rgb)
-
-    device = torch.device(loaded.device if torch.cuda.is_available() or loaded.device == "cpu" else "cpu")
-    with torch.inference_mode():
-        prepared = prepare_observation_for_inference(
-            observation, device, loaded.task, loaded.robot_type
-        )
-        prepared = loaded.preprocessor(prepared)
-        action = loaded.policy.select_action(prepared)
-        action = loaded.postprocessor(action)
-
+def rtc_leftover_poses(
+    engine: Any,
+    loaded: LoadedPolicy,
+    fallback_joints: Mapping[str, float],
+) -> list[dict[str, float]]:
+    """Read the processed future actions already held by LeRobot's RTC queue."""
+    queue = getattr(engine, "action_queue", None)
+    if queue is None:
+        return []
     try:
-        robot_action = make_robot_action(action, loaded.dataset_features)
-    except Exception:
-        # Fallback when the policy tensor is already a named mapping.
-        if isinstance(action, dict):
-            robot_action = {str(k): float(v) for k, v in action.items()}
-        else:
-            flat = action.squeeze(0).detach().cpu().tolist()
-            robot_action = {
-                key: float(flat[i]) for i, key in enumerate(loaded.ordered_action_keys) if i < len(flat)
-            }
-    pose = observation_to_pose(robot_action)
-    if len(pose) < len(JOINT_ORDER):
-        # Fill unspecified joints from the current observation so a partial action cannot drop them.
-        merged = dict(joints)
-        merged.update(pose)
-        return merged
-    return pose
+        leftover = queue.get_processed_left_over()
+    except Exception as exc:  # noqa: BLE001 - chart telemetry must not affect control
+        logger.debug("could not read RTC leftover actions: %s", exc)
+        return []
+    if leftover is None:
+        return []
+    return [_action_pose(action, loaded, fallback_joints) for action in leftover]
+
+
+def _policy_action_queue(policy: Any) -> deque | None:
+    """Return the action queue used by synchronous chunking policies."""
+    for attr in getattr(policy, "_action_queue_attrs", ("_queues", "_action_queue")):
+        queue = getattr(policy, attr, None)
+        if isinstance(queue, Mapping):
+            queue = queue.get("action")
+        if isinstance(queue, deque):
+            return queue
+    return None
+
+
+def sync_leftover_poses(
+    loaded: LoadedPolicy,
+    fallback_joints: Mapping[str, float],
+) -> list[dict[str, float]]:
+    """Read unread sync-policy actions without running another inference."""
+    queue = _policy_action_queue(loaded.policy)
+    if queue is None:
+        return []
+    pending = list(queue)
+    if not pending:
+        return []
+
+    actions: list[dict[str, float]] = []
+    for action in pending:
+        try:
+            actions.append(_action_pose(loaded.postprocessor(action), loaded, fallback_joints))
+        except Exception as exc:  # noqa: BLE001 - chart telemetry must not affect control
+            logger.debug("could not project sync queued action for the rollout chart: %s", exc)
+            break
+    return actions
+
+
+def inference_leftover_poses(
+    engine: Any,
+    loaded: LoadedPolicy,
+    fallback_joints: Mapping[str, float],
+) -> list[dict[str, float]]:
+    """Return future actions from the active LeRobot engine, without extra inference."""
+    return rtc_leftover_poses(engine, loaded, fallback_joints) or sync_leftover_poses(
+        loaded, fallback_joints
+    )
 
 
 def _action_pose(
@@ -243,9 +354,9 @@ def _action_pose(
     fallback_joints: Mapping[str, float],
 ) -> dict[str, float]:
     """Map one policy action tensor or mapping to a complete joint pose."""
-    from lerobot.policies.utils import make_robot_action
-
     try:
+        from lerobot.policies.utils import make_robot_action
+
         robot_action = make_robot_action(action, loaded.dataset_features)
     except Exception:
         if isinstance(action, dict):

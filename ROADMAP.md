@@ -375,6 +375,17 @@ E-STOP、Stop 和任务切换的现有所有权语义。
 - `pytest`、`node --check`、`git diff --check` 与可执行的浏览器 smoke 通过，无法覆盖的
   真实硬件边界记录在 `docs/dev_log.md`。
 
+### 回归修复（2026-09-22）
+
+实时 rollout 的虚线预测不得再触发第二次 policy inference。overlay 必须复用
+`select_action()` 已填充的 action queue；模型调用次数与关闭 overlay 时一致，避免
+SmolVLA 等大模型因额外 chunk 推理拖慢控制线程或出现周期性动作断续。
+
+rollout 必须使用 LeRobot 自带的 `create_inference_engine()`，不得在 monitor 内手写
+替代 engine。RTC 参数必须完整进入 `RTCInferenceConfig`，并安装到 policy 的
+`rtc_config` 后调用 `init_rtc_processor()`。E-STOP/Disconnect 仍先执行硬件安全动作，
+再停止 engine。
+
 ## 后续里程碑（2026-09-21）：Blender 远程虚拟相机接入
 
 状态：已实现并通过自动化与当前运行中的 Blender 流验证。

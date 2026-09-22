@@ -2,6 +2,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -11,7 +12,6 @@ import pytest
 from lerobot_monitor import loop as loop_module
 from lerobot_monitor.config import CamerasConfig, LibraryConfig, MonitorConfig, RecordingConfig, RobotConfig
 from lerobot_monitor.loop import Command, ControlLoop
-from lerobot_monitor.policy import ActionChunk
 from lerobot_monitor.types import JOINT_ORDER
 
 
@@ -31,6 +31,23 @@ def _loop(tmp_path: Path) -> ControlLoop:
     leader.connected = False
     leader.snapshot.return_value = {"connected": False}
     return ControlLoop(config, cameras, follower, leader)
+
+
+class FakeInferenceEngine:
+    """Small stand-in for LeRobot's sync/RTC engine at the monitor boundary."""
+
+    def __init__(self, action: dict[str, float], leftovers: list[dict[str, float]] | None = None) -> None:
+        self.action = action
+        self.failed = False
+        self.failure_traceback = None
+        self.notify_observation = MagicMock()
+        self.get_action = MagicMock(return_value=action)
+        self.stop = MagicMock()
+        self.action_queue = None
+        if leftovers is not None:
+            self.action_queue = SimpleNamespace(
+                get_processed_left_over=MagicMock(return_value=leftovers)
+            )
 
 
 def _dispatch(loop: ControlLoop, kind: str, payload: dict[str, object] | None = None) -> dict:
@@ -85,6 +102,7 @@ def test_stopped_policy_worker_cannot_replace_new_rollout(tmp_path: Path, monkey
         job.result = loaded(path)
 
     monkeypatch.setattr(loop, "_policy_worker", worker)
+    monkeypatch.setattr(loop, "_start_inference_engine", lambda _loaded: True)
     loop._handle(Command("rollout_start", {"policy_path": "old", "record": False}))
     old_job = loop._policy_job
     assert old_job is not None
@@ -495,75 +513,100 @@ def test_resumed_record_num_episodes_is_relative_to_start_index(tmp_path: Path, 
 def test_rollout_policy_deadline_runs_at_policy_rate_without_drift(tmp_path: Path, monkeypatch) -> None:
     loop = _loop(tmp_path)
     loaded = SimpleNamespace(path="policy", task="", policy=MagicMock(), reset=MagicMock())
+    engine = FakeInferenceEngine({"gripper": 1.0})
+    monkeypatch.setattr(loop, "_start_inference_engine", lambda _loaded: (
+        setattr(loop, "_inference_engine", engine) or True
+    ))
+    monkeypatch.setattr(loop, "_build_rollout_obs_frame", lambda observation: observation)
     monkeypatch.setattr(loop_module.time, "perf_counter", lambda: 0.0)
     assert loop._begin_rollout(loaded, {"record": False, "policy_fps": 15}, "policy")
-    predict = MagicMock(return_value={"gripper": 1.0})
-    monkeypatch.setattr(loop_module, "predict_pose", predict)
-    # The chart preview is a separate, throttled inference; keep it out of this clock.
-    monkeypatch.setattr(loop, "_capture_rollout_prediction", MagicMock())
 
     clock = iter((0.0, 1 / 30, 2 / 30, 3 / 30, 4 / 30))
     monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(clock))
     for _ in range(5):
         loop._tick_rollout()
 
-    assert predict.call_count == 3
+    assert engine.get_action.call_count == 3
     assert loop.follower.send_pose.call_count == 3
     assert loop._next_policy_t == pytest.approx(0.2)
 
 
-def test_rollout_prediction_uses_completion_time_and_unique_ids(tmp_path: Path, monkeypatch) -> None:
+def test_rollout_prediction_reads_lerobot_rtc_queue(tmp_path: Path, monkeypatch) -> None:
     loop = _loop(tmp_path)
     loop.loaded_policy = SimpleNamespace(path="policy", task="", policy=MagicMock(), reset=MagicMock())
+    loop.mode = "rollout"
     loop.task_t0 = 10.0
     loop.policy_fps = 20.0
-    calls: list[dict] = []
-
-    def fake_chunk(*_args, **kwargs):
-        calls.append(kwargs)
-        return ActionChunk(
-            actions=[{"gripper": 1.0}, {"gripper": 2.0}],
-            strategy="policy_chunk",
-            degraded=False,
-            warnings=[],
-        )
-
-    monkeypatch.setattr(loop_module, "predict_action_chunk", fake_chunk)
-    clock = iter((12.0, 12.25, 13.0, 13.5))
+    loop._next_policy_t = 0.0
+    loop._next_prediction_t = 0.0
+    loop._inference_engine = FakeInferenceEngine(
+        {"gripper": 0.0},
+        leftovers=[{"gripper": 1.0}, {"gripper": 2.0}],
+    )
+    monkeypatch.setattr(loop, "_build_rollout_obs_frame", lambda observation: observation)
+    clock = iter((12.0, 12.25, 13.0, 13.25))
     monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(clock))
 
-    loop._capture_rollout_prediction(11.5, {})
+    loop._tick_rollout()
     first = loop._rollout_prediction
-    assert loop._next_prediction_t == pytest.approx(12.75)
-    loop._capture_rollout_prediction(12.75, {})
-    second = loop._rollout_prediction
 
-    assert first is not None and second is not None
+    assert first is not None
     assert first["id"] == 1
-    assert first["observed_t_s"] == 1.5
     assert first["t_s"] == 2.25
     assert first["step_s"] == 0.05
-    assert second["id"] == 2
-    assert second["t_s"] == 3.5
-    assert loop._next_prediction_t == pytest.approx(14.0)
-    assert all(call["reset"] is False and call["allow_sequential"] is False for call in calls)
+    assert first["strategy"] == "policy_queue"
+    assert first["latency_ms"] == 0.0
+    assert first["actions"] == [{"gripper": 1.0}, {"gripper": 2.0}]
 
 
-def test_rollout_prediction_failure_is_non_fatal_and_throttled(tmp_path: Path, monkeypatch) -> None:
+def test_rollout_prediction_reads_sync_policy_queue(tmp_path: Path, monkeypatch) -> None:
     loop = _loop(tmp_path)
-    loop.loaded_policy = SimpleNamespace(path="policy", task="", policy=MagicMock(), reset=MagicMock())
-    loop.task_t0 = 1.0
-
-    monkeypatch.setattr(loop_module, "predict_action_chunk", MagicMock(side_effect=RuntimeError("no chunk")))
-    clock = iter((2.0, 2.25, 3.0, 3.25))
+    policy = SimpleNamespace(_action_queue=deque([{"gripper": 1.0}, {"gripper": 2.0}]))
+    loop.loaded_policy = SimpleNamespace(
+        path="policy",
+        task="",
+        policy=policy,
+        postprocessor=lambda action: action,
+    )
+    loop.mode = "rollout"
+    loop.task_t0 = 10.0
+    loop.policy_fps = 20.0
+    loop._next_policy_t = 0.0
+    loop._next_prediction_t = 0.0
+    loop._inference_engine = FakeInferenceEngine({"gripper": 0.0})
+    monkeypatch.setattr(loop, "_build_rollout_obs_frame", lambda observation: observation)
+    clock = iter((12.0, 12.25))
     monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(clock))
 
-    loop._capture_rollout_prediction(1.5, {})
-    loop._capture_rollout_prediction(2.5, {})
+    loop._tick_rollout()
 
-    assert loop._rollout_prediction is None
-    messages = [entry["message"] for entry in loop.logs]
-    assert sum("rollout chunk preview unavailable" in message for message in messages) == 1
+    assert loop._rollout_prediction is not None
+    assert loop._rollout_prediction["strategy"] == "policy_queue"
+    assert loop._rollout_prediction["actions"] == [{"gripper": 1.0}, {"gripper": 2.0}]
+
+
+def test_start_inference_engine_uses_hw_features_method(tmp_path: Path, monkeypatch) -> None:
+    loop = _loop(tmp_path)
+    loaded = SimpleNamespace(task="pick cube", policy=MagicMock())
+    engine = MagicMock()
+    engine.failed = False
+    config = SimpleNamespace(type="rtc")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(loop_module, "inference_config_from_extra", lambda _extra: config)
+    monkeypatch.setattr(loop, "_rollout_hw_features", lambda: {"observation.state": {"names": []}})
+
+    def fake_create(_loaded, **kwargs):
+        captured.update(kwargs)
+        return engine
+
+    monkeypatch.setattr(loop_module, "create_monitor_inference_engine", fake_create)
+
+    assert loop._start_inference_engine(loaded) is True
+    engine.reset.assert_called_once_with()
+    engine.start.assert_called_once_with()
+    engine.resume.assert_called_once_with()
+    assert captured["hw_features"] == {"observation.state": {"names": []}}
 
 
 def test_rollout_legacy_fps_is_policy_rate_and_is_capped_to_control(tmp_path: Path) -> None:

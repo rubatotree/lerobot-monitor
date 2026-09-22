@@ -719,6 +719,28 @@ def huggingface_hub_cache() -> Path:
     return huggingface_home() / "hub"
 
 
+def cached_hub_snapshot(repo_id: str, revision: str = "") -> str | None:
+    """Return a local HF snapshot path without calling the Hub."""
+    repo_id = str(repo_id or "").strip()
+    if not repo_id:
+        return None
+    repo_dir = huggingface_hub_cache() / f"models--{repo_id.replace('/', '--')}"
+    snapshots = repo_dir / "snapshots"
+    if not snapshots.is_dir():
+        return None
+    if revision:
+        candidate = snapshots / revision
+        return str(candidate.resolve()) if candidate.is_dir() else None
+    try:
+        children = [path for path in snapshots.iterdir() if path.is_dir()]
+    except OSError:
+        return None
+    if not children:
+        return None
+    children.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return str(children[0].resolve())
+
+
 def lerobot_home() -> Path:
     for key in ("HF_LEROBOT_HOME", "LEROBOT_HOME"):
         if os.environ.get(key):

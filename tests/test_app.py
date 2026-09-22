@@ -802,6 +802,7 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="dbg-cam-map"',
         'id="dbg-eval"',
         'id="md-file-input"',
+        'id="pol-path-menu"',
     ):
         assert marker in page.text
 

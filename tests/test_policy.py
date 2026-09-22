@@ -10,17 +10,20 @@ import contextlib
 import sys
 import types
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
+from lerobot_monitor import model_hub
 from lerobot_monitor.policy import (
     LoadedPolicy,
     create_monitor_inference_engine,
     inference_config_from_extra,
     predict_action_chunk,
+    resolve_cached_policy_path,
 )
 
 ACTION = "action"
@@ -311,6 +314,30 @@ def test_inference_config_from_extra_parses_rtc_fields(monkeypatch) -> None:
     assert config.rtc.execution_horizon == 15
     assert config.rtc.max_guidance_weight == pytest.approx(5.0)
     assert config.queue_threshold == 12
+
+
+def test_resolve_cached_policy_path_uses_local_snapshot(tmp_path: Path, monkeypatch) -> None:
+    snapshot = tmp_path / "hub" / "models--user--policy" / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        model_hub,
+        "parse_remote",
+        lambda path, revision="": SimpleNamespace(
+            source="huggingface",
+            repo_id="user/policy",
+            revision=revision,
+        ),
+    )
+
+    assert resolve_cached_policy_path("user/policy") == str(snapshot.resolve())
+
+
+def test_resolve_cached_policy_path_accepts_existing_directory(tmp_path: Path) -> None:
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+
+    assert resolve_cached_policy_path(str(policy_dir)) == str(policy_dir.resolve())
 
 
 def test_create_monitor_engine_installs_rtc_processor(monkeypatch) -> None:

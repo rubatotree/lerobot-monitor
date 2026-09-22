@@ -13,6 +13,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from enum import Enum
+from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 import numpy as np
@@ -120,6 +121,23 @@ class ActionChunk:
     warnings: list[str]
 
 
+def resolve_cached_policy_path(path: str, revision: str = "") -> str | None:
+    """Resolve a repo id to an already-cached local snapshot without touching the Hub."""
+    local_path = Path(path).expanduser()
+    if local_path.is_dir():
+        return str(local_path.resolve())
+    try:
+        from .library import cached_hub_snapshot
+        from .model_hub import parse_remote
+
+        parsed = parse_remote(path, revision=revision)
+    except Exception:
+        return None
+    if parsed.source != "huggingface":
+        return None
+    return cached_hub_snapshot(parsed.repo_id, parsed.revision)
+
+
 def load_policy(
     path: str,
     *,
@@ -136,6 +154,13 @@ def load_policy(
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
     from lerobot.utils.constants import ACTION
 
+    requested_revision = str((extra or {}).get("policy.pretrained_revision", "")).strip()
+    cached_path = resolve_cached_policy_path(path, requested_revision)
+    load_path = cached_path or path
+    is_local_source = cached_path is not None or Path(path).expanduser().is_dir()
+    if cached_path is not None:
+        logger.info("using cached policy snapshot for %s: %s", path, cached_path)
+
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(
             f"CUDA requested but this process has no GPU torch "
@@ -146,21 +171,34 @@ def load_policy(
 
     def _load(*, local_only: bool) -> LoadedPolicy:
         kwargs = {"local_files_only": local_only}
-        cfg = PreTrainedConfig.from_pretrained(path, **kwargs)
-        cfg.pretrained_path = path
+        cfg = PreTrainedConfig.from_pretrained(load_path, **kwargs)
+        cfg.pretrained_path = load_path
         cfg.device = device
         apply_policy_overrides(cfg, extra)
+        vlm_model_name = getattr(cfg, "vlm_model_name", None)
+        if isinstance(vlm_model_name, str) and vlm_model_name:
+            cached_vlm = resolve_cached_policy_path(vlm_model_name)
+            if cached_vlm is not None:
+                logger.info("using cached VLM snapshot for %s: %s", vlm_model_name, cached_vlm)
+                cfg.vlm_model_name = cached_vlm
         policy_cls = get_policy_class(cfg.type)
-        policy = policy_cls.from_pretrained(path, config=cfg, local_files_only=local_only)
+        policy = policy_cls.from_pretrained(load_path, config=cfg, local_files_only=local_only)
         policy = policy.to(device)
         policy.eval()
+        preprocessor_overrides = {
+            "device_processor": {"device": device},
+            "rename_observations_processor": {"rename_map": rename_map or {}},
+        }
+        resolved_vlm_name = getattr(cfg, "vlm_model_name", None)
+        if isinstance(resolved_vlm_name, str) and resolved_vlm_name:
+            preprocessor_overrides["tokenizer_processor"] = {
+                "tokenizer_name": resolved_vlm_name,
+            }
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=cfg,
-            pretrained_path=path,
-            preprocessor_overrides={
-                "device_processor": {"device": device},
-                "rename_observations_processor": {"rename_map": rename_map or {}},
-            },
+            pretrained_path=load_path,
+            pretrained_revision=requested_revision or None,
+            preprocessor_overrides=preprocessor_overrides,
         )
         output = cfg.output_features.get(ACTION) or cfg.output_features.get("action")
         if output is not None and getattr(output, "names", None):
@@ -181,6 +219,9 @@ def load_policy(
             robot_type=robot_type,
         )
 
+    if cached_path is not None or is_local_source:
+        with _prefer_hub_cache():
+            return _load(local_only=True)
     try:
         with _prefer_hub_cache():
             return _load(local_only=True)

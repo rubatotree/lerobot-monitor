@@ -386,6 +386,10 @@ rollout 必须使用 LeRobot 自带的 `create_inference_engine()`，不得在 m
 `rtc_config` 后调用 `init_rtc_processor()`。E-STOP/Disconnect 仍先执行硬件安全动作，
 再停止 engine。
 
+cached policy 的 repo id 必须先通过 `local_files_only=True` 解析到本地 snapshot；
+本地路径和已缓存 repo 不得进入网络 fallback。Policy path 的模型选择必须写入实际
+snapshot 路径，并可从 cached policy 候选列表直接选择。
+
 ## 后续里程碑（2026-09-21）：Blender 远程虚拟相机接入
 
 状态：已实现并通过自动化与当前运行中的 Blender 流验证。

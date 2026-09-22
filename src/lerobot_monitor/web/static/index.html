@@ -327,7 +327,13 @@
         <div class="task-block">
           <h3>Rollout</h3>
           <label>Policy path
-            <input id="pol-path" type="text" placeholder="rubatotree/so101_classify_the_blocks_act_512"/>
+            <span class="policy-picker">
+              <input id="pol-path" type="text" autocomplete="off" aria-autocomplete="list" aria-expanded="false" aria-controls="pol-path-menu" placeholder="rubatotree/so101_classify_the_blocks_act_512"/>
+              <button type="button" id="btn-pol-path-menu" class="policy-picker-toggle" aria-label="Choose cached policy" title="Choose cached policy">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+              <div id="pol-path-menu" class="policy-picker-menu hidden" role="listbox" aria-label="Cached policies"></div>
+            </span>
           </label>
           <label>Instruction
             <input id="pol-task" type="text" placeholder="Match each loose plastic block to the examples in the organizer and put it in the matching compartment."/>

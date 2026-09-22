@@ -1391,6 +1391,40 @@ function updateTaskInfo() {
   el.addEventListener("change", persistUi);
   el.addEventListener("input", persistUi);
 });
+if ($("pol-path")) {
+  const input = $("pol-path");
+  input.addEventListener("input", () => {
+    openPolicyPicker();
+    renderPolicyPickerMenu();
+  });
+  input.addEventListener("keydown", (event) => {
+    const menu = $("pol-path-menu");
+    const rows = menu ? [...menu.querySelectorAll(".policy-picker-option:not(:disabled)")] : [];
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (!menu || menu.classList.contains("hidden")) openPolicyPicker();
+      setPolicyPickerActive(policyPickerActive + 1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!menu || menu.classList.contains("hidden")) openPolicyPicker();
+      setPolicyPickerActive(policyPickerActive <= 0 ? rows.length - 1 : policyPickerActive - 1);
+    } else if (event.key === "Enter" && policyPickerActive >= 0 && rows[policyPickerActive]) {
+      event.preventDefault();
+      rows[policyPickerActive].click();
+    } else if (event.key === "Escape") {
+      closePolicyPicker();
+    } else if (event.key === "Tab") {
+      closePolicyPicker();
+    }
+  });
+}
+bind("btn-pol-path-menu", togglePolicyPicker);
+document.addEventListener("pointerdown", (event) => {
+  const picker = event.target && event.target.closest && event.target.closest(".policy-picker");
+  if (!picker) closePolicyPicker();
+});
+window.addEventListener("resize", positionPolicyPickerMenu);
+window.addEventListener("scroll", positionPolicyPickerMenu, true);
 if ($("chk-rec-resume")) $("chk-rec-resume").addEventListener("change", updateResumeTargetUi);
 bind("btn-rec-use-video", () => {
   const id = browsedLocalVideoId();
@@ -4198,6 +4232,7 @@ function renderModels() {
   const ol = $("md-list");
   if (!ol) return;
   ol.innerHTML = "";
+  renderPolicyPickerMenu();
   const select = $("dbg-policy");
   const selected = select ? select.value : "";
   if (select) select.innerHTML = `<option value="">—</option>`;
@@ -4270,6 +4305,133 @@ function renderModels() {
     }
   });
   if (select && selected) select.value = selected;
+}
+
+let policyPickerActive = -1;
+
+function policyPickerModels(query = "") {
+  const text = String(query || "").trim().toLowerCase();
+  return modelsCache.filter((model) => {
+    if (!model.path) return false;
+    if (!text) return true;
+    return [model.name, model.path, model.policy_type, model.source]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase()
+      .includes(text);
+  });
+}
+
+function positionPolicyPickerMenu() {
+  const input = $("pol-path");
+  const menu = $("pol-path-menu");
+  if (!input || !menu || menu.classList.contains("hidden")) return;
+  const rect = input.getBoundingClientRect();
+  const width = Math.min(rect.width, window.innerWidth - 16);
+  const height = Math.min(menu.scrollHeight || 240, 240);
+  const left = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - width - 8));
+  let top = rect.bottom + 4;
+  if (top + height > window.innerHeight - 8) top = Math.max(8, rect.top - height - 4);
+  Object.assign(menu.style, {
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${width}px`,
+    maxHeight: "240px",
+  });
+}
+
+function closePolicyPicker() {
+  const input = $("pol-path");
+  const menu = $("pol-path-menu");
+  if (!menu || menu.classList.contains("hidden")) return;
+  menu.classList.add("hidden");
+  policyPickerActive = -1;
+  if (input) input.setAttribute("aria-expanded", "false");
+}
+
+function setPolicyPickerActive(index) {
+  const menu = $("pol-path-menu");
+  if (!menu) return;
+  const rows = [...menu.querySelectorAll(".policy-picker-option:not(:disabled)")];
+  if (!rows.length) {
+    policyPickerActive = -1;
+    return;
+  }
+  policyPickerActive = Math.max(0, Math.min(index, rows.length - 1));
+  rows.forEach((row, rowIndex) => {
+    const active = rowIndex === policyPickerActive;
+    row.classList.toggle("active", active);
+    row.setAttribute("aria-selected", String(active));
+    if (active) row.scrollIntoView({ block: "nearest" });
+  });
+}
+
+function choosePolicyPickerModel(model) {
+  const input = $("pol-path");
+  if (!input || !model || !model.path) return;
+  input.value = model.path;
+  closePolicyPicker();
+  persistUi();
+}
+
+function renderPolicyPickerMenu() {
+  const menu = $("pol-path-menu");
+  const input = $("pol-path");
+  if (!menu || !input) return;
+  const selectedPath = input.value.trim();
+  const query = modelsCache.some((model) => model.path === selectedPath) ? "" : selectedPath;
+  const rows = policyPickerModels(query);
+  menu.innerHTML = "";
+  policyPickerActive = -1;
+  if (!rows.length) {
+    const empty = document.createElement("p");
+    empty.className = "policy-picker-empty";
+    empty.textContent = "No cached policy matches";
+    menu.appendChild(empty);
+  } else {
+    rows.forEach((model, index) => {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "policy-picker-option";
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", "false");
+      option.dataset.index = String(index);
+      const title = document.createElement("span");
+      title.className = "policy-picker-title";
+      title.textContent = model.name || model.path;
+      const detail = document.createElement("span");
+      detail.className = "policy-picker-detail";
+      const meta = document.createElement("span");
+      meta.className = "policy-picker-meta";
+      const source = model.source === "hub" ? "hf cache" : model.source || "local";
+      meta.textContent = [model.policy_type, source].filter(Boolean).join(" · ");
+      const path = document.createElement("span");
+      path.className = "policy-picker-path";
+      path.textContent = model.path;
+      detail.append(meta, path);
+      option.append(title, detail);
+      option.title = `${model.name || model.path}\n${model.path}`;
+      option.addEventListener("click", () => choosePolicyPickerModel(model));
+      option.addEventListener("mousemove", () => setPolicyPickerActive(index));
+      menu.appendChild(option);
+    });
+  }
+  positionPolicyPickerMenu();
+}
+
+function openPolicyPicker() {
+  const input = $("pol-path");
+  const menu = $("pol-path-menu");
+  if (!input || !menu) return;
+  menu.classList.remove("hidden");
+  input.setAttribute("aria-expanded", "true");
+  renderPolicyPickerMenu();
+}
+
+function togglePolicyPicker() {
+  const menu = $("pol-path-menu");
+  if (menu && !menu.classList.contains("hidden")) closePolicyPicker();
+  else openPolicyPicker();
 }
 
 const MODEL_REFRESH_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v4h-4"/></svg>`;

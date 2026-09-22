@@ -22,6 +22,14 @@
   `_rollout_hw_feature_spec`，并增加真实覆盖 `_start_inference_engine` 的回归测试。
 - 恢复非 RTC 的虚线预测：同步 engine 没有 `ActionQueue`，现在回退读取 policy 自身的
   `select_action()` action queue；该路径只做 telemetry 映射，不执行额外推理。
+- rollout 加载 repo id 前先用 `snapshot_download(local_files_only=True)` 解析本地 HF
+  snapshot；cached repo 和本地目录都不再进入网络 fallback。Policy path 增加 cached
+  policy picker，Models 点击仍写入具体 snapshot 路径。picker 显示模型名、类型、来源
+  和本地路径，支持过滤、方向键、Enter、Escape 与点击外部关闭。
+- cached 解析进一步改为直接扫描 `models--org--name/snapshots`，不再调用
+  `snapshot_download`。SmolVLA 的 `vlm_model_name` 和 preprocessor
+  `tokenizer_processor.tokenizer_name` 也替换为本地 VLM snapshot，避免 Transformers
+  再次解析 backbone repo。
 - E-STOP 和 Disconnect 调整为先关闭力矩/释放串口，再收后台 producer，避免线程 join
   延迟安全动作。
 - 验证：`tests/test_policy.py` 与 `tests/test_loop.py` 共 41 项通过；排除当前 venv

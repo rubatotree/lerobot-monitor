@@ -109,6 +109,9 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         stopped = client.post("/lerobot/api/task/stop")
         assert stopped.status_code == 200
         assert stopped.json().get("ok") is True
+        force_stopped = client.post("/lerobot/api/task/force_stop")
+        assert force_stopped.status_code == 200
+        assert force_stopped.json().get("ok") is True
         queued = client.post(
             "/lerobot/api/rollout/start",
             json={"policy_path": "missing/policy", "duration_s": 1, "record": False},
@@ -906,8 +909,8 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="preset-name-popover"',
         'id="btn-arm-toggle"',
         'id="btn-leader-toggle"',
-        'id="btn-arm-force"',
-        'id="btn-leader-force"',
+        'id="btn-hdr-arm-power"',
+        'id="btn-hdr-leader-power"',
         'aria-label="Arm device"',
         'aria-label="Leader device"',
     ):
@@ -1009,7 +1012,9 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert ".side-tools" in css.text
     assert ".preset-name-popover" in css.text
     assert ".preset-icon-btn.loading" in css.text
-    assert ".force-device" in css.text
+    assert ".hdr-device-power" in css.text
+    assert ".hdr-icon.stop.stop-requested" in css.text
+    assert ".hdr-icon.task-on" in css.text
     assert ".chart-hover-tooltip" in css.text
     assert ".chart-time-control" in css.text
     list_rule = re.search(r"\.lib-list\s*\{(?P<body>.*?)\}", css.text, re.DOTALL)
@@ -1074,4 +1079,7 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert "function selectLibrarySearchKind" in script.text
     assert 'api("/api/hardware/apply"' in script.text
     assert 'api("/api/hardware/force_disconnect"' in script.text
+    assert 'api("/api/task/force_stop"' in script.text
     assert 'const endpointRole = role === "arm" ? "robot" : "leader";' in script.text
+    assert 'lbl.textContent = label;' in script.text
+    assert 'id="st-bus"' not in script.text

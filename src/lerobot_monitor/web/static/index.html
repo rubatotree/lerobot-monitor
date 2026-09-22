@@ -20,10 +20,14 @@
         <span id="mode-pill" class="pill idle">offline</span>
       </div>
       <div class="header-status" aria-label="System status">
-        <span class="hdr-stat">bus <b id="st-bus">free</b></span>
-        <span class="hdr-stat">mode <b id="st-mode">offline</b></span>
-        <span class="hdr-stat">F <b id="st-robot">—</b></span>
-        <span class="hdr-stat">L <b id="st-leader">—</b></span>
+        <button type="button" id="btn-hdr-arm-power" class="hdr-device-power" aria-pressed="false" title="Connect follower arm">
+          <span class="hdr-device-role">F</span>
+          <span id="st-robot" class="hdr-device-name">No device</span>
+        </button>
+        <button type="button" id="btn-hdr-leader-power" class="hdr-device-power" aria-pressed="false" title="Connect leader arm">
+          <span class="hdr-device-role">L</span>
+          <span id="st-leader" class="hdr-device-name">No device</span>
+        </button>
         <span class="hdr-stat" id="st-env" title="python / torch">env —</span>
         <span class="hdr-stat" id="st-elapsed">—</span>
         <span class="hdr-stat" id="st-episode">—</span>
@@ -421,9 +425,6 @@
             <button type="button" id="btn-arm-toggle" class="port-toggle" aria-pressed="false" aria-label="Connect arm" title="Connect arm">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"/><path d="M7.4 6.4a7 7 0 1 0 9.2 0"/></svg>
             </button>
-            <button type="button" id="btn-arm-force" class="force-device" aria-label="Force disconnect arm" title="Force disconnect arm">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"/><path d="M7.4 6.4a7 7 0 1 0 9.2 0"/><path d="m4 4 16 16"/></svg>
-            </button>
           </div>
           <p class="hw-status" id="arm-status">disconnected</p>
         </div>
@@ -433,9 +434,6 @@
             <select id="leader-port" aria-label="Leader device"></select>
             <button type="button" id="btn-leader-toggle" class="port-toggle" aria-pressed="false" aria-label="Connect leader" title="Connect leader">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"/><path d="M7.4 6.4a7 7 0 1 0 9.2 0"/></svg>
-            </button>
-            <button type="button" id="btn-leader-force" class="force-device" aria-label="Force disconnect leader" title="Force disconnect leader">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"/><path d="M7.4 6.4a7 7 0 1 0 9.2 0"/><path d="m4 4 16 16"/></svg>
             </button>
           </div>
           <p class="hw-status" id="leader-status">disconnected</p>

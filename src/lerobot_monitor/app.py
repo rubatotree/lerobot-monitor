@@ -431,6 +431,13 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     async def task_stop() -> dict[str, Any]:
         return hub.loop.request_stop()
 
+    @router.post("/api/task/force_stop")
+    async def task_force_stop() -> dict[str, Any]:
+        result = await asyncio.to_thread(hub.loop.request_force_stop)
+        if not result.get("ok", False):
+            raise HTTPException(400, result.get("error") or "force stop failed")
+        return result
+
     @router.post("/api/scan")
     async def scan_devices() -> dict[str, Any]:
         from .ports import list_serial_ports

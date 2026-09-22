@@ -163,6 +163,59 @@ h3 {
 .hdr-icon.auto-on { color: var(--ok); border-color: #2d4d42; background: #15241e; }
 .hdr-icon.stop { color: var(--warn); }
 .hdr-icon.stop:hover { color: #f0c040; border-color: var(--warn); }
+.hdr-icon.task-on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: #201c35;
+}
+.hdr-icon[data-task="teleop"].task-on { color: var(--blue); border-color: #3a4a70; background: #172033; }
+.hdr-icon[data-task="record"].task-on { color: var(--rec); border-color: #6a3040; background: #2a151c; }
+.hdr-icon[data-task="rollout"].task-on { color: var(--ok); border-color: #2d4d42; background: #15241e; }
+.hdr-icon.stop.stop-requested {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: #2b2410;
+  box-shadow: 0 0 8px rgba(212, 160, 23, 0.18);
+}
+.hdr-device-power {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 92px;
+  min-height: 34px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--faint);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.hdr-device-power:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  color: var(--text);
+}
+.hdr-device-power.on {
+  color: var(--ok);
+  border-color: #2d4d42;
+  background: #15241e;
+}
+.hdr-device-power.pending-disconnect {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: #2b2410;
+}
+.hdr-device-power:disabled { opacity: 0.42; }
+.hdr-device-role {
+  color: var(--faint);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+}
+.hdr-device-name {
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
 #st-env.warn { color: var(--warn); }
 #fps {
   display: inline-block;
@@ -1364,7 +1417,7 @@ main.episodes-closed {
 .hw-status.error { color: var(--err); }
 .device-row {
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) 32px 32px;
+  grid-template-columns: 44px minmax(0, 1fr) 32px;
   gap: 5px;
   align-items: center;
   min-width: 0;
@@ -1372,8 +1425,7 @@ main.episodes-closed {
 .device-row h3 {
   margin: 0;
 }
-.port-toggle,
-.force-device {
+.port-toggle {
   display: grid;
   place-items: center;
   width: 32px;
@@ -1384,8 +1436,7 @@ main.episodes-closed {
   background: var(--surface);
   border: 1px solid var(--line);
 }
-.port-toggle svg,
-.force-device svg {
+.port-toggle svg {
   width: 15px;
   height: 15px;
   fill: none;
@@ -1405,17 +1456,6 @@ main.episodes-closed {
   box-shadow: 0 0 8px rgba(93, 186, 154, 0.18);
 }
 .port-toggle:disabled { opacity: 0.32; }
-.force-device {
-  color: #e9a4ae;
-  background: #21151a;
-  border-color: #59303a;
-}
-.force-device:hover:not(:disabled) {
-  color: #ffd2d8;
-  border-color: #8d4654;
-  background: #321a21;
-}
-.force-device:disabled { opacity: 0.32; }
 select {
   background: #090a12;
   border: 1px solid var(--line);
@@ -1987,8 +2027,8 @@ body.dragging-row { cursor: row-resize; user-select: none; }
   .replay-exit { min-height: 44px; }
   .preset-btns button { width: 38px; min-width: 38px; min-height: 38px; }
   .preset-name-line button { width: 38px; min-width: 38px; min-height: 38px; }
-  .device-row { grid-template-columns: 44px minmax(0, 1fr) 38px 38px; }
-  .port-toggle, .force-device { width: 38px; min-width: 38px; min-height: 38px; }
+  .device-row { grid-template-columns: 44px minmax(0, 1fr) 38px; }
+  .port-toggle { width: 38px; min-width: 38px; min-height: 38px; }
 }
 
 @media (max-width: 1180px) {

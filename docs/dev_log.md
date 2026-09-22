@@ -34,7 +34,15 @@
   read pose、teleop、record、rollout 不再调用 `connect()`；实际 HTTP 验证中
   `POST /api/joints` 返回 400，`POST /api/rollout/start` 接受排队后由控制线程记录
   `start rollout requires a connected follower arm`。
-- 验证：排除 `test_sim.py` 后 `153 passed, 2 skipped`；`node --check`、Python compile
+- 顶栏任务按钮保持 teleop/record/rollout 文案，仅通过 `task-on` 点亮；点击已激活任务
+  不再触发停止。Stop 对慢停止任务采用两阶段状态：第一次 `stop-requested` 变黄并调用
+  `/api/task/stop`，第二次调用 `/api/task/force_stop`。
+- `force_stop` 会立即脱离 inference engine，把 engine.stop 放到后台清理，同时关闭
+  writer 并回到 idle/offline；follower 掉线或读失败时 `_abort_active_task` 会主动结束
+  rollout，不再等待后续 tick。
+- 顶栏 F/L 改为设备名电源按钮，bus/mode 文本移除；顶栏与 Hardware 面板共用
+  `disconnectPending`，第一次软断开、第二次 force disconnect，独立 force 按钮删除。
+- 验证：排除 `test_sim.py` 后 `155 passed, 2 skipped`；`node --check`、Python compile
   通过。浏览器 smoke 覆盖系统 preset、显式 Load 日志、图标 Save/Rename、刷新持久化、
   服务重启自动恢复、1024/390px 无横向溢出；未使用真实串口和相机做换端口 soak。
 

@@ -449,6 +449,42 @@ def test_force_disconnect_leader_only_keeps_arm_connected(tmp_path: Path) -> Non
     loop.leader.disconnect.assert_called_once_with()
 
 
+def test_force_stop_detaches_engine_without_waiting(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "rollout"
+    engine = MagicMock()
+    loop._inference_engine = engine
+    loop.loaded_policy = SimpleNamespace(path="policy")
+
+    result = _dispatch(loop, "force_stop")
+
+    assert result == {"ok": True, "stopped": "rollout"}
+    assert loop._inference_engine is None
+    assert loop.loaded_policy is None
+    assert loop.mode == "idle"
+    deadline = time.monotonic() + 1.0
+    while not engine.stop.called and time.monotonic() < deadline:
+        time.sleep(0.01)
+    engine.stop.assert_called_once_with()
+
+
+def test_rollout_aborts_when_follower_disconnects(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "rollout"
+    loop.follower.connected = False
+    engine = MagicMock()
+    loop._inference_engine = engine
+    loop.loaded_policy = SimpleNamespace(path="policy")
+
+    loop._tick()
+
+    assert loop._inference_engine is None
+    assert loop.loaded_policy is None
+    assert loop.mode == "offline"
+    assert loop.last_error == "follower disconnected"
+    engine.stop.assert_called_once_with()
+
+
 @pytest.mark.parametrize("kind,payload", [("record_start", {}), ("teleop_start", {"auto_record": True})])
 def test_stop_during_recorder_open_discards_unpublished_writer(
     tmp_path: Path,

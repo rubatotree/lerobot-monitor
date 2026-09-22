@@ -65,8 +65,11 @@ Browser  --HTTP/WS/MJPEG-->  FastAPI
 - 控制命令不再隐式连接设备：jog/relax、resume、读取 follower/leader、teleop、record
   和 rollout 在对应设备未连接时直接拒绝并记录错误；只有连接图标和 Hardware preset
   可以建立连接。
+- 顶栏任务按钮不再切换成 Stop 文案，只在任务激活时点亮。Stop 对 teleop/record/
+  rollout 使用两阶段停止：第一次请求软停止并变黄，第二次发送 force stop，立即脱离
+  推理引擎。Follower/leader 的顶栏与 Hardware 电源按钮共用软断开/强制断开逻辑。
 
-验证：排除缺少 `scservo_sdk` 的仿真测试后为 `153 passed, 2 skipped`；`node --check`、
+验证：排除缺少 `scservo_sdk` 的仿真测试后为 `155 passed, 2 skipped`；`node --check`、
 Python compile 与浏览器 smoke 通过。浏览器覆盖固定搜索/工具栏、per-tab 搜索与 preset
 状态、内联重命名、显式 Load 日志、刷新恢复、服务重启自动恢复，以及 1024/390px
 无横向溢出。真实串口与相机的换端口连接仍需在硬件现场做最终 soak 验证。

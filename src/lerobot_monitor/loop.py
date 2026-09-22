@@ -338,6 +338,15 @@ class ControlLoop:
             self.on_snapshot(self.snapshot())
         return {"ok": True, "pending": pending, "mode": self.mode}
 
+    def request_force_stop(self, timeout: float = 15.0) -> dict[str, Any]:
+        """Detach the active task immediately instead of waiting for graceful shutdown."""
+        self._cancel.set()
+        with self._start_lock:
+            self._start_generation += 1
+        self._cancel_policy_load()
+        self.pending = None
+        return self.submit("force_stop", timeout=timeout)
+
     def force_current_hardware_apply(self) -> bool:
         """Ask an in-flight hardware preset to skip relax waits immediately."""
         if not self._hardware_apply_active.is_set():
@@ -1225,6 +1234,11 @@ class ControlLoop:
             else:
                 path = self._close_writer()
                 self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
+        elif kind == "force_stop":
+            stopped = self.mode
+            self._force_abort_active_task()
+            self.log("info", f"force stop completed ({stopped})")
+            self._reply(cmd, ok=True, stopped=stopped)
         elif kind == "resume":
             self._require_no_debug_lease("resume")
             self._estop.clear()
@@ -1432,7 +1446,9 @@ class ControlLoop:
                 self._apply_estop()
             return
         if not self.follower.connected:
-            if self.mode not in {"offline", "estop"}:
+            if self.mode in {"jogging", "teleop", "record", "rollout"}:
+                self._abort_active_task("follower disconnected")
+            elif self.mode not in {"offline", "estop"}:
                 self.mode = "offline"
             return
         try:
@@ -1442,6 +1458,8 @@ class ControlLoop:
             self.log("error", f"read failed: {exc}")
             if self._pending_release:
                 self._release_follower(self._pending_release)
+            elif self.mode in {"jogging", "teleop", "record", "rollout"}:
+                self._abort_active_task(f"read failed: {exc}")
             return
 
         try:
@@ -1469,6 +1487,48 @@ class ControlLoop:
                     self._end_rollout()
                 self._close_writer()
                 self.mode = "idle"
+
+    def _abort_active_task(self, reason: str) -> None:
+        """Return to a safe idle/offline state without waiting for another tick."""
+        self._cancel.set()
+        self.pending = None
+        self._invalidate_policy_load()
+        self._end_rollout()
+        self.loaded_policy = None
+        self._close_writer()
+        self._slew_goal = None
+        self._pending_release = None
+        self.mode = "idle" if self.follower.connected else "offline"
+        self.last_error = reason
+        self.log("error", f"active task aborted: {reason}")
+
+    def _force_abort_active_task(self) -> None:
+        """Detach slow shutdown work so force stop can return immediately."""
+        self.pending = None
+        self._invalidate_policy_load()
+        engine = self._inference_engine
+        self._inference_engine = None
+        self._rollout_hw_feature_spec = {}
+        self._clear_rollout_prediction()
+        if engine is not None:
+            threading.Thread(
+                target=self._stop_inference_engine_safely,
+                args=(engine,),
+                daemon=True,
+                name="force-stop-inference",
+            ).start()
+        self.loaded_policy = None
+        self._close_writer()
+        self._slew_goal = None
+        self._pending_release = None
+        self.mode = "idle" if self.follower.connected else "offline"
+
+    @staticmethod
+    def _stop_inference_engine_safely(engine: Any) -> None:
+        try:
+            engine.stop()
+        except Exception:
+            pass
 
     def _tick_jog(self) -> None:
         assert self._slew_start is not None and self._slew_goal is not None

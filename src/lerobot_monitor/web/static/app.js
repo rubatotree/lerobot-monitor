@@ -230,15 +230,42 @@ function toastError(err) {
 }
 
 let actionBusy = false;
+let stopRequested = false;
+const disconnectPending = { arm: false, leader: false };
+const SLOW_STOP_MODES = new Set(["teleop", "record", "rollout"]);
+const SLOW_START_PENDING = new Set(["teleop_start", "record_start", "rollout_start"]);
 function exitReplayForControl() {
   if (episodeSource || replayActive || armReplay) closeEpisodeSelection();
 }
 
+function isSlowStopActive(mode, pending) {
+  return SLOW_STOP_MODES.has(mode) || SLOW_START_PENDING.has(pending);
+}
+
+function syncStopButton(mode, pending) {
+  const active = isSlowStopActive(mode, pending);
+  if (!active) stopRequested = false;
+  const button = $("btn-hdr-stop");
+  if (!button) return;
+  button.classList.toggle("stop-requested", stopRequested);
+  button.title = stopRequested ? "Press again to force stop" : "Stop teleop / record / rollout";
+}
+
 function requestStop() {
-  actionBusy = false;
-  document.querySelectorAll(".hdr-icon.pending").forEach((el) => el.classList.remove("pending"));
+  const mode = (last && last.mode) || "";
+  const pending = last && last.task && last.task.pending;
+  if (stopRequested) {
+    localLog("force stop requested", "error");
+    return api("/api/task/force_stop").catch(toastError);
+  }
   if (replayActive || episodeSource) closeEpisodeSelection();
-  else localLog("stop requested");
+  if (isSlowStopActive(mode, pending)) {
+    stopRequested = true;
+    syncStopButton(mode, pending);
+    localLog("stop requested — press Stop again to force");
+  } else {
+    localLog("stop requested");
+  }
   return api("/api/task/stop").catch(toastError);
 }
 async function runAction(btnId, message, fn) {
@@ -2198,7 +2225,6 @@ function applyStatus(d) {
     closeEpisodeSelection();
   }
   const mode = backendMode;
-  const owner = d.owner || (d.robot && d.robot.connected ? mode : "free");
   const pill = $("mode-pill");
   pill.textContent = replayActive ? "REPLAY" : mode;
   pill.className = `pill ${replayActive ? "replay" : mode}`;
@@ -2209,21 +2235,7 @@ function applyStatus(d) {
   busLive = !!robot.connected;
   $("joint-panel").classList.toggle("bus-live", busLive);
 
-  const busEl = $("st-bus");
-  if (busEl) {
-    busEl.textContent = robot.connected ? `${robot.port} · ${owner}` : owner;
-  }
-  const modeEl = $("st-mode");
-  if (modeEl) modeEl.textContent = replayActive ? `replay · ${mode}` : mode;
-  const stR = $("st-robot");
-  stR.textContent = robot.connected ? robot.port : "free";
-  const stL = $("st-leader");
-  if (leader.connected) {
-    const lOwner = (mode === "teleop" || mode === "record") ? mode : "connected";
-    stL.textContent = `${leader.port} · ${lOwner}`;
-  } else {
-    stL.textContent = "off";
-  }
+  syncDevicePowerButtons(robot, leader);
   const envEl = $("st-env");
   if (envEl) {
     const label = d.runtime_label || (meta && meta.runtime_label) || "";
@@ -2234,6 +2246,7 @@ function applyStatus(d) {
   setTaskButton("btn-hdr-teleop", mode === "teleop" || pending === "teleop_start", "teleop");
   setTaskButton("btn-hdr-record", mode === "record" || pending === "record_start", "record");
   setTaskButton("btn-hdr-rollout", mode === "rollout" || pending === "rollout_start", "rollout");
+  syncStopButton(mode, pending);
   ["btn-hdr-teleop", "btn-hdr-record", "btn-hdr-rollout", "btn-hdr-capture", "btn-hdr-relax"].forEach((id) => {
     const el = $(id);
     if (!el) return;
@@ -2465,7 +2478,9 @@ function setTaskButton(id, on, label) {
   const el = $(id);
   if (!el) return;
   const lbl = el.querySelector(".hdr-lbl");
-  if (lbl) lbl.textContent = on ? "stop" : label;
+  if (lbl) lbl.textContent = label;
+  el.classList.toggle("task-on", on);
+  el.setAttribute("aria-pressed", String(on));
 }
 
 function recordFields() {
@@ -2766,15 +2781,39 @@ function setHwStatus(id, device) {
 }
 
 function setPortToggle(role, connected) {
-  const button = $(`btn-${role}-toggle`);
+  const buttons = [
+    $(`btn-${role}-toggle`),
+    $(`btn-hdr-${role}-power`),
+  ].filter(Boolean);
   const select = $(`${role}-port`);
-  if (!button) return;
-  button.classList.toggle("on", connected);
-  button.setAttribute("aria-pressed", String(connected));
-  button.disabled = !connected && !(select && select.value);
-  const action = connected ? "Disconnect" : "Connect";
-  button.title = `${action} ${role}`;
-  button.setAttribute("aria-label", `${action} ${role}`);
+  if (!connected) disconnectPending[role] = false;
+  for (const button of buttons) {
+    button.classList.toggle("on", connected);
+    button.classList.toggle("pending-disconnect", disconnectPending[role]);
+    button.setAttribute("aria-pressed", String(connected));
+    const action = disconnectPending[role]
+      ? `Force disconnect ${role}`
+      : connected ? `Disconnect ${role}` : `Connect ${role}`;
+    button.title = action;
+    button.setAttribute("aria-label", action);
+    button.disabled = !connected && !(select && select.value);
+  }
+}
+
+function syncDevicePowerButtons(robot, leader) {
+  const states = {
+    arm: { device: robot || {}, port: $("arm-port") ? $("arm-port").value : "" },
+    leader: { device: leader || {}, port: $("leader-port") ? $("leader-port").value : "" },
+  };
+  for (const [role, state] of Object.entries(states)) {
+    const label = $(`st-${role === "arm" ? "robot" : "leader"}`);
+    if (label) {
+      label.textContent = state.device.connected
+        ? String(state.device.port || "connected")
+        : String(state.port || "No device");
+    }
+    setPortToggle(role, Boolean(state.device.connected));
+  }
 }
 
 async function togglePortConnection(role) {
@@ -2783,18 +2822,24 @@ async function togglePortConnection(role) {
   const device = role === "arm"
     ? ((last && last.robot) || {})
     : ((last && last.leader) || {});
+  if (disconnectPending[role]) {
+    return api("/api/hardware/force_disconnect", { role });
+  }
   if (device.connected) {
-    return api(`/api/${endpointRole}/disconnect`);
+    disconnectPending[role] = true;
+    setPortToggle(role, true);
+    try {
+      return await api(`/api/${endpointRole}/disconnect`);
+    } catch (err) {
+      disconnectPending[role] = false;
+      setPortToggle(role, true);
+      throw err;
+    }
   }
   const port = select ? select.value : "";
   if (!port) throw new Error(`select a ${role} device before connecting`);
   persistUi();
   return api(`/api/${endpointRole}/connect`, { port });
-}
-
-async function forceDisconnectRole(role) {
-  localLog(`force disconnect ${role} requested — skipping relax`);
-  return api("/api/hardware/force_disconnect", { role });
 }
 
 function camerasFlag() {
@@ -2923,6 +2968,7 @@ function updateTaskInfo() {
       ? ((last && last.robot) || {})
       : ((last && last.leader) || {});
     setPortToggle(role, Boolean(device.connected));
+    syncDevicePowerButtons((last && last.robot) || {}, (last && last.leader) || {});
   });
 });
 if ($("pol-path")) {
@@ -3217,8 +3263,8 @@ $("chk-hold").addEventListener("change", async (e) => {
 
 bind("btn-arm-toggle", () => togglePortConnection("arm"));
 bind("btn-leader-toggle", () => togglePortConnection("leader"));
-bind("btn-arm-force", () => forceDisconnectRole("arm"));
-bind("btn-leader-force", () => forceDisconnectRole("leader"));
+bind("btn-hdr-arm-power", () => togglePortConnection("arm"));
+bind("btn-hdr-leader-power", () => togglePortConnection("leader"));
 bind("btn-rec-next", () => api("/api/record/next"));
 bind("btn-hdr-scan", () => runAction("btn-hdr-scan", "scan requested", async () => {
   await api("/api/scan");
@@ -3232,14 +3278,20 @@ bind("btn-hdr-relax", () => {
 bind("btn-hdr-teleop", () => {
   const mode = (last && last.mode) || "";
   const pending = last && last.task && last.task.pending;
-  if (mode === "teleop" || pending === "teleop_start") return requestStop();
+  if (mode === "teleop" || pending === "teleop_start") {
+    localLog("teleop is active — use Stop");
+    return;
+  }
   exitReplayForControl();
   return runAction("btn-hdr-teleop", "teleop requested", () => api("/api/teleop/start", { auto_record: autoRecord, ...captureFields() }));
 });
 bind("btn-hdr-record", () => {
   const mode = (last && last.mode) || "";
   const pending = last && last.task && last.task.pending;
-  if (mode === "record" || pending === "record_start") return requestStop();
+  if (mode === "record" || pending === "record_start") {
+    localLog("record is active — use Stop");
+    return;
+  }
   exitReplayForControl();
   return runAction("btn-hdr-record", "record requested — writing video session", async () => {
     const fields = recordFields();
@@ -3264,7 +3316,10 @@ bind("btn-hdr-record", () => {
 bind("btn-hdr-rollout", () => {
   const mode = (last && last.mode) || "";
   const pending = last && last.task && last.task.pending;
-  if (mode === "rollout" || pending === "rollout_start") return requestStop();
+  if (mode === "rollout" || pending === "rollout_start") {
+    localLog("rollout is active — use Stop");
+    return;
+  }
   exitReplayForControl();
   const path = ($("pol-path") && $("pol-path").value.trim()) || "(no policy)";
   return runAction("btn-hdr-rollout", `rollout requested — loading ${path}`, () => {
@@ -3279,7 +3334,8 @@ bind("btn-hdr-rollout", () => {
 });
 bind("btn-hdr-capture", () => {
   if (capturing || (last && last.task && last.task.pending === "capture_start")) {
-    return requestStop();
+    localLog("capture is active — use Stop");
+    return;
   }
   exitReplayForControl();
   return runAction("btn-hdr-capture", "video capture requested", async () => {
@@ -6744,8 +6800,7 @@ async function refreshPorts() {
       leader.connected ? leader.port : "",
       uiHw.leader_port || (meta.leader && meta.leader.port) || "",
     );
-    setPortToggle("arm", Boolean(robot.connected));
-    setPortToggle("leader", Boolean(leader.connected));
+    syncDevicePowerButtons(robot, leader);
   } catch { /* ignore */ }
 }
 refreshPorts();

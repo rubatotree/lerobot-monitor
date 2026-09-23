@@ -589,6 +589,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         }
         if row:
             item["has_video"] = bool(row.get("videos"))
+            item["task"] = str(row.get("task") or "")
         saved = hub.store.episode_overrides(kind, source_id).get(str(int(index)))
         if saved:
             for key in ("name", "task", "note"):
@@ -1019,7 +1020,13 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         else:
             has_video = bool(row.get("has_video"))
             episodes = [
-                _episode_item("dataset", id, index, playable=playable, row={"videos": has_video})
+                _episode_item(
+                    "dataset",
+                    id,
+                    index,
+                    playable=playable,
+                    row={"videos": has_video, "task": row.get("task") or ""},
+                )
                 for index in range(count)
             ]
             title = row.get("display_name") or row.get("title") or row.get("repo_id") or row.get("name") or id

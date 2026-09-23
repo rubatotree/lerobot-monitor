@@ -111,6 +111,7 @@ class EpisodeWriter:
         merge: bool = True,
         video: bool = True,
         kind: str = "record",
+        task: str = "",
     ) -> None:
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -131,6 +132,7 @@ class EpisodeWriter:
         if self.video:
             (self.folder / "videos").mkdir(exist_ok=True)
         self.kind = kind
+        self.task = str(task or "")
         self.closed = False
         self.action_frames = 0
         self.video_frames = 0
@@ -346,6 +348,7 @@ class EpisodeWriter:
             # Compatibility alias for the container playback rate.
             "effective_video_fps": self.video_fps if self._videos or self._video_frames else 0,
             "video": self.video,
+            "task": self.task,
             "dir": self.folder.name,
             "videos": videos,
             "preview": "preview.jpg" if (self.folder / "preview.jpg").is_file() else None,

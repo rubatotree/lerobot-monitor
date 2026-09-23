@@ -224,6 +224,7 @@ def test_episode_edit_persists(tmp_path: Path, monkeypatch) -> None:
         listed = client.get("/lerobot/api/episodes", params={"kind": "video", "id": video_id})
         assert listed.status_code == 200
         assert listed.json()["episodes"][0]["name"] == ""
+        assert listed.json()["episodes"][0]["task"] == "sort"
         assert listed.json()["source"] == {
             "title": "blocks",
             "subtitle": "sort",
@@ -975,7 +976,7 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="btn-ds-empty"',
         'id="library-modal"',
         'id="rec-dataset-select"',
-        'class="library-select" aria-label="Rollout model"',
+        'data-drop-kind="model"',
         'id="viz-exit"',
         'id="side-tabs"',
         'data-tab="joints"',
@@ -1131,6 +1132,9 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert ".library-modal-body textarea" in css.text
     assert ".library-meta-menu" in css.text
     assert ".library-select" in css.text
+    assert ".library-drop-select" in css.text
+    assert ".library-item.draggable-resource" in css.text
+    assert ".ep-meta-summary" in css.text
     assert ".lib-meta" in css.text
     assert ".lib-description" in css.text
     assert ".library-menu" in css.text
@@ -1171,6 +1175,9 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert "function populateRecordDatasetSelect" in script.text
     assert "function syncRecordDatasetSelection" in script.text
     assert "function populateModelSelects" in script.text
+    assert "function bindLibraryDropSelect" in script.text
+    assert "LIBRARY_DRAG_MIME" in script.text
+    assert "function createNewRecordDataset" in script.text
     assert "function beginLibraryRename" not in script.text
     assert "lib-rename" not in script.text
     assert 'id="btn-lib-meta-settings"' in page.text

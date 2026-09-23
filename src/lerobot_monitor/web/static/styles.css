@@ -1104,6 +1104,27 @@ main.episodes-closed {
   padding-top: 6px;
   border-top: 1px solid var(--line);
 }
+.ep-meta-summary {
+  display: grid;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.ep-meta-row {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  gap: 6px;
+  font-size: 10px;
+}
+.ep-meta-row strong { color: var(--faint); font-weight: 500; }
+.ep-meta-row span {
+  min-width: 0;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .ep-editor.hidden { display: none; }
 .ep-editor label {
   flex-direction: row;
@@ -2118,6 +2139,19 @@ select {
   color: inherit;
 }
 .library-select { width: 100%; min-width: 0; }
+.library-drop-select {
+  border-style: dashed;
+  border-color: #3a4a70;
+  background: #0d1422;
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+.library-drop-select.drop-active {
+  border-color: var(--accent);
+  background: #151a2a;
+  box-shadow: inset 3px 0 0 var(--accent), 0 0 0 1px var(--accent-dim);
+}
+.library-item.draggable-resource .lib-item-title { cursor: grab; }
+.library-item.dragging { opacity: 0.5; }
 #arm-port, #leader-port { width: 100%; min-width: 0; }
 .task-info {
   margin-top: 8px;

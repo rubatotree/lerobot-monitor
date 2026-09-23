@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
-  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260923-library-selects-2"/>
+  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260923-episode-details-2"/>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -324,7 +324,7 @@
         <div class="panel-body">
             <div class="task-block">
               <label>Dataset
-                <select id="rec-dataset-select" class="library-select">
+                <select id="rec-dataset-select" class="library-select library-drop-select" data-drop-kind="dataset">
                   <option value="__new__">New dataset</option>
                 </select>
               </label>
@@ -394,7 +394,7 @@
         <div class="panel-body">
             <div class="task-block">
               <label>Model
-                <select id="pol-path" class="library-select" aria-label="Rollout model"></select>
+                <select id="pol-path" class="library-select library-drop-select" data-drop-kind="model" aria-label="Rollout model"></select>
               </label>
               <label>Instruction
                 <input id="pol-task" type="text" placeholder="Match each loose plastic block to the examples in the organizer and put it in the matching compartment."/>
@@ -458,7 +458,7 @@
         <div class="panel-body">
         <div class="task-block">
           <label>Model
-            <select id="dbg-policy"></select>
+            <select id="dbg-policy" class="library-select library-drop-select" data-drop-kind="model"></select>
           </label>
           <input id="dbg-path" type="hidden"/>
           <label>Instruction
@@ -543,6 +543,6 @@
     </div>
   </div>
 
-  <script src="/lerobot/static/app.js?v=20260923-library-selects-2"></script>
+  <script src="/lerobot/static/app.js?v=20260923-episode-details-2"></script>
 </body>
 </html>

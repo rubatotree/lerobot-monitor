@@ -71,8 +71,13 @@ metadata、description、来源编辑、同步与删除入口，并移除不必�
   下载覆盖本地和删除；Episode 支持编辑、删除与排序。
 - Record / Rollout / Debug 统一从 Library 下拉选择 Datasets 或 Models，不再手填
   repo_id/path；Record 与 Rollout 标题移除，Teleop 标题使用标签字体。
-- Library 15 秒轮询已删除。非仿真测试 `172 passed`；完整测试 `201 passed, 2 failed`，
-  失败均为既有模拟总线初始位姿/动作落点断言。JS/Python 语法与 diff 检查通过，浏览器检查
+- Models/Datasets 支持拖放到右侧接收选择器，接收控件使用独立虚线强调样式；Record
+  的 Dataset 字段位于 Task 上方。
+- New dataset 会立即创建并选中空数据集；录制 task 写入每个 episode，episode 展开
+  详情显示 Task/Name/Note 元信息摘要。点击 episode 主行会同时进入回放并展开只读
+  详情，编辑图标才展开编辑表单。
+- Library 15 秒轮询已删除。非仿真测试 `171 passed, 2 skipped`；完整测试 `203 passed, 1 failed`，
+  失败为既有模拟总线初始位姿断言。JS/Python 语法与 diff 检查通过，浏览器检查
   覆盖主要交互且无 console error。
 
 ## 已完成（2026-09-22）：Joints 面板显式连接与同步源

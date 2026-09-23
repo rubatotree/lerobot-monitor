@@ -141,6 +141,7 @@ class DatasetRecorder:
             raise ValueError("action_fps and video_fps must be positive")
         self.fps = self.action_fps
         self.kind = kind
+        self.task = str((extra_meta or {}).get("task") or "")
         explicit_video_format = video_format is not None
         stored_video_format = str(meta.get("format") or "")
         self.video_format = str(video_format or stored_video_format or "mp4")
@@ -265,6 +266,7 @@ class DatasetRecorder:
             merge=self.merge,
             video=self.video,
             kind=self.kind,
+            task=self.task,
         )
         self.episode_index = index
         return self._episode
@@ -470,8 +472,11 @@ class VideoLibrary:
                 preview = child / "preview.jpg"
                 row["preview"] = preview.name if preview.is_file() else None
                 duration = _episode_duration_s(child, row, meta or {})
-                if row.get("duration_s") != duration:
+                task = str(row.get("task") or (meta or {}).get("task") or "")
+                changed = row.get("duration_s") != duration or row.get("task") != task
+                if changed:
                     row["duration_s"] = duration
+                    row["task"] = task
                     episode_meta = child / "meta.json"
                     saved = _read_json(episode_meta)
                     saved.update(row)

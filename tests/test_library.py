@@ -230,6 +230,24 @@ def test_video_library_recovers_missing_duration_from_joints_csv(tmp_path: Path)
     assert json.loads((episode / "meta.json").read_text(encoding="utf-8"))["duration_s"] == pytest.approx(51.1124)
 
 
+def test_recorder_persists_task_into_each_episode(tmp_path: Path) -> None:
+    root = tmp_path / "videos" / "tasked"
+    rec = DatasetRecorder(
+        root,
+        fps=5,
+        kind="record",
+        extra_meta={"task": "sort blocks"},
+        video=False,
+    )
+    rec.add_action({}, None, episode_index=0, elapsed_s=0.0)
+    rec.finish_episode(0)
+    rec.add_action({}, None, episode_index=1, elapsed_s=0.0)
+    rec.close()
+
+    saved = VideoLibrary(root.parent).get(root.name)
+    assert [episode["task"] for episode in saved["episodes"]] == ["sort blocks", "sort blocks"]
+
+
 def test_list_hf_datasets_hub_and_lerobot(tmp_path: Path, monkeypatch) -> None:
     hf = tmp_path / "hf"
     hub = hf / "hub" / "datasets--user--blocks"

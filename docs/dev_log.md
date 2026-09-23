@@ -23,14 +23,19 @@
 - Record / Rollout / Debug 的 Library 依赖改为下拉选择：Record 只列 Datasets，
   Rollout 与 Debug 只列 Models；路径保存在隐藏字段中，不再要求手动输入。Record 和
   Rollout 标题移除，Teleop 标题改为与 Task 一致的标签样式。
+- Models/Datasets 卡片支持从 Library 拖到右侧对应选择器；接收下拉使用虚线高亮、
+  左侧强调色和拖入态反馈，类型不匹配时拒绝。Record 的 Dataset 已移动到 Task 上方。
+- Record 的 New dataset 选项会立即创建并选中空数据集。录制 task 会写入每个 episode
+  meta；episode 展开详情新增 Task/Name/Note 元信息摘要。点击 episode 主行会同时
+  播放并展开只读详情，编辑图标才展开编辑表单。
 - Episode 查看器对所有来源提供编辑、删除和拖动排序；Video 使用原有物理 episode
   操作，Dataset 使用持久化 episode view override 调整顺序和隐藏项。
 - 移除 Library 15 秒自动轮询，保留初始加载、操作后刷新和手动 Scan/Refresh。
 - 新增 `GET /api/datasets/search`、`POST /api/datasets/download`、
   `POST /api/datasets/empty`；数据集下载后必须包含 `meta/info.json`，空数据集使用
   临时目录原子创建。
-- 验证：排除 `test_sim.py` 为 `172 passed`；完整测试为 `201 passed, 2 failed`，
-  失败均为既有 `test_sim` 模拟总线初始位姿/动作落点断言。`node --check`、
+- 验证：排除 `test_sim.py` 为 `171 passed, 2 skipped`；完整测试为 `203 passed, 1 failed`，
+  失败为既有 `test_sim` 模拟总线初始位姿断言。`node --check`、
   Python compile、`git diff --check` 通过。
 - Chrome/IAB 浏览器检查通过：metadata 位于标题下方且每行两个字段、设置弹层、单个
   来源编辑按钮、上传/下载/删除按钮、选中后 description、Datasets Add 菜单、Videos

@@ -213,6 +213,7 @@ def local_episode_payload(root: Path, index: int) -> dict[str, Any]:
             "requested_video_fps": requested_video_fps,
             "encoded_video_fps": encoded_video_fps,
             "duration_s": duration_s,
+            "task": str(episode_meta.get("task") or root_meta.get("task") or ""),
         }
     )
     return payload

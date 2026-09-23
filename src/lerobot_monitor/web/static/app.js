@@ -55,6 +55,7 @@ let snapshotsCache = [];
 let modelsCache = [];
 const LIBRARY_SEARCH_KEY = "lerobot-monitor-library-search";
 const LIBRARY_META_FIELDS_KEY = "lerobot-monitor-library-meta-fields";
+const LIBRARY_DRAG_MIME = "application/x-lerobot-library";
 const librarySearch = {
   videos: "",
   datasets: "",
@@ -82,6 +83,7 @@ let snapshotCaptureBusy = false;
 let episodeSource = null;
 let episodeRows = [];
 let expandedEpisode = null;
+let editingEpisode = null;
 let episodeSignatureCache = "";
 let replayActive = false;
 let replaySeekId = null;
@@ -2903,7 +2905,7 @@ function parentPath(path) {
 function recordDatasetValue() {
   const repo = $("rec-repo") ? $("rec-repo").value.trim() : "";
   const row = datasetsCache.find((item) => (item.repo_id || item.id) === repo);
-  return row ? `dataset:${row.repo_id || row.id}` : "__new__";
+  return row ? `dataset:${row.repo_id || row.id}` : "";
 }
 
 function populateRecordDatasetSelect() {
@@ -2911,6 +2913,10 @@ function populateRecordDatasetSelect() {
   if (!select) return;
   const current = select.value || recordDatasetValue();
   select.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Choose dataset…";
+  select.appendChild(placeholder);
   const fresh = document.createElement("option");
   fresh.value = "__new__";
   fresh.textContent = "New dataset";
@@ -2927,7 +2933,6 @@ function populateRecordDatasetSelect() {
     select.appendChild(group);
   }
   setSelectValue(select, current);
-  if (!select.value) select.value = "__new__";
 }
 
 function syncRecordDatasetSelection() {
@@ -2943,12 +2948,109 @@ function syncRecordDatasetSelection() {
         ? parentPath(row.path)
         : String((meta.recording && meta.recording.root) || meta.recording_root || "");
     }
+  } else if (value === "__new__") {
+    if ($("rec-repo")) $("rec-repo").value = "";
+    if ($("rec-root")) $("rec-root").value = String((meta.recording && meta.recording.root) || meta.recording_root || "");
   } else {
     if ($("rec-repo")) $("rec-repo").value = "";
     if ($("rec-root")) $("rec-root").value = String((meta.recording && meta.recording.root) || meta.recording_root || "");
   }
   updateRecordDestinationUi();
   persistUi();
+}
+
+let creatingRecordDataset = false;
+
+async function createNewRecordDataset() {
+  if (creatingRecordDataset) return;
+  const select = $("rec-dataset-select");
+  if (!select) return;
+  const previous = select.dataset.previousValue || "";
+  const name = ($("rec-task") && $("rec-task").value.trim()) || "dataset";
+  const cameras = ((last && last.cameras) || meta.cameras || [])
+    .filter((camera) => camera && camera.enabled && camera.show_main)
+    .map((camera) => ({
+      key: String(camera.label || camera.name || ""),
+      width: Number(camera.width || 640),
+      height: Number(camera.height || 480),
+    }));
+  creatingRecordDataset = true;
+  try {
+    const created = await api("/api/datasets/empty", {
+      name,
+      repo_id: "",
+      fps: Number($("rec-action-fps") && $("rec-action-fps").value) || 15,
+      robot_type: String((meta.robot && meta.robot.type) || ""),
+      cameras,
+    });
+    await refreshLibrarySection("datasets");
+    const value = `dataset:${created.repo_id || created.id}`;
+    populateRecordDatasetSelect();
+    setSelectValue(select, value);
+    select.dataset.previousValue = value;
+    syncRecordDatasetSelection();
+    localLog(`dataset created: ${created.repo_id || created.id}`);
+  } catch (err) {
+    setSelectValue(select, previous);
+    syncRecordDatasetSelection();
+    toastError(err);
+  } finally {
+    creatingRecordDataset = false;
+  }
+}
+
+function applyLibraryDrop(select, payload) {
+  const expectedKind = select.dataset.dropKind || "";
+  if (!payload || payload.kind !== expectedKind) {
+    toastError(new Error(`drop a Library ${expectedKind} here`));
+    return;
+  }
+  if (expectedKind === "dataset") {
+    const value = `dataset:${payload.id}`;
+    if (![...select.options].some((option) => option.value === value)) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = payload.display_name || payload.id;
+      select.appendChild(option);
+    }
+    select.value = value;
+    syncRecordDatasetSelection();
+  } else {
+    if (![...select.options].some((option) => option.value === payload.path)) {
+      const option = document.createElement("option");
+      option.value = payload.path;
+      option.textContent = payload.display_name || payload.id;
+      select.appendChild(option);
+    }
+    select.value = payload.path;
+    if (select.id === "dbg-policy" && $("dbg-path")) $("dbg-path").value = payload.path;
+    persistUi();
+  }
+  selectLibraryItem(payload.kind, payload.id);
+  renderLibrarySectionFor(payload.kind);
+}
+
+function bindLibraryDropSelect(select) {
+  if (!select) return;
+  const active = (event) => {
+    if (!event.dataTransfer || ![...event.dataTransfer.types].includes(LIBRARY_DRAG_MIME)) return false;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    select.classList.add("drop-active");
+    return true;
+  };
+  select.addEventListener("dragenter", active);
+  select.addEventListener("dragover", active);
+  select.addEventListener("dragleave", () => select.classList.remove("drop-active"));
+  select.addEventListener("drop", (event) => {
+    if (!active(event)) return;
+    select.classList.remove("drop-active");
+    try {
+      applyLibraryDrop(select, JSON.parse(event.dataTransfer.getData(LIBRARY_DRAG_MIME)));
+    } catch (err) {
+      toastError(err);
+    }
+  });
 }
 
 function recordFields() {
@@ -3412,10 +3514,17 @@ function updateTaskInfo() {
   });
 });
 if ($("rec-dataset-select")) {
-  $("rec-dataset-select").addEventListener("change", () => {
+  $("rec-dataset-select").addEventListener("change", async () => {
+    const select = $("rec-dataset-select");
+    if (select.value === "__new__") {
+      await createNewRecordDataset();
+      return;
+    }
+    select.dataset.previousValue = select.value;
     syncRecordDatasetSelection();
   });
 }
+["rec-dataset-select", "pol-path", "dbg-policy"].forEach((id) => bindLibraryDropSelect($(id)));
 
 function setSelectedPreset(kind, name) {
   if (name) presetSelections[kind] = name;
@@ -4371,6 +4480,23 @@ function makeLibraryItem(kind, row, onOpen, tools = []) {
   const sourceId = librarySourceId(kind, row);
   const li = document.createElement("li");
   li.className = "library-item";
+  if (kind === "model" || kind === "dataset") {
+    li.classList.add("draggable-resource");
+    li.draggable = true;
+    li.addEventListener("dragstart", (event) => {
+      const payload = {
+        kind,
+        id: sourceId,
+        path: String(row.path || ""),
+        display_name: libraryDisplayName(kind, row),
+      };
+      event.dataTransfer.effectAllowed = "copy";
+      event.dataTransfer.setData(LIBRARY_DRAG_MIME, JSON.stringify(payload));
+      event.dataTransfer.setData("text/plain", payload.display_name || sourceId);
+      li.classList.add("dragging");
+    });
+    li.addEventListener("dragend", () => li.classList.remove("dragging"));
+  }
   const selected = isLibrarySelected(kind, sourceId);
   if (selected) li.classList.add("sel");
   const head = document.createElement("div");
@@ -5405,16 +5531,49 @@ function setEpisodeMutationPending(pending) {
   renderEpisodes();
 }
 
+function episodeSummaryValues(ep, draft = null) {
+  if (draft) {
+    return {
+      task: draft.task || "",
+      name: draft.name || "",
+      note: draft.note || "",
+    };
+  }
+  return {
+    task: ep.task || (episodeSource && episodeSource.subtitle) || "",
+    name: ep.name || "",
+    note: ep.note || "",
+  };
+}
+
+function makeEpisodeSummary(values) {
+  const summary = document.createElement("div");
+  summary.className = "ep-meta-summary";
+  [["task", "Task"], ["name", "Name"], ["note", "Note"]].forEach(([key, label]) => {
+    const row = document.createElement("div");
+    row.className = "ep-meta-row";
+    const name = document.createElement("strong");
+    name.textContent = label;
+    const value = document.createElement("span");
+    value.textContent = String(values[key] || "—");
+    value.title = value.textContent;
+    row.append(name, value);
+    summary.appendChild(row);
+  });
+  return summary;
+}
+
 function makeEpisodeEditor(ep) {
   const source = episodeSource ? { ...episodeSource } : null;
   const draftKey = episodeDraftKey(source, ep.index);
   const draft = episodeDrafts.get(draftKey) || {
     name: ep.name || "",
-    task: ep.task || "",
+    task: ep.task || (episodeSource && episodeSource.subtitle) || "",
     note: ep.note || "",
   };
   const box = document.createElement("div");
   box.className = "ep-editor";
+  box.appendChild(makeEpisodeSummary(episodeSummaryValues(ep, draft)));
   const inputs = {};
   [["name", "Name", "e.g. grasp"], ["task", "Task", ""], ["note", "Note", ""]].forEach(([key, label, placeholder]) => {
     const row = document.createElement("label");
@@ -5453,7 +5612,7 @@ function makeEpisodeEditor(ep) {
       Object.entries(draft).forEach(([key, value]) => { payload[key] = String(value).trim(); });
       Object.assign(ep, await api("/api/episodes", payload, "PUT"));
       episodeDrafts.delete(draftKey);
-      expandedEpisode = null;
+      editingEpisode = null;
     } catch (err) {
       toastError(err);
     } finally {
@@ -5463,7 +5622,7 @@ function makeEpisodeEditor(ep) {
   cancel.addEventListener("click", (event) => {
     event.stopPropagation();
     episodeDrafts.delete(draftKey);
-    expandedEpisode = null;
+    editingEpisode = null;
     renderEpisodes();
   });
   actions.append(save, cancel);
@@ -5473,7 +5632,8 @@ function makeEpisodeEditor(ep) {
 }
 
 function toggleEpisodeEditor(index) {
-  expandedEpisode = expandedEpisode === index ? null : index;
+  expandedEpisode = index;
+  editingEpisode = editingEpisode === index ? null : index;
   renderEpisodes();
 }
 
@@ -5524,12 +5684,14 @@ function renderEpisodes() {
       && vizState.id === episodeSource.id
       && vizState.episode === ep.index;
     if (isReplaying) li.classList.add("sel");
+    const isEditing = editingEpisode === ep.index;
+    if (isEditing) li.classList.add("editing");
     const head = document.createElement("div");
     head.className = "ep-head";
     const primary = document.createElement("button");
     primary.type = "button";
     primary.className = "ep-primary";
-    primary.setAttribute("aria-label", `View episode ${ep.index}${ep.name || ep.task ? `: ${ep.name || ep.task}` : ""}`);
+    primary.setAttribute("aria-label", `Play and show details for episode ${ep.index}`);
     const index = document.createElement("span");
     index.className = "ep-index";
     index.textContent = `ep ${ep.index}`;
@@ -5539,11 +5701,22 @@ function renderEpisodes() {
     label.title = episodeTooltip(ep);
     const tools = document.createElement("span");
     tools.className = "ep-icons";
-    const edit = makeEpisodeIconButton("ep-edit", `Edit episode ${ep.index}`, EPISODE_ICONS.edit);
+    const play = makeEpisodeIconButton("ep-play", `Play episode ${ep.index}`, EPISODE_ICONS.play);
+    play.disabled = episodeMutationPending || !ep.playable;
+    play.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (!play.disabled) playEpisode(source.kind, source.id, ep.index);
+    });
+    tools.append(play);
+    const edit = makeEpisodeIconButton(
+      "ep-edit",
+      `${isEditing ? "Close" : "Edit"} episode ${ep.index}`,
+      EPISODE_ICONS.edit,
+    );
     edit.disabled = episodeMutationPending;
     edit.addEventListener("click", (event) => {
       event.stopPropagation();
-      toggleEpisodeEditor(ep.index);
+      if (!edit.disabled) toggleEpisodeEditor(ep.index);
     });
     tools.append(edit);
     const remove = makeEpisodeIconButton("ep-del", `Delete episode ${ep.index}`, EPISODE_ICONS.delete);
@@ -5557,10 +5730,17 @@ function renderEpisodes() {
     makeEpisodeDragHandle(drag, li, list, source.kind, source.id);
     tools.append(remove, drag);
     primary.append(index, label);
-    primary.addEventListener("click", () => playEpisode(source.kind, source.id, ep.index));
+    primary.addEventListener("click", () => {
+      expandedEpisode = ep.index;
+      editingEpisode = null;
+      renderEpisodes();
+      playEpisode(source.kind, source.id, ep.index);
+    });
     head.append(primary, tools);
     li.appendChild(head);
-    if (expandedEpisode === ep.index) li.appendChild(makeEpisodeEditor(ep));
+    if (expandedEpisode === ep.index) {
+      li.appendChild(isEditing ? makeEpisodeEditor(ep) : makeEpisodeSummary(episodeSummaryValues(ep)));
+    }
     list.appendChild(li);
   });
 }
@@ -5628,6 +5808,7 @@ async function loadEpisodeList(kind, id, title = id) {
   const sameSource = !!episodeSource && episodeSource.kind === kind && episodeSource.id === id;
   if (!sameSource) {
     expandedEpisode = null;
+    editingEpisode = null;
     episodeDrafts.clear();
   }
   openEpisodeSelection();
@@ -5885,6 +6066,7 @@ function closeEpisodeSelection() {
   clearLibrarySelection("video");
   episodeRows = [];
   expandedEpisode = null;
+  editingEpisode = null;
   episodeLoading = false;
   episodeError = "";
   episodeDrafts.clear();
@@ -7601,6 +7783,7 @@ function syncEpisodeSource(refreshedKind = "") {
     episodeSource = null;
     episodeRows = [];
     expandedEpisode = null;
+    editingEpisode = null;
     episodeSignatureCache = "";
     renderEpisodes();
   } else if (signature !== episodeSignatureCache) {

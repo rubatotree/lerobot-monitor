@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -59,6 +61,41 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 
 def episode_dir(root: Path, index: int) -> Path:
     return root / "episodes" / f"{int(index):06d}"
+
+
+def _episode_duration_s(folder: Path, info: dict[str, Any], root_meta: dict[str, Any]) -> float:
+    saved = info.get("duration_s")
+    try:
+        duration = float(saved)
+        if math.isfinite(duration) and duration > 0:
+            return duration
+    except (TypeError, ValueError):
+        pass
+    joints = folder / "joints.csv"
+    if joints.is_file():
+        last_t: float | None = None
+        try:
+            with joints.open(newline="", encoding="utf-8") as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        value = float(row.get("t") or "")
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(value):
+                        last_t = value
+        except OSError:
+            last_t = None
+        if last_t is not None:
+            return round(last_t, 4)
+    frames = int(info.get("action_frames") or info.get("frames") or 0)
+    fps = float(
+        info.get("action_fps")
+        or info.get("fps")
+        or root_meta.get("action_fps")
+        or root_meta.get("fps")
+        or 0
+    )
+    return round(frames / fps, 4) if frames > 0 and fps > 0 else 0.0
 
 
 class DatasetRecorder:
@@ -407,6 +444,10 @@ class VideoLibrary:
         meta["id"] = meta.get("id") or path.name
         meta["path"] = str(path)
         meta["episodes"] = self._episodes(path, meta)
+        duration = round(sum(float(episode.get("duration_s") or 0.0) for episode in meta["episodes"]), 4)
+        if meta.get("duration_s") != duration:
+            meta["duration_s"] = duration
+            _write_json(meta_path, meta)
         return meta
 
     def _episodes(self, path: Path, meta: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -428,6 +469,13 @@ class VideoLibrary:
                 row["videos"] = [v.name for v in videos]
                 preview = child / "preview.jpg"
                 row["preview"] = preview.name if preview.is_file() else None
+                duration = _episode_duration_s(child, row, meta or {})
+                if row.get("duration_s") != duration:
+                    row["duration_s"] = duration
+                    episode_meta = child / "meta.json"
+                    saved = _read_json(episode_meta)
+                    saved.update(row)
+                    _write_json(episode_meta, saved)
                 by_index[index] = row
         return [by_index[k] for k in sorted(by_index)]
 
@@ -450,6 +498,66 @@ class VideoLibrary:
             raise FileNotFoundError(dataset_id)
         with self._lock:
             shutil.rmtree(path)
+
+    def trim_to_first_episode(self, dataset_id: str) -> dict[str, Any]:
+        """Keep only the lowest-numbered episode and reindex it to episode 0."""
+        path = self._dataset_dir(dataset_id)
+        if not (path / "meta.json").is_file():
+            raise FileNotFoundError(dataset_id)
+        with self._lock:
+            indices = [int(episode["index"]) for episode in self._episodes(path)]
+            if len(indices) <= 1:
+                return self.get(dataset_id)
+            keep = min(indices)
+            for index in indices:
+                if index == keep:
+                    continue
+                shutil.rmtree(episode_dir(path, index), ignore_errors=True)
+            return self._reindex(path)
+
+    def trim_all_to_first_episode(self) -> list[dict[str, Any]]:
+        trimmed: list[dict[str, Any]] = []
+        for row in self.list():
+            dataset_id = str(row.get("id") or "")
+            indices = sorted(int(episode.get("index", 0)) for episode in row.get("episodes") or [])
+            if len(indices) <= 1:
+                continue
+            result = self.trim_to_first_episode(dataset_id)
+            result["trimmed_from_episode"] = indices[0]
+            trimmed.append(result)
+        return trimmed
+
+    def duplicate(self, dataset_id: str, *, name: str | None = None) -> dict[str, Any]:
+        source = self._dataset_dir(dataset_id)
+        if not source.is_dir():
+            raise FileNotFoundError(dataset_id)
+        source_meta = _read_json(source / "meta.json")
+        duplicate_name = str(name if name is not None else f"{source_meta.get('name') or dataset_id} copy")
+        base = slugify(duplicate_name or dataset_id)
+        base_id = f"{base}_{_utc_stamp()}"
+        with self._lock:
+            suffix = 1
+            while True:
+                duplicate_id = base_id if suffix == 1 else f"{base_id}_{suffix}"
+                destination = self.root / duplicate_id
+                try:
+                    destination.mkdir(exist_ok=False)
+                    break
+                except FileExistsError:
+                    suffix += 1
+            try:
+                shutil.copytree(source, destination, dirs_exist_ok=True)
+                meta = _read_json(destination / "meta.json")
+                now = datetime.now(timezone.utc).isoformat()
+                meta["id"] = duplicate_id
+                meta["name"] = duplicate_name
+                meta["created_utc"] = now
+                meta["updated_utc"] = now
+                _write_json(destination / "meta.json", meta)
+            except BaseException:
+                shutil.rmtree(destination, ignore_errors=True)
+                raise
+        return self.get(duplicate_id)
 
     def delete_episode(self, dataset_id: str, index: int) -> dict[str, Any]:
         path = self._dataset_dir(dataset_id)
@@ -511,6 +619,7 @@ class VideoLibrary:
                     info["preview"] = preview.name
                 videos = sorted((dest / "videos").glob("*")) if (dest / "videos").is_dir() else []
                 info["videos"] = [v.name for v in videos]
+                info["duration_s"] = _episode_duration_s(dest, info, meta)
                 episodes.append(info)
                 if episode_meta_path.is_file():
                     _write_json(episode_meta_path, info)
@@ -721,6 +830,89 @@ def list_local_models(roots: list[Path], *, max_depth: int = 6) -> list[dict[str
 DatasetLibrary = VideoLibrary
 
 
+def _metadata_time(row: dict[str, Any]) -> str:
+    value = row.get("updated_utc") or row.get("created_utc")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    try:
+        stamp = int(row.get("mtime") or 0)
+    except (TypeError, ValueError):
+        stamp = 0
+    if stamp <= 0:
+        return ""
+    return datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+
+
+def library_metadata(kind: str, row: dict[str, Any]) -> dict[str, Any]:
+    """Structured display metadata shared by every Library resource."""
+    metadata: dict[str, Any] = {
+        "saved_at": _metadata_time(row),
+        "source": str(row.get("source") or ""),
+        "path": str(row.get("path") or ""),
+        "repo_id": str(row.get("repo_id") or ""),
+    }
+    if kind == "model":
+        metadata.update(
+            {
+                "policy_type": str(row.get("policy_type") or ""),
+                "revision": str(row.get("revision") or ""),
+                "weights": "missing" if row.get("missing") else "available",
+            }
+        )
+    elif kind == "dataset":
+        metadata.update(
+            {
+                "episodes": row.get("episodes"),
+                "fps": row.get("fps"),
+                "task": str(row.get("task") or ""),
+                "robot_type": str(row.get("robot_type") or ""),
+            }
+        )
+    elif kind == "video":
+        metadata.update(
+            {
+                "episodes": len(row.get("episodes") or []),
+                "fps": row.get("action_fps") or row.get("fps"),
+                "duration_s": row.get("duration_s"),
+                "task": str(row.get("task") or ""),
+            }
+        )
+    elif kind == "snapshot":
+        metadata.update(
+            {
+                "origin": str(row.get("origin") or ""),
+                "cameras": len(row.get("cameras") or []),
+                "task": str(row.get("task") or ""),
+                "joints": len(row.get("joints") or {}),
+            }
+        )
+    return {key: value for key, value in metadata.items() if value not in (None, "")}
+
+
+def default_library_note(kind: str, row: dict[str, Any]) -> str:
+    """Build the concise, editable metadata note used when a resource is first seen."""
+    source = str(row.get("source") or "local")
+    if kind == "model":
+        policy_type = str(row.get("policy_type") or "policy")
+        remote = str(row.get("repo_id") or row.get("path") or row.get("name") or "")
+        return " · ".join(part for part in (policy_type, source, remote) if part)
+    if kind == "dataset":
+        episodes = row.get("episodes")
+        episode_label = f"{int(episodes)} episodes" if episodes is not None else "unknown episodes"
+        fps = row.get("fps")
+        fps_label = f"{fps} fps" if fps else "unknown fps"
+        return " · ".join((episode_label, fps_label, source))
+    if kind == "video":
+        episodes = len(row.get("episodes") or [])
+        duration = float(row.get("duration_s") or 0.0)
+        fps = row.get("action_fps") or row.get("fps")
+        parts = [f"{episodes} episodes", f"{duration:.1f}s"]
+        if fps:
+            parts.append(f"{fps} fps")
+        return " · ".join(parts)
+    return ""
+
+
 def huggingface_home() -> Path:
     if os.environ.get("HF_HOME"):
         return Path(os.environ["HF_HOME"])
@@ -796,14 +988,18 @@ def _lerobot_info(path: Path) -> dict[str, Any]:
         return value.strip()[:2000] if isinstance(value, str) else ""
 
     task = text("task") or (tasks[0] if tasks else "")
+    episodes = info.get("total_episodes")
+    if episodes is None:
+        episodes = info.get("total_episodes_in_set")
     return {
         "fps": info.get("fps"),
-        "episodes": info.get("total_episodes") or info.get("total_episodes_in_set"),
+        "episodes": episodes,
         "title": text("title"),
         "subtitle": text("subtitle"),
         "description": text("description"),
         "task": task,
         "tasks": tasks,
+        "robot_type": text("robot_type"),
         "lerobot": True,
     }
 
@@ -866,6 +1062,7 @@ def _dataset_entry(repo_id: str, path: Path, source: str) -> dict[str, Any] | No
         "mtime": int(stat.st_mtime) if stat else 0,
         "episodes": extra.get("episodes"),
         "fps": extra.get("fps"),
+        "robot_type": extra.get("robot_type"),
         "lerobot": True,
         "has_video": has_video,
         "previewable": previewable,
@@ -972,3 +1169,6 @@ def list_hf_datasets(extra_roots: list[Path] | None = None) -> list[dict[str, An
 
 def mosaic_named(images_bgr: dict[str, Any]):
     return mosaic_bgr(images_bgr)
+
+
+dataset_entry = _dataset_entry

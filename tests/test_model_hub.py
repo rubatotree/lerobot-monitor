@@ -68,8 +68,8 @@ def test_registry_upserts_duplicate_remote_and_updates_weights(tmp_path: Path, m
     assert second["repo_id"] == "lerobot/act_aloha"
 
     changed = registry.save(first["id"], {"remote": "lerobot/act_aloha_v2", "revision": "main"})
-    assert changed["path"] == ""
-    assert changed["missing"] is True
+    assert changed["path"].endswith("lerobot--act_aloha_v2-main")
+    assert changed["playable"] is False
 
     updated = registry.update(first["id"])
     assert updated["path"]
@@ -90,3 +90,23 @@ def test_registry_uses_stable_id_for_local_model(tmp_path: Path) -> None:
     assert len(store.models()) == 1
     assert second["source"] == "local"
     assert second["path"] == str(model_dir.resolve())
+
+
+def test_registry_uploads_registered_model(tmp_path: Path, monkeypatch) -> None:
+    model_dir = tmp_path / "policy"
+    model_dir.mkdir()
+    store = JsonStore(tmp_path / "store.json")
+    registry = ModelRegistry(store, [])
+    row = registry.register(remote=str(model_dir), name="Local")
+    row = store.put_model({**row, "repo_id": "user/local-policy"})
+
+    calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        model_hub,
+        "upload_hf_model",
+        lambda repo_id, path, revision="": calls.append((repo_id, path, revision)),
+    )
+
+    uploaded = registry.upload(row["id"])
+    assert uploaded["repo_id"] == "user/local-policy"
+    assert calls == [("user/local-policy", str(model_dir.resolve()), "")]

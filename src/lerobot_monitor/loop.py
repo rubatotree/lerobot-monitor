@@ -745,6 +745,19 @@ class ControlLoop:
         self.writer = None
         self.record_kind = None
         path = writer.close()
+        if path is not None:
+            try:
+                library = VideoLibrary(path.parent)
+                before = library.get(writer.dataset_id)
+                indices = sorted(int(episode.get("index", 0)) for episode in before.get("episodes") or [])
+                if len(indices) > 1:
+                    keep = indices[0]
+                    library.trim_to_first_episode(writer.dataset_id)
+                    if self.store is not None:
+                        self.store.remap_episode_overrides("video", writer.dataset_id, {str(keep): 0})
+                        self.store.delete_episode_view("video", writer.dataset_id)
+            except Exception as exc:  # noqa: BLE001 - cleanup must not break recording stop
+                self.log("error", f"video trim failed: {exc}")
         self.log("info", f"dataset saved: {path}")
         return path
 

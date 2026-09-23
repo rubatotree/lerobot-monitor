@@ -12,7 +12,7 @@ from .types import RELAX_POSE, ZERO_POSE
 
 PRESET_KINDS = ("record", "rollout", "pose", "debug", "hardware")
 EPISODE_KINDS = ("video", "dataset")
-LIBRARY_KINDS = ("video", "dataset")
+LIBRARY_KINDS = ("video", "dataset", "model")
 DEFAULT_POSE_PRESETS: dict[str, dict[str, float]] = {
     "relax": dict(RELAX_POSE),
     "zero": dict(ZERO_POSE),
@@ -30,6 +30,8 @@ class JsonStore:
             "episode_overrides": {kind: {} for kind in EPISODE_KINDS},
             "library_overrides": {kind: {} for kind in LIBRARY_KINDS},
             "models": [],
+            "datasets": [],
+            "episode_views": {kind: {} for kind in EPISODE_KINDS},
         }
         self._load()
         self._ensure_default_poses()
@@ -63,10 +65,27 @@ class JsonStore:
             for kind in LIBRARY_KINDS:
                 group = library_overrides.get(kind)
                 if isinstance(group, dict):
-                    self._data["library_overrides"][kind] = group
+                    self._data["library_overrides"][kind] = {
+                        str(source_id): self._normalize_library_entry(entry)
+                        for source_id, entry in group.items()
+                        if isinstance(entry, dict)
+                    }
         models = raw.get("models")
         if isinstance(models, list):
             self._data["models"] = [dict(entry) for entry in models if isinstance(entry, dict)]
+        datasets = raw.get("datasets")
+        if isinstance(datasets, list):
+            self._data["datasets"] = [dict(entry) for entry in datasets if isinstance(entry, dict)]
+        episode_views = raw.get("episode_views")
+        if isinstance(episode_views, dict):
+            for kind in EPISODE_KINDS:
+                group = episode_views.get(kind)
+                if isinstance(group, dict):
+                    self._data["episode_views"][kind] = {
+                        str(source_id): dict(view)
+                        for source_id, view in group.items()
+                        if isinstance(view, dict)
+                    }
 
     def _ensure_default_poses(self) -> None:
         pose = self._data["presets"].setdefault("pose", {})
@@ -257,18 +276,22 @@ class JsonStore:
             self._write()
 
     def library_override(self, kind: str, source_id: str) -> dict[str, str]:
-        """Return the monitor-owned note and description for one library source."""
+        """Return monitor-owned display metadata for one library source."""
         if kind not in LIBRARY_KINDS:
             raise KeyError(kind)
         with self._lock:
             saved = self._data["library_overrides"][kind].get(str(source_id))
             if not isinstance(saved, dict):
                 return {}
-            return {
-                key: str(saved[key])
-                for key in ("note", "description")
-                if saved.get(key) is not None
+            entry = self._normalize_library_entry(saved)
+            result = {
+                key: str(entry[key])
+                for key in ("name", "description", "task", "repo_id", "path", "source", "remote", "revision")
+                if entry.get(key) is not None
             }
+            if isinstance(entry.get("metadata"), dict):
+                result["metadata"] = dict(entry["metadata"])
+            return result
 
     def save_library_override(
         self,
@@ -283,17 +306,28 @@ class JsonStore:
             raise ValueError("library source id is empty")
         with self._lock:
             group = self._data["library_overrides"][kind].setdefault(key, {})
-            entry = dict(group) if isinstance(group, dict) else {}
-            for field in ("note", "description"):
+            entry = self._normalize_library_entry(group) if isinstance(group, dict) else {}
+            for field in ("name", "description", "task", "repo_id", "path", "source", "remote", "revision"):
                 if field in payload:
                     entry[field] = str(payload[field])
+            if "metadata" in payload and isinstance(payload["metadata"], dict):
+                entry["metadata"] = dict(payload["metadata"])
+            if "notes" in payload and "description" not in payload:
+                entry["description"] = "\n".join(self._normalize_notes(payload["notes"]))
+            elif "note" in payload and "description" not in payload:
+                entry["description"] = str(payload["note"]).strip()
+            entry.pop("notes", None)
+            entry.pop("note", None)
             self._data["library_overrides"][kind][key] = entry
             self._write()
-            return {
+            result = {
                 field: str(entry[field])
-                for field in ("note", "description")
+                for field in ("name", "description", "task", "repo_id", "path", "source", "remote", "revision")
                 if entry.get(field) is not None
             }
+            if isinstance(entry.get("metadata"), dict):
+                result["metadata"] = dict(entry["metadata"])
+            return result
 
     def delete_library_override(self, kind: str, source_id: str) -> None:
         if kind not in LIBRARY_KINDS:
@@ -301,6 +335,27 @@ class JsonStore:
         with self._lock:
             self._data["library_overrides"][kind].pop(str(source_id), None)
             self._write()
+
+    @staticmethod
+    def _normalize_notes(value: Any) -> list[str]:
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if not isinstance(value, (list, tuple)):
+            return []
+        return [str(note).strip() for note in value if str(note).strip()]
+
+    @classmethod
+    def _normalize_library_entry(cls, entry: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(entry)
+        if "description" not in normalized:
+            if "notes" in normalized:
+                normalized["description"] = "\n".join(cls._normalize_notes(normalized.pop("notes")))
+            elif "note" in normalized:
+                normalized["description"] = str(normalized.pop("note") or "").strip()
+        normalized.pop("notes", None)
+        normalized.pop("note", None)
+        return normalized
 
     def models(self) -> list[dict[str, Any]]:
         """User-registered models; the scan of local caches stays separate."""
@@ -337,4 +392,71 @@ class JsonStore:
             self._data["models"] = [
                 entry for entry in self._data["models"] if str(entry.get("id") or "") != key
             ]
+            self._write()
+
+    def datasets(self) -> list[dict[str, Any]]:
+        """User-registered datasets; scan results stay separate."""
+        with self._lock:
+            return [dict(entry) for entry in self._data["datasets"]]
+
+    def dataset(self, dataset_id: str) -> dict[str, Any] | None:
+        key = str(dataset_id)
+        with self._lock:
+            for entry in self._data["datasets"]:
+                if str(entry.get("id") or "") == key:
+                    return dict(entry)
+        return None
+
+    def put_dataset(self, entry: dict[str, Any]) -> dict[str, Any]:
+        key = str(entry.get("id") or "").strip()
+        if not key:
+            raise ValueError("dataset id is empty")
+        payload = dict(entry)
+        payload["id"] = key
+        with self._lock:
+            for index, saved in enumerate(self._data["datasets"]):
+                if str(saved.get("id") or "") == key:
+                    self._data["datasets"][index] = payload
+                    break
+            else:
+                self._data["datasets"].append(payload)
+            self._write()
+        return dict(payload)
+
+    def delete_dataset(self, dataset_id: str) -> None:
+        key = str(dataset_id)
+        with self._lock:
+            self._data["datasets"] = [
+                entry for entry in self._data["datasets"] if str(entry.get("id") or "") != key
+            ]
+            self._write()
+
+    def episode_view(self, kind: str, source_id: str) -> dict[str, Any]:
+        if kind not in EPISODE_KINDS:
+            raise KeyError(kind)
+        with self._lock:
+            view = self._data["episode_views"][kind].get(str(source_id))
+            return dict(view) if isinstance(view, dict) else {}
+
+    def save_episode_view(self, kind: str, source_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if kind not in EPISODE_KINDS:
+            raise KeyError(kind)
+        key = str(source_id).strip()
+        if not key:
+            raise ValueError("episode source id is empty")
+        with self._lock:
+            entry = dict(self._data["episode_views"][kind].get(key) or {})
+            if "order" in payload:
+                entry["order"] = [int(index) for index in payload["order"]]
+            if "hidden" in payload:
+                entry["hidden"] = sorted({int(index) for index in payload["hidden"]})
+            self._data["episode_views"][kind][key] = entry
+            self._write()
+            return dict(entry)
+
+    def delete_episode_view(self, kind: str, source_id: str) -> None:
+        if kind not in EPISODE_KINDS:
+            raise KeyError(kind)
+        with self._lock:
+            self._data["episode_views"][kind].pop(str(source_id), None)
             self._write()

@@ -42,11 +42,19 @@ let autoRecord = false;
 let capturing = false;
 let selectedVideoId = "";
 let selectedDatasetId = "";
+let selectedModelId = "";
+const librarySelections = {
+  model: "",
+  dataset: "",
+  video: "",
+  snapshot: "",
+};
 let videosCache = [];
 let datasetsCache = [];
 let snapshotsCache = [];
 let modelsCache = [];
 const LIBRARY_SEARCH_KEY = "lerobot-monitor-library-search";
+const LIBRARY_META_FIELDS_KEY = "lerobot-monitor-library-meta-fields";
 const librarySearch = {
   videos: "",
   datasets: "",
@@ -54,7 +62,20 @@ const librarySearch = {
   models: "",
   ...loadJsonStorage(LIBRARY_SEARCH_KEY),
 };
-let activeLibrarySearchKind = "videos";
+const LIBRARY_META_DEFAULTS = {
+  models: ["saved_at", "source", "repo_id", "policy_type"],
+  datasets: ["saved_at", "source", "repo_id", "episodes", "fps", "task"],
+  videos: ["saved_at", "source", "path", "episodes", "fps"],
+  snapshots: ["saved_at", "origin", "cameras", "task"],
+};
+let libraryMetaFields = {
+  models: [...LIBRARY_META_DEFAULTS.models],
+  datasets: [...LIBRARY_META_DEFAULTS.datasets],
+  videos: [...LIBRARY_META_DEFAULTS.videos],
+  snapshots: [...LIBRARY_META_DEFAULTS.snapshots],
+  ...loadJsonStorage(LIBRARY_META_FIELDS_KEY),
+};
+let activeLibrarySearchKind = "models";
 let activeSnapshot = null;
 let snapshotActive = false;
 let snapshotCaptureBusy = false;
@@ -3937,7 +3958,7 @@ function initSplitters() {
 }
 initSplitters();
 
-initTabList("library-tabs", "lerobot-monitor-library-tab", "videos", selectLibrarySearchKind);
+initTabList("library-tabs", "lerobot-monitor-library-tab", "models", selectLibrarySearchKind);
 initTabList("side-tabs", "lerobot-monitor-side-tab", "joints", (kind) => {
   selectPresetKind(PRESET_KIND_BY_TAB[kind] || "pose");
 });
@@ -3956,123 +3977,586 @@ if ($("roll-kv") && !$("roll-kv").children.length) addKvRow();
 if ($("btn-kv-add")) bind("btn-kv-add", () => addKvRow());
 
 const LIBRARY_EDIT_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg>`;
+const LIBRARY_DELETE_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/></svg>`;
+const LIBRARY_DRAG_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/></svg>`;
+const LIBRARY_ADD_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>`;
+const LIBRARY_DUPLICATE_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11"/><path d="M5 15V4h11"/></svg>`;
+const LIBRARY_REFRESH_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>`;
+const LIBRARY_UPLOAD_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M5 20h14"/></svg>`;
+const LIBRARY_DOWNLOAD_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>`;
 
 function librarySourceId(kind, row) {
-  return kind === "video" ? String(row.id || "") : String(row.repo_id || row.id || "");
+  if (kind === "video" || kind === "snapshot") return String(row.id || "");
+  return String(row.repo_id || row.id || "");
 }
 
-async function saveLibraryOverride(kind, sourceId, payload) {
+function libraryCache(kind) {
+  if (kind === "model") return modelsCache;
+  if (kind === "dataset") return datasetsCache;
+  if (kind === "video") return videosCache;
+  return snapshotsCache;
+}
+
+function libraryDisplayName(kind, row) {
+  return String(row.display_name || row.name || row.title || row.repo_id || row.id || "");
+}
+
+function libraryMetadata(row) {
+  return row && typeof row.metadata === "object" && row.metadata ? row.metadata : {};
+}
+
+function libraryDescription(row) {
+  return String((row && row.description) || "");
+}
+
+const LIBRARY_META_LABELS = {
+  saved_at: "Saved",
+  source: "Source",
+  path: "Path",
+  repo_id: "Upstream",
+  policy_type: "Policy",
+  revision: "Revision",
+  weights: "Weights",
+  episodes: "Episodes",
+  fps: "FPS",
+  duration_s: "Duration",
+  task: "Task",
+  robot_type: "Robot",
+  origin: "Origin",
+  cameras: "Cameras",
+  joints: "Joints",
+};
+
+function metadataText(key, value) {
+  if (value == null || value === "") return "";
+  if (key === "saved_at") {
+    const date = new Date(String(value));
+    if (!Number.isNaN(date.getTime())) return date.toLocaleString();
+  }
+  if (key === "duration_s") return `${Number(value).toFixed(1)}s`;
+  return String(value);
+}
+
+function renderLibraryMetadata(li, kind, row) {
+  const metadata = libraryMetadata(row);
+  const selected = isLibrarySelected(kind, librarySourceId(kind, row));
+  const fields = selected
+    ? Object.keys(metadata)
+    : libraryMetaFields[`${kind}s`] || [];
+  const visible = fields
+    .map((key) => [key, metadataText(key, metadata[key])])
+    .filter(([, value]) => value);
+  if (!visible.length) return;
+  const host = document.createElement("div");
+  host.className = "lib-meta";
+  visible.forEach(([key, value]) => {
+    const line = document.createElement("div");
+    line.className = "lib-meta-row";
+    const label = document.createElement("strong");
+    label.textContent = LIBRARY_META_LABELS[key] || key;
+    const text = document.createElement("span");
+    text.textContent = value;
+    text.title = value;
+    line.append(label, text);
+    host.appendChild(line);
+  });
+  li.appendChild(host);
+}
+
+function renderLibraryDescription(li, kind, sourceId, row) {
+  if (!isLibrarySelected(kind, sourceId)) return;
+  const description = libraryDescription(row);
+  const host = document.createElement("div");
+  host.className = `lib-description${description ? "" : " empty"}`;
+  host.textContent = description || "No description";
+  host.title = description || "No description";
+  li.appendChild(host);
+}
+
+function selectedLibraryId(kind) {
+  return librarySelections[kind] || "";
+}
+
+function isLibrarySelected(kind, sourceId) {
+  return selectedLibraryId(kind) === String(sourceId);
+}
+
+function selectLibraryItem(kind, sourceId) {
+  librarySelections[kind] = String(sourceId || "");
+}
+
+function clearLibrarySelection(kind = "") {
+  if (kind) librarySelections[kind] = "";
+  else Object.keys(librarySelections).forEach((key) => { librarySelections[key] = ""; });
+}
+
+async function saveLibraryMetadata(kind, sourceId, payload) {
   const saved = await api("/api/library", { kind, id: sourceId, ...payload }, "PUT");
-  const cache = kind === "video" ? videosCache : datasetsCache;
+  const cache = libraryCache(kind);
   const row = cache.find((item) => librarySourceId(kind, item) === sourceId);
   if (row) Object.assign(row, saved);
   if (episodeSource && episodeSource.kind === kind && episodeSource.id === sourceId) {
     Object.assign(episodeSource, saved);
   }
+  if (kind === "snapshot" && activeSnapshot && activeSnapshot.id === sourceId) {
+    activeSnapshot = saved;
+    if (replayActive) renderSnapshotHeader();
+  }
+  if (kind === "video" && vizState.kind === "video" && vizState.id === sourceId && saved.display_name) {
+    vizState.title = saved.display_name;
+    if ($("replay-title")) $("replay-title").textContent = saved.display_name;
+    if ($("viz-title")) $("viz-title").textContent = saved.display_name;
+  }
+  renderModels();
   renderVideos();
   renderDatasets();
+  renderSnapshots();
   renderEpisodes();
   return saved;
 }
 
-async function saveSnapshotNote(snapshotId, note) {
-  const saved = await saveSnapshotFields(snapshotId, { note });
-  if (snapshotActive && activeSnapshot && activeSnapshot.id === snapshotId && replayActive) {
-    renderSnapshotHeader();
-  }
-  return saved;
+function makeLibraryIconButton(className, label, icon) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `ghost icon-btn ${className}`;
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.innerHTML = icon;
+  return button;
 }
 
-function appendLibraryNote(li, kind, sourceId, row) {
-  const noteButton = document.createElement("button");
-  noteButton.type = "button";
-  noteButton.className = `lib-note-button${row.note ? "" : " empty"}`;
-  noteButton.textContent = row.note || "Add note";
-  noteButton.title = row.note ? `Note: ${row.note}` : "Add note";
-  noteButton.setAttribute("aria-label", row.note ? `Edit note: ${row.note}` : "Add note");
-  const editor = document.createElement("div");
-  editor.className = "lib-note-editor hidden";
+async function commitLibraryNotes(kind, sourceId, notes) {
+  return saveLibraryMetadata(kind, sourceId, { notes });
+}
+
+function beginNoteEdit(noteRow, kind, sourceId, notes, index) {
+  if (noteRow.querySelector(".lib-note-input")) return;
+  const original = noteRow.querySelector(".lib-note-text");
+  if (!original) return;
   const input = document.createElement("input");
   input.type = "text";
-  input.value = row.note || "";
-  input.placeholder = "note";
+  input.className = "lib-note-input";
+  input.value = notes[index] || "";
   input.setAttribute("aria-label", "Library note");
   const actions = document.createElement("span");
-  actions.className = "lib-note-actions";
+  actions.className = "lib-note-edit-actions";
   const save = document.createElement("button");
   save.type = "button";
-  save.className = "ghost icon-btn";
-  save.title = "Save note";
-  save.setAttribute("aria-label", "Save note");
-  save.innerHTML = LIBRARY_EDIT_ICON;
+  save.textContent = "Save";
   const cancel = document.createElement("button");
   cancel.type = "button";
   cancel.className = "ghost";
   cancel.textContent = "Cancel";
   actions.append(save, cancel);
-  editor.append(input, actions);
-  noteButton.addEventListener("click", () => {
-    noteButton.classList.add("hidden");
-    editor.classList.remove("hidden");
-    input.focus();
-    input.select();
-  });
-  const closeEditor = () => {
-    editor.classList.add("hidden");
-    noteButton.classList.remove("hidden");
-  };
+  original.replaceWith(input);
+  noteRow.querySelector(".lib-note-drag").replaceWith(actions);
+  input.focus();
+  input.select();
+  const close = () => renderLibrarySectionFor(kind);
   const commit = async () => {
-    save.disabled = true;
-    cancel.disabled = true;
-    input.disabled = true;
+    const text = input.value.trim();
+    if (!text) {
+      toastError(new Error("note cannot be empty"));
+      return;
+    }
+    const next = notes.slice();
+    next[index] = text;
     try {
-      if (kind === "snapshot") await saveSnapshotNote(sourceId, input.value.trim());
-      else if (kind === "model") {
-        await api(`/api/models/${encodeURIComponent(sourceId)}`, { note: input.value.trim() }, "PUT");
-        await refreshLibrarySection("models");
-      }
-      else await saveLibraryOverride(kind, sourceId, { note: input.value.trim() });
+      await commitLibraryNotes(kind, sourceId, next);
     } catch (err) {
       toastError(err);
-      closeEditor();
-    } finally {
-      save.disabled = false;
-      cancel.disabled = false;
-      input.disabled = false;
+      close();
     }
   };
   save.addEventListener("click", commit);
-  cancel.addEventListener("click", closeEditor);
+  cancel.addEventListener("click", close);
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
       commit();
     } else if (event.key === "Escape") {
       event.preventDefault();
-      closeEditor();
+      close();
     }
   });
-  li.append(noteButton, editor);
+}
+
+async function deleteLibraryNote(kind, sourceId, notes, index) {
+  const next = notes.filter((_, itemIndex) => itemIndex !== index);
+  try {
+    await commitLibraryNotes(kind, sourceId, next);
+  } catch (err) {
+    toastError(err);
+  }
+}
+
+function bindNoteDrag(handle, noteRow, list, kind, sourceId, notes) {
+  const commitOrder = async () => {
+    const order = [...list.querySelectorAll(".lib-note-row")].map((row) => Number(row.dataset.noteIndex));
+    const next = order.map((index) => notes[index]).filter((note) => note != null);
+    if (next.every((note, index) => note === notes[index])) return;
+    try {
+      await commitLibraryNotes(kind, sourceId, next);
+    } catch (err) {
+      toastError(err);
+      renderLibrarySectionFor(kind);
+    }
+  };
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    handle.setPointerCapture(event.pointerId);
+    noteRow.classList.add("dragging");
+    const move = (moveEvent) => {
+      const target = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY);
+      const targetRow = target && target.closest(".lib-note-row");
+      if (!targetRow || targetRow === noteRow || targetRow.parentElement !== list) return;
+      const rect = targetRow.getBoundingClientRect();
+      if (moveEvent.clientY < rect.top + rect.height / 2) list.insertBefore(noteRow, targetRow);
+      else list.insertBefore(noteRow, targetRow.nextSibling);
+    };
+    const up = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      handle.removeEventListener("pointercancel", up);
+      noteRow.classList.remove("dragging");
+      commitOrder();
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+    handle.addEventListener("pointercancel", up);
+  });
+  handle.addEventListener("keydown", (event) => {
+    if (!event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    const index = Number(noteRow.dataset.noteIndex);
+    const target = event.key === "ArrowUp" ? index - 1 : index + 1;
+    if (target < 0 || target >= notes.length) return;
+    const next = notes.slice();
+    [next[index], next[target]] = [next[target], next[index]];
+    commitLibraryNotes(kind, sourceId, next).catch((err) => {
+      toastError(err);
+      renderLibrarySectionFor(kind);
+    });
+  });
+}
+
+function appendLibraryNotes(li, kind, sourceId, row) {
+  const notes = libraryNotes(row);
+  const selected = isLibrarySelected(kind, sourceId);
+  if (!selected && !libraryNotesVisible) return;
+  const host = document.createElement("div");
+  host.className = "lib-notes";
+  const list = document.createElement("ol");
+  list.className = "lib-note-list";
+  notes.forEach((note, index) => {
+    const noteRow = document.createElement("li");
+    noteRow.className = "lib-note-row";
+    noteRow.dataset.noteIndex = String(index);
+    const text = document.createElement("button");
+    text.type = "button";
+    text.className = "lib-note-text";
+    text.textContent = note;
+    text.title = note;
+    text.addEventListener("click", () => beginNoteEdit(noteRow, kind, sourceId, notes, index));
+    const remove = makeLibraryIconButton("danger", "Delete note", LIBRARY_DELETE_ICON);
+    remove.addEventListener("click", () => deleteLibraryNote(kind, sourceId, notes, index));
+    const drag = makeLibraryIconButton("lib-note-drag", "Drag to reorder note", LIBRARY_DRAG_ICON);
+    drag.setAttribute("aria-label", "Drag to reorder note. Alt+Arrow Up/Down also reorders.");
+    noteRow.append(text, remove, drag);
+    list.appendChild(noteRow);
+    bindNoteDrag(drag, noteRow, list, kind, sourceId, notes);
+  });
+  host.appendChild(list);
+  if (selected) {
+    const add = document.createElement("div");
+    add.className = "lib-note-add";
+    const button = makeLibraryIconButton("lib-note-add-button", "Add note", LIBRARY_ADD_ICON);
+    button.append(document.createTextNode("Add note"));
+    button.addEventListener("click", () => {
+      const next = [...notes, ""];
+      const placeholder = document.createElement("li");
+      placeholder.className = "lib-note-row";
+      placeholder.dataset.noteIndex = String(next.length - 1);
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "lib-note-input";
+      input.placeholder = "note";
+      input.setAttribute("aria-label", "New library note");
+      placeholder.appendChild(input);
+      list.appendChild(placeholder);
+      add.remove();
+      input.focus();
+      const commit = async () => {
+        const text = input.value.trim();
+        if (!text) {
+          renderLibrarySectionFor(kind);
+          return;
+        }
+        next[next.length - 1] = text;
+        try {
+          await commitLibraryNotes(kind, sourceId, next);
+        } catch (err) {
+          toastError(err);
+          renderLibrarySectionFor(kind);
+        }
+      };
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          commit();
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          renderLibrarySectionFor(kind);
+        }
+      });
+      input.addEventListener("blur", () => {
+        if (input.isConnected) commit();
+      });
+    });
+    add.appendChild(button);
+    host.appendChild(add);
+  }
+  li.appendChild(host);
 }
 
 function libraryTitle(kind, row) {
-  if (kind === "dataset") {
-    return String(row.title || row.repo_id || row.id || "");
-  }
-  return String(row.name || row.title || row.id || "");
+  return libraryDisplayName(kind, row);
 }
 
 function filterLibraryRows(kind, rows) {
   const query = String(librarySearch[kind] || "").trim().toLowerCase();
   if (!query) return rows;
   return rows.filter((row) => {
-    const haystack = `${libraryTitle(kind, row)}\n${row.note || ""}`.toLowerCase();
+    const haystack = `${libraryTitle(kind, row)}\n${libraryDescription(row)}\n${JSON.stringify(libraryMetadata(row))}`.toLowerCase();
     return haystack.includes(query);
   });
 }
 
 function libraryFilterMessage(kind) {
-  return `No ${kind} title or note matches this search`;
+  return `No ${kind} title, metadata, or description matches this search`;
+}
+
+function renderLibrarySectionFor(kind) {
+  if (kind === "model") renderModels();
+  else if (kind === "dataset") renderDatasets();
+  else if (kind === "video") renderVideos();
+  else renderSnapshots();
+}
+
+function makeLibraryItem(kind, row, onOpen, tools = []) {
+  const sourceId = librarySourceId(kind, row);
+  const li = document.createElement("li");
+  li.className = "library-item";
+  const selected = isLibrarySelected(kind, sourceId);
+  if (selected) li.classList.add("sel");
+  const head = document.createElement("div");
+  head.className = "lib-item-head";
+  const title = document.createElement("button");
+  title.type = "button";
+  title.className = "lib-row-button lib-item-title";
+  title.textContent = libraryDisplayName(kind, row);
+  title.title = libraryDisplayName(kind, row);
+  title.setAttribute("aria-pressed", String(selected));
+  title.addEventListener("click", onOpen);
+  head.appendChild(title);
+  const toolHost = document.createElement("span");
+  toolHost.className = "lib-item-tools";
+  tools.forEach((tool) => toolHost.appendChild(tool));
+  if (toolHost.children.length) head.appendChild(toolHost);
+  li.appendChild(head);
+  renderLibraryMetadata(li, kind, row);
+  renderLibraryDescription(li, kind, sourceId, row);
+  return li;
+}
+
+if ($("library")) {
+  const clearSelectionOutsideItems = (event) => {
+    if (event.target.closest(".library-item, .library-tools, .library-menu, .library-modal")) return;
+    const kind = activeLibrarySearchKind.replace(/s$/, "");
+    if (!selectedLibraryId(kind)) return;
+    clearLibrarySelection(kind);
+    renderLibrarySectionFor(kind);
+  };
+  $("library").addEventListener("pointerdown", clearSelectionOutsideItems);
+  document.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("#library, #library-modal")) return;
+    const kind = activeLibrarySearchKind.replace(/s$/, "");
+    if (!selectedLibraryId(kind)) return;
+    clearLibrarySelection(kind);
+    renderLibrarySectionFor(kind);
+  });
+}
+
+async function deleteLibraryResource(kind, row) {
+  const sourceId = librarySourceId(kind, row);
+  const label = libraryDisplayName(kind, row) || sourceId;
+  if (!window.confirm(`Delete ${kind} ${label}?`)) return;
+  try {
+    await api(`/api/library?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(sourceId)}`, undefined, "DELETE");
+    clearLibrarySelection(kind);
+    if (isLibrarySelected(kind, sourceId)) {
+      if (kind === "snapshot") closeEpisodeSelection();
+      else if (kind === "video") closeEpisodeSelection();
+      else if (kind === "model") selectedModelId = "";
+      else if (kind === "dataset") closeEpisodeSelection();
+    }
+    await refreshLibrarySection(`${kind}s`);
+  } catch (err) {
+    toastError(err);
+  }
+}
+
+async function syncLibraryResource(kind, row, direction) {
+  const sourceId = librarySourceId(kind, row);
+  const endpoint = kind === "model" ? "models" : "datasets";
+  const action = direction === "upload" ? "upload" : "download";
+  try {
+    await api(`/api/${endpoint}/${encodeURIComponent(sourceId)}/${action}`);
+    await refreshLibrarySection(`${kind}s`);
+  } catch (err) {
+    toastError(err);
+  }
+}
+
+function editLibrarySource(kind, row) {
+  const sourceId = librarySourceId(kind, row);
+  const currentSource = row.remote || row.path || row.repo_id || "";
+  const supportsSource = kind === "model" || kind === "dataset";
+  openLibraryModal(`Edit ${kind} details`, (body) => {
+    const grid = document.createElement("div");
+    grid.className = "library-modal-grid";
+    const name = document.createElement("input");
+    name.type = "text";
+    name.value = libraryDisplayName(kind, row);
+    name.setAttribute("aria-label", "Display name");
+    grid.appendChild(modalField("Name", name));
+    let source = null;
+    let revision = null;
+    let task = null;
+    if (supportsSource) {
+      source = document.createElement("input");
+      source.type = "text";
+      source.value = currentSource;
+      source.placeholder = kind === "model" ? "org/name or local model path" : "org/name or local dataset path";
+      source.setAttribute("aria-label", "Upstream repo_id or local path");
+      revision = document.createElement("input");
+      revision.type = "text";
+      revision.value = String(row.revision || "");
+      revision.placeholder = "revision (optional)";
+      revision.setAttribute("aria-label", "Revision");
+      grid.append(
+        modalField("Upstream repo_id / local path", source),
+        modalField("Revision", revision),
+      );
+    } else {
+      task = document.createElement("input");
+      task.type = "text";
+      task.value = String(row.task || "");
+      task.placeholder = "task";
+      task.setAttribute("aria-label", "Task");
+      grid.appendChild(modalField("Task", task));
+    }
+    const description = document.createElement("textarea");
+    description.rows = 4;
+    description.value = libraryDescription(row);
+    description.placeholder = "description";
+    description.setAttribute("aria-label", "Description");
+    const descriptionField = document.createElement("label");
+    descriptionField.textContent = "Description";
+    descriptionField.appendChild(description);
+    const actions = document.createElement("div");
+    actions.className = "library-modal-actions";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.textContent = "Save & sync";
+    actions.appendChild(save);
+    body.append(grid, descriptionField, actions);
+    save.addEventListener("click", async () => {
+      const nextSource = source ? source.value.trim() : "";
+      if (supportsSource && !nextSource) {
+        libraryModalStatus(body, "Upstream repo_id or local path is required", true);
+        return;
+      }
+      save.disabled = true;
+      try {
+        const payload = {
+          name: name.value.trim(),
+          description: description.value.trim(),
+        };
+        if (supportsSource) {
+          payload.remote = nextSource;
+          payload.revision = revision.value.trim();
+        } else {
+          payload.task = task.value.trim();
+        }
+        await saveLibraryMetadata(kind, sourceId, payload);
+        closeLibraryModal();
+      } catch (err) {
+        libraryModalStatus(body, err.message || String(err), true);
+      } finally {
+        save.disabled = false;
+      }
+    });
+  });
+}
+
+function libraryResourceTools(kind, row) {
+  const sourceId = librarySourceId(kind, row);
+  const tools = [];
+  const edit = makeLibraryIconButton("lib-source-edit", `Edit details for ${sourceId}`, LIBRARY_EDIT_ICON);
+  edit.addEventListener("click", (event) => {
+    event.stopPropagation();
+    editLibrarySource(kind, row);
+  });
+  tools.push(edit);
+  if (kind === "video" || kind === "snapshot") {
+    const copy = makeLibraryIconButton("lib-copy", `Copy ${kind} ${sourceId}`, LIBRARY_DUPLICATE_ICON);
+    copy.addEventListener("click", (event) => {
+      event.stopPropagation();
+      duplicateLibraryResource(kind, row);
+    });
+    const remove = makeLibraryIconButton("lib-delete danger", `Delete ${kind} ${sourceId}`, LIBRARY_DELETE_ICON);
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteLibraryResource(kind, row);
+    });
+    tools.push(copy, remove);
+    return tools;
+  }
+  const hasUpstream = Boolean(row.repo_id);
+  const hasPath = Boolean(row.path);
+  const upload = makeLibraryIconButton("lib-upload", `Upload ${sourceId} to Hugging Face`, LIBRARY_UPLOAD_ICON);
+  upload.disabled = !hasUpstream || !hasPath;
+  upload.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (!upload.disabled) syncLibraryResource(kind, row, "upload");
+  });
+  const download = makeLibraryIconButton("lib-download", `Download ${sourceId} from Hugging Face`, LIBRARY_DOWNLOAD_ICON);
+  download.disabled = !hasUpstream;
+  download.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (!download.disabled) syncLibraryResource(kind, row, "download");
+  });
+  const remove = makeLibraryIconButton("lib-delete danger", `Delete ${kind} ${sourceId}`, LIBRARY_DELETE_ICON);
+  remove.addEventListener("click", (event) => {
+    event.stopPropagation();
+    deleteLibraryResource(kind, row);
+  });
+  tools.push(upload, download, remove);
+  return tools;
+}
+
+async function duplicateLibraryResource(kind, row) {
+  const sourceId = librarySourceId(kind, row);
+  const endpoint = kind === "snapshot" ? "snapshots" : "videos";
+  try {
+    const created = await api(`/api/${endpoint}/${encodeURIComponent(sourceId)}/duplicate`);
+    await refreshLibrarySection(`${kind}s`);
+    localLog(`${kind} copied: ${created.id}`);
+  } catch (err) {
+    toastError(err);
+  }
 }
 
 function renderVideos() {
@@ -4091,19 +4575,7 @@ function renderVideos() {
     return;
   }
   rows.forEach((vid) => {
-    const li = document.createElement("li");
-    if (episodeSource && episodeSource.kind === "video" && episodeSource.id === vid.id) li.className = "sel";
-    const n = (vid.episodes || []).length;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "lib-row-button";
-    button.textContent = `${vid.name || vid.id}  ·  ${n} ep`;
-    button.setAttribute("aria-pressed", String(li.classList.contains("sel")));
-    li.title = vid.path || vid.id;
-    button.addEventListener("click", () => selectVideo(vid.id));
-    li.appendChild(button);
-    appendLibraryNote(li, "video", String(vid.id), vid);
-    ol.appendChild(li);
+    ol.appendChild(makeLibraryItem("video", vid, () => selectVideo(vid.id), libraryResourceTools("video", vid)));
   });
 }
 
@@ -4123,29 +4595,10 @@ function renderDatasets() {
     return;
   }
   rows.forEach((ds) => {
-    const li = document.createElement("li");
     const id = ds.repo_id || ds.id;
-    if (episodeSource && episodeSource.kind === "dataset" && episodeSource.id === id) li.className = "sel";
-    const n = ds.episodes != null ? `${ds.episodes} ep` : ds.source || "hf";
-    const play = ds.playable ? "" : "  · no video";
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "lib-row-button";
-    button.textContent = `${id}  ·  ${n}${play}`;
-    button.setAttribute("aria-pressed", String(li.classList.contains("sel")));
-    li.title = ds.path || ds.repo_id || "";
-    button.addEventListener("click", () => selectHfDataset(ds));
-    li.appendChild(button);
-    appendLibraryNote(li, "dataset", id, ds);
-    ol.appendChild(li);
+    ol.appendChild(makeLibraryItem("dataset", ds, () => selectHfDataset(ds), libraryResourceTools("dataset", ds)));
   });
 }
-
-const SNAPSHOT_ICONS = {
-  edit: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg>`,
-  duplicate: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11"/><path d="M5 15V4h11"/></svg>`,
-  delete: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/></svg>`,
-};
 
 function snapshotSourceLabel(snapshot) {
   if (snapshot.origin === "replay" && snapshot.source) {
@@ -4157,19 +4610,8 @@ function snapshotSourceLabel(snapshot) {
   return "hardware";
 }
 
-function snapshotCameraCount(snapshot) {
-  const count = (snapshot.cameras || []).length;
-  return count ? `${count} cam` : "no image";
-}
-
 function makeSnapshotIconButton(className, label, icon) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = `ghost icon-btn ${className}`;
-  button.title = label;
-  button.setAttribute("aria-label", label);
-  button.innerHTML = icon;
-  return button;
+  return makeLibraryIconButton(className, label, icon);
 }
 
 function renderSnapshots() {
@@ -4190,52 +4632,15 @@ function renderSnapshots() {
     return;
   }
   rows.forEach((snapshot) => {
-    const li = document.createElement("li");
-    if (snapshotActive && activeSnapshot && activeSnapshot.id === snapshot.id) li.className = "sel";
-    const head = document.createElement("div");
-    head.className = "snap-head";
-    const open = document.createElement("button");
-    open.type = "button";
-    open.className = "lib-row-button";
-    open.textContent = `${snapshot.name || snapshot.id}  ·  ${snapshotSourceLabel(snapshot)}  ·  ${snapshotCameraCount(snapshot)}`;
-    open.setAttribute("aria-pressed", String(li.classList.contains("sel")));
-    li.title = snapshot.description || snapshot.id;
-    open.addEventListener("click", () => openSnapshot(snapshot.id));
-    const tools = document.createElement("span");
-    tools.className = "snap-tools";
-    const edit = makeSnapshotIconButton("snap-edit", `Edit snapshot ${snapshot.id}`, SNAPSHOT_ICONS.edit);
-    edit.addEventListener("click", (event) => {
-      event.stopPropagation();
-      openSnapshot(snapshot.id).then(() => openSnapshotEditor()).catch(toastError);
-    });
-    const duplicate = makeSnapshotIconButton("snap-dup", `Duplicate snapshot ${snapshot.id}`, SNAPSHOT_ICONS.duplicate);
-    duplicate.addEventListener("click", (event) => {
-      event.stopPropagation();
-      duplicateSnapshot(snapshot.id);
-    });
-    const remove = makeSnapshotIconButton("snap-del", `Delete snapshot ${snapshot.id}`, SNAPSHOT_ICONS.delete);
-    remove.addEventListener("click", (event) => {
-      event.stopPropagation();
-      deleteSnapshot(snapshot.id);
-    });
-    tools.append(edit, duplicate, remove);
-    head.append(open, tools);
-    li.appendChild(head);
-    appendLibraryNote(li, "snapshot", snapshot.id, snapshot);
-    ol.appendChild(li);
+    ol.appendChild(
+      makeLibraryItem(
+        "snapshot",
+        snapshot,
+        () => openSnapshot(snapshot.id),
+        libraryResourceTools("snapshot", snapshot),
+      ),
+    );
   });
-}
-
-async function saveSnapshotFields(snapshotId, payload) {
-  const saved = await api(`/api/snapshots/${encodeURIComponent(snapshotId)}`, payload, "PUT");
-  const index = snapshotsCache.findIndex((row) => row.id === saved.id);
-  if (index >= 0) snapshotsCache[index] = saved;
-  if (activeSnapshot && activeSnapshot.id === saved.id) {
-    activeSnapshot = saved;
-    if (replayActive) renderSnapshotHeader();
-  }
-  renderSnapshots();
-  return saved;
 }
 
 async function duplicateSnapshot(snapshotId) {
@@ -4256,73 +4661,10 @@ function renderSnapshotHeader() {
   const title = $("replay-title");
   if (title) {
     const snapshot = activeSnapshot || {};
-    const name = snapshot.name || snapshot.id || "snapshot";
+    const name = snapshot.display_name || snapshot.name || snapshot.id || "snapshot";
     title.textContent = `${name} · ${snapshotSourceLabel(snapshot)}`;
     title.title = snapshot.description || name;
   }
-}
-
-function openSnapshotEditor() {
-  const host = $("dbg-snap-editor");
-  const snapshot = activeSnapshot;
-  if (!host || !snapshot) return;
-  host.classList.remove("hidden");
-  host.innerHTML = "";
-  const fields = {};
-  [["name", "Name"], ["task", "Task"]].forEach(([key, label]) => {
-    const row = document.createElement("label");
-    row.textContent = label;
-    const input = document.createElement("input");
-    input.type = "text";
-    input.value = snapshot[key] || "";
-    input.setAttribute("aria-label", `Snapshot ${key}`);
-    fields[key] = input;
-    row.appendChild(input);
-    host.appendChild(row);
-  });
-  [["note", "Note"], ["description", "Description"]].forEach(([key, label]) => {
-    const row = document.createElement("label");
-    row.textContent = label;
-    const input = document.createElement("textarea");
-    input.rows = key === "note" ? 2 : 3;
-    input.value = snapshot[key] || "";
-    input.setAttribute("aria-label", `Snapshot ${key}`);
-    fields[key] = input;
-    row.appendChild(input);
-    host.appendChild(row);
-  });
-  const actions = document.createElement("div");
-  actions.className = "row-actions";
-  const save = document.createElement("button");
-  save.type = "button";
-  save.textContent = "Save";
-  const cancel = document.createElement("button");
-  cancel.type = "button";
-  cancel.className = "ghost";
-  cancel.textContent = "Close";
-  actions.append(save, cancel);
-  host.appendChild(actions);
-  const close = () => {
-    host.classList.add("hidden");
-    host.innerHTML = "";
-  };
-  cancel.addEventListener("click", close);
-  save.addEventListener("click", async () => {
-    save.disabled = true;
-    cancel.disabled = true;
-    try {
-      const payload = {};
-      Object.entries(fields).forEach(([key, input]) => { payload[key] = input.value.trim(); });
-      await saveSnapshotFields(snapshot.id, payload);
-      close();
-    } catch (err) {
-      toastError(err);
-    } finally {
-      save.disabled = false;
-      cancel.disabled = false;
-    }
-  });
-  fields.name.focus();
 }
 
 function snapshotCameraUrl(snapshotId, key) {
@@ -4387,6 +4729,7 @@ async function openSnapshot(snapshotId) {
   previewRequestGeneration += 1;
   activeSnapshot = snapshot;
   snapshotActive = true;
+  selectLibraryItem("snapshot", snapshot.id);
   vizState.kind = "snapshot";
   vizState.id = snapshot.id;
   vizState.episode = 0;
@@ -4937,28 +5280,28 @@ function makeEpisodeIconButton(className, label, icon) {
   return button;
 }
 
-async function reorderEpisodes(videoId, order) {
+async function reorderEpisodes(kind, sourceId, order) {
   if (episodeMutationPending) return;
-  const replayingThisVideo = replayActive && vizState.kind === "video" && vizState.id === videoId;
-  const previousEpisode = replayingThisVideo ? vizState.episode : null;
-  const wasPlaying = replayingThisVideo && vizState.playing;
-  if (replayingThisVideo) {
+  const replayingThisSource = replayActive && vizState.kind === kind && vizState.id === sourceId;
+  const previousEpisode = replayingThisSource ? vizState.episode : null;
+  const wasPlaying = replayingThisSource && vizState.playing;
+  if (replayingThisSource) {
     pauseVizVideos();
     vizState.episode = -1;
     renderEpisodes();
   }
   setEpisodeMutationPending(true);
   try {
-    const result = await api(`/api/videos/${encodeURIComponent(videoId)}/episodes/reorder`, { order });
-    await refreshLibrarySection("videos");
-    await loadEpisodeList("video", videoId);
-    if (replayingThisVideo) {
+    const result = await api("/api/episodes/reorder", { kind, id: sourceId, order });
+    await refreshLibrarySection(`${kind}s`);
+    await loadEpisodeList(kind, sourceId);
+    if (replayingThisSource) {
       const mapped = result.episode_index_map && result.episode_index_map[String(previousEpisode)];
       if (mapped == null) leaveReplay();
-      else await loadPreview("video", videoId, Number(mapped), wasPlaying);
+      else await loadPreview(kind, sourceId, Number(mapped), wasPlaying);
     }
   } catch (err) {
-    if (replayingThisVideo && previousEpisode != null) {
+    if (replayingThisSource && previousEpisode != null) {
       vizState.episode = previousEpisode;
       renderEpisodes();
       if (wasPlaying) playVizVideos();
@@ -4969,7 +5312,7 @@ async function reorderEpisodes(videoId, order) {
   }
 }
 
-function makeEpisodeDragHandle(handle, li, list, videoId) {
+function makeEpisodeDragHandle(handle, li, list, kind, sourceId) {
   let dragState = null;
 
   const finishDrag = async () => {
@@ -4982,7 +5325,7 @@ function makeEpisodeDragHandle(handle, li, list, videoId) {
     handle.removeEventListener("pointerup", finishDrag);
     handle.removeEventListener("pointercancel", finishDrag);
     const order = [...list.querySelectorAll("li[data-episode-index]")].map((row) => Number(row.dataset.episodeIndex));
-    if (order.join(",") !== initialOrder.join(",")) await reorderEpisodes(videoId, order);
+    if (order.join(",") !== initialOrder.join(",")) await reorderEpisodes(kind, sourceId, order);
   };
 
   const onMove = (event) => {
@@ -5015,7 +5358,7 @@ function makeEpisodeDragHandle(handle, li, list, videoId) {
     event.preventDefault();
     const rows = [...list.querySelectorAll("li[data-episode-index]")];
     const from = rows.indexOf(li);
-    moveEpisode(videoId, from, event.key === "ArrowUp" ? -1 : 1);
+    moveEpisode(kind, sourceId, from, event.key === "ArrowUp" ? -1 : 1);
   });
 }
 
@@ -5105,58 +5448,6 @@ function toggleEpisodeEditor(index) {
   renderEpisodes();
 }
 
-function openEpisodeDescriptionEditor() {
-  if (!episodeSource || episodeMutationPending || $("ep-description-editor")) return;
-  const description = $("ep-description");
-  if (!description || description.hidden) return;
-  const editor = document.createElement("div");
-  editor.id = "ep-description-editor";
-  editor.className = "ep-description-editor";
-  const input = document.createElement("textarea");
-  input.rows = 3;
-  input.value = episodeSource.description || "";
-  input.placeholder = "description";
-  input.setAttribute("aria-label", "Library description");
-  const actions = document.createElement("div");
-  actions.className = "row-actions";
-  const save = document.createElement("button");
-  save.type = "button";
-  save.textContent = "Save";
-  const cancel = document.createElement("button");
-  cancel.type = "button";
-  cancel.className = "ghost";
-  cancel.textContent = "Cancel";
-  actions.append(save, cancel);
-  editor.append(input, actions);
-  description.hidden = true;
-  description.parentElement.appendChild(editor);
-  input.focus();
-  const close = () => {
-    editor.remove();
-    description.hidden = false;
-  };
-  save.addEventListener("click", async () => {
-    save.disabled = true;
-    cancel.disabled = true;
-    input.disabled = true;
-    try {
-      await saveLibraryOverride(episodeSource.kind, episodeSource.id, { description: input.value.trim() });
-      close();
-      renderEpisodes();
-    } catch (err) {
-      toastError(err);
-      close();
-    }
-  });
-  cancel.addEventListener("click", close);
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      close();
-    }
-  });
-}
-
 function renderEpisodes() {
   const detail = $("vid-detail");
   const list = $("ep-list");
@@ -5168,7 +5459,6 @@ function renderEpisodes() {
   detail.classList.remove("hidden");
   const sourceTitle = episodeSource.title || episodeSource.id;
   const subtitle = episodeSource.subtitle || "";
-  const description = episodeSource.description || "";
   if ($("ep-title")) {
     $("ep-title").textContent = `${sourceTitle} · ${episodeRows.length} ep`;
     $("ep-title").title = sourceTitle;
@@ -5177,16 +5467,6 @@ function renderEpisodes() {
     $("ep-subtitle").textContent = subtitle;
     $("ep-subtitle").hidden = !subtitle;
     $("ep-subtitle").title = subtitle;
-  }
-  if ($("ep-description")) {
-    const descriptionNode = $("ep-description");
-    descriptionNode.textContent = description || "Add description";
-    descriptionNode.hidden = false;
-    descriptionNode.classList.toggle("empty", !description);
-    descriptionNode.title = description || "Add description";
-    descriptionNode.tabIndex = 0;
-    descriptionNode.setAttribute("role", "button");
-    descriptionNode.setAttribute("aria-label", description ? "Edit description" : "Add description");
   }
   list.innerHTML = "";
   list.setAttribute("aria-busy", String(episodeLoading));
@@ -5237,18 +5517,16 @@ function renderEpisodes() {
       toggleEpisodeEditor(ep.index);
     });
     tools.append(edit);
-    if (source.kind === "video") {
-      const remove = makeEpisodeIconButton("ep-del", `Delete episode ${ep.index}`, EPISODE_ICONS.delete);
-      remove.disabled = episodeMutationPending;
-      remove.addEventListener("click", (event) => {
-        event.stopPropagation();
-        deleteEpisode(source.id, ep.index);
-      });
-      const drag = makeEpisodeIconButton("ep-drag", `Drag episode ${ep.index} to reorder`, EPISODE_ICONS.drag);
-      drag.disabled = episodeMutationPending;
-      makeEpisodeDragHandle(drag, li, list, source.id);
-      tools.append(remove, drag);
-    }
+    const remove = makeEpisodeIconButton("ep-del", `Delete episode ${ep.index}`, EPISODE_ICONS.delete);
+    remove.disabled = episodeMutationPending;
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteEpisode(source.kind, source.id, ep.index);
+    });
+    const drag = makeEpisodeIconButton("ep-drag", `Drag episode ${ep.index} to reorder`, EPISODE_ICONS.drag);
+    drag.disabled = episodeMutationPending;
+    makeEpisodeDragHandle(drag, li, list, source.kind, source.id);
+    tools.append(remove, drag);
     primary.append(index, label);
     primary.addEventListener("click", () => playEpisode(source.kind, source.id, ep.index));
     head.append(primary, tools);
@@ -5468,7 +5746,6 @@ function syncArmToggle() {
 function syncModeBadges() {
   if ($("replay-badge")) $("replay-badge").classList.toggle("hidden", snapshotActive);
   if ($("snapshot-badge")) $("snapshot-badge").classList.toggle("hidden", !snapshotActive);
-  if ($("btn-snap-edit")) $("btn-snap-edit").classList.toggle("hidden", !snapshotActive);
 }
 
 function enterReplay({ showEpisodes = true } = {}) {
@@ -5520,11 +5797,6 @@ function leaveReplay() {
   snapshotActive = false;
   activeSnapshot = null;
   vizState.snapshot = null;
-  const debugEditor = $("dbg-snap-editor");
-  if (debugEditor) {
-    debugEditor.classList.add("hidden");
-    debugEditor.innerHTML = "";
-  }
   vizVideos().forEach((video) => video.pause());
   const host = $("viz-cams");
   if (host) {
@@ -5580,6 +5852,8 @@ function closeEpisodeSelection() {
   armReplay = false;
   stopArmReplayLoop();
   episodeSource = null;
+  clearLibrarySelection("dataset");
+  clearLibrarySelection("video");
   episodeRows = [];
   expandedEpisode = null;
   episodeLoading = false;
@@ -6399,7 +6673,7 @@ async function loadPreview(kind, id, episode, autoplay = false) {
   vizState.task = "";
   lastReplayJointPanelElapsed = Number.NaN;
   clearVizChunk();
-  enterReplay();
+  enterReplay({ showEpisodes: kind === "dataset" });
   resetReplayCharts();
   syncArmToggle();
   syncReplayPlayState();
@@ -6470,13 +6744,19 @@ function stepPreview(delta) {
 
 async function selectVideo(id) {
   if (replayActive) leaveReplay();
+  if (episodeSource) closeEpisodeSelection();
+  selectedVideoId = String(id);
+  selectLibraryItem("video", id);
   previewRequestGeneration += 1;
   const row = videosCache.find((item) => item.id === id);
-  await loadEpisodeList("video", id, (row && (row.name || row.id)) || id).catch(toastError);
+  persistUi();
+  renderVideos();
+  await loadPreview("video", id, 0, false).catch(toastError);
 }
 
 async function selectHfDataset(ds) {
   selectedDatasetId = ds.repo_id || ds.id;
+  selectLibraryItem("dataset", selectedDatasetId);
   if (replayActive) leaveReplay();
   previewRequestGeneration += 1;
   persistUi();
@@ -6517,21 +6797,12 @@ if ($("viz-ep")) {
   });
 }
 if ($("btn-ep-close")) bind("btn-ep-close", closeEpisodeSelection);
-if ($("ep-description")) {
-  $("ep-description").addEventListener("click", openEpisodeDescriptionEditor);
-  $("ep-description").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      openEpisodeDescriptionEditor();
-    }
-  });
-}
 bindReplaySeek("replay-seek");
 bindReplayChartSeek(stateChart, "chart-state");
 bindReplayChartSeek(actionChart, "chart-action");
 bindReplayChartWheel(actionChart);
 
-async function moveEpisode(videoId, from, delta) {
+async function moveEpisode(kind, sourceId, from, delta) {
   if (episodeMutationPending) return;
   const order = episodeRows.map((e) => e.index);
   const to = from + delta;
@@ -6539,34 +6810,38 @@ async function moveEpisode(videoId, from, delta) {
   const tmp = order[from];
   order[from] = order[to];
   order[to] = tmp;
-  await reorderEpisodes(videoId, order);
+  await reorderEpisodes(kind, sourceId, order);
 }
 
-async function deleteEpisode(videoId, index) {
+async function deleteEpisode(kind, sourceId, index) {
   if (episodeMutationPending) return;
   if (!window.confirm(`Delete episode ${index}?`)) return;
-  const replayingThisVideo = replayActive && vizState.kind === "video" && vizState.id === videoId;
-  const previousEpisode = replayingThisVideo ? vizState.episode : null;
-  const deletingActive = replayingThisVideo && previousEpisode === index;
-  const wasPlaying = replayingThisVideo && vizState.playing;
+  const replayingThisSource = replayActive && vizState.kind === kind && vizState.id === sourceId;
+  const previousEpisode = replayingThisSource ? vizState.episode : null;
+  const deletingActive = replayingThisSource && previousEpisode === index;
+  const wasPlaying = replayingThisSource && vizState.playing;
   if (deletingActive) leaveReplay();
-  else if (replayingThisVideo) {
+  else if (replayingThisSource) {
     pauseVizVideos();
     vizState.episode = -1;
     renderEpisodes();
   }
   try {
     setEpisodeMutationPending(true);
-    const result = await api(`/api/videos/${encodeURIComponent(videoId)}/episodes/${index}`, undefined, "DELETE");
-    await refreshLibrarySection("videos");
-    await loadEpisodeList("video", videoId);
-    if (replayingThisVideo && !deletingActive) {
+    const result = await api(
+      `/api/episodes?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(sourceId)}&episode=${index}`,
+      undefined,
+      "DELETE",
+    );
+    await refreshLibrarySection(`${kind}s`);
+    await loadEpisodeList(kind, sourceId);
+    if (replayingThisSource && !deletingActive) {
       const mapped = result.episode_index_map && result.episode_index_map[String(previousEpisode)];
       if (mapped == null) leaveReplay();
-      else await loadPreview("video", videoId, Number(mapped), wasPlaying);
+      else await loadPreview(kind, sourceId, Number(mapped), wasPlaying);
     }
   } catch (err) {
-    if (replayingThisVideo && !deletingActive && previousEpisode != null) {
+    if (replayingThisSource && !deletingActive && previousEpisode != null) {
       vizState.episode = previousEpisode;
       renderEpisodes();
       if (wasPlaying) playVizVideos();
@@ -6606,58 +6881,20 @@ function renderModels() {
       select.appendChild(option);
     }
     if (!visibleIds.has(m.id)) return;
-    const li = document.createElement("li");
-    const source = m.source === "hub" ? "hf cache" : m.source || "local";
-    const parts = [m.name, m.policy_type, source].filter(Boolean);
-    const label = parts.join("  ·  ");
-    const head = document.createElement("div");
-    head.className = "snap-head";
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "lib-row-button";
-    button.textContent = label;
-    li.title = m.path || m.name;
-    button.addEventListener("click", () => {
+    const tools = libraryResourceTools("model", m);
+    const li = makeLibraryItem("model", m, () => {
+      selectedModelId = librarySourceId("model", m);
+      selectLibraryItem("model", selectedModelId);
       if (!m.path) {
+        renderModels();
         localLog(`model ${m.name} has no weights yet — run Update first`, "error");
         return;
       }
       if ($("pol-path")) $("pol-path").value = m.path;
       if ($("dbg-path")) $("dbg-path").value = m.path;
       persistUi();
-    });
-    head.appendChild(button);
-    if (m.managed) {
-      const tools = document.createElement("span");
-      tools.className = "snap-tools";
-      const edit = makeSnapshotIconButton("md-edit", `Edit model ${m.id}`, LIBRARY_EDIT_ICON);
-      edit.addEventListener("click", (event) => {
-        event.stopPropagation();
-        openModelEditor(li, m);
-      });
-      const update = makeSnapshotIconButton("md-update", `Update weights for ${m.id}`, MODEL_REFRESH_ICON);
-      update.addEventListener("click", (event) => {
-        event.stopPropagation();
-        updateModel(m.id);
-      });
-      const remove = makeSnapshotIconButton("md-del", `Remove model ${m.id}`, SNAPSHOT_ICONS.delete);
-      remove.addEventListener("click", (event) => {
-        event.stopPropagation();
-        deleteModel(m.id);
-      });
-      tools.append(edit, update, remove);
-      head.appendChild(tools);
-    }
-    li.appendChild(head);
-    if (m.managed) {
-      const meta = document.createElement("p");
-      meta.className = `model-meta${m.missing ? " warn" : ""}`;
-      const remote = m.remote || m.path || "no remote address";
-      meta.textContent = m.missing ? `${remote} · weights missing` : remote;
-      meta.title = m.path || remote;
-      li.appendChild(meta);
-      appendLibraryNote(li, "model", m.id, m);
-    }
+      renderModels();
+    }, tools);
     ol.appendChild(li);
   });
   if (select && selected) select.value = selected;
@@ -6799,13 +7036,6 @@ function modelLibraryStatus(message, isError = false) {
   status.textContent = message;
 }
 
-function modelHubStatus(message, isError = false) {
-  const status = $("md-hub-status");
-  if (!status) return;
-  status.className = `library-status${isError ? " error" : ""}`;
-  status.textContent = message;
-}
-
 function openModelEditor(li, model) {
   const existing = li.querySelector(".model-editor");
   if (existing) {
@@ -6900,142 +7130,336 @@ async function deleteModel(modelId) {
   }
 }
 
-async function searchModelHub() {
-  const query = $("md-search") ? $("md-search").value.trim() : "";
-  const list = $("md-hub-list");
-  if (!list) return;
-  list.innerHTML = "";
-  if (!query) {
-    modelHubStatus("Type a query to search the Hugging Face Hub", true);
-    return;
+function closeLibraryModal() {
+  const modal = $("library-modal");
+  if (!modal) return;
+  modal.classList.add("hidden");
+  const body = $("library-modal-body");
+  if (body) body.innerHTML = "";
+}
+
+function openLibraryModal(title, build) {
+  const modal = $("library-modal");
+  const heading = $("library-modal-title");
+  const body = $("library-modal-body");
+  if (!modal || !heading || !body) return;
+  heading.textContent = title;
+  body.innerHTML = "";
+  build(body);
+  modal.classList.remove("hidden");
+}
+
+function libraryModalStatus(body, message, isError = false) {
+  let status = body.querySelector(".library-modal-status");
+  if (!status) {
+    status = document.createElement("p");
+    status.className = "library-status";
+    body.appendChild(status);
   }
-  modelHubStatus(`searching “${query}”…`);
-  try {
-    const rows = await fetchJson(`/api/models/search?q=${encodeURIComponent(query)}`);
-    if (!Array.isArray(rows) || !rows.length) {
-      modelHubStatus("No matching model");
-      return;
-    }
-    modelHubStatus(`${rows.length} result${rows.length === 1 ? "" : "s"}`);
-    rows.forEach((row) => {
-      const li = document.createElement("li");
-      li.className = "hub-row";
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "lib-row-button";
-      button.textContent = `${row.repo_id}  ·  ${row.downloads} downloads`;
-      button.addEventListener("click", () => {
-        if ($("md-remote")) $("md-remote").value = row.repo_id;
-        if ($("md-name")) $("md-name").value = row.repo_id;
-        addModelFromRemote(row.repo_id, row.repo_id).catch(toastError);
-      });
-      li.appendChild(button);
-      list.appendChild(li);
+  status.className = `library-status library-modal-status${isError ? " error" : ""}`;
+  status.textContent = message;
+}
+
+function modalField(labelText, input) {
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  label.appendChild(input);
+  return label;
+}
+
+function openDownloadModal(kind) {
+  const isModel = kind === "model";
+  openLibraryModal(isModel ? "Add model" : "Download dataset", (body) => {
+    const search = document.createElement("div");
+    search.className = "library-modal-search";
+    const query = document.createElement("input");
+    query.type = "search";
+    query.placeholder = isModel ? "Search Hugging Face models" : "Search Hugging Face datasets";
+    query.setAttribute("aria-label", query.placeholder);
+    const searchButton = document.createElement("button");
+    searchButton.type = "button";
+    searchButton.className = "ghost";
+    searchButton.textContent = "Search";
+    search.append(query, searchButton);
+    const results = document.createElement("ol");
+    results.className = "lib-list library-modal-results";
+    const grid = document.createElement("div");
+    grid.className = "library-modal-grid";
+    const remote = document.createElement("input");
+    remote.type = "text";
+    remote.placeholder = isModel
+      ? "Hugging Face repo_id/URL or local model path"
+      : "Hugging Face repo_id/URL or local dataset path";
+    remote.setAttribute("aria-label", "Upstream repo_id or local path");
+    const revision = document.createElement("input");
+    revision.type = "text";
+    revision.placeholder = "revision (optional)";
+    revision.setAttribute("aria-label", "Revision");
+    const name = document.createElement("input");
+    name.type = "text";
+    name.placeholder = "display name (optional)";
+    name.setAttribute("aria-label", "Display name");
+    grid.append(
+      modalField("Address", remote),
+      modalField("Revision", revision),
+      ...(isModel ? [modalField("Name", name)] : []),
+    );
+    const actions = document.createElement("div");
+    actions.className = "library-modal-actions";
+    const submit = document.createElement("button");
+    submit.type = "button";
+    submit.textContent = isModel ? "Add model" : "Download";
+    actions.appendChild(submit);
+    body.append(search, results, grid, actions);
+
+    const runSearch = async () => {
+      const text = query.value.trim();
+      if (!text) {
+        libraryModalStatus(body, "Type a query first", true);
+        return;
+      }
+      results.innerHTML = "";
+      libraryModalStatus(body, `searching “${text}”…`);
+      try {
+        const path = isModel
+          ? `/api/models/search?q=${encodeURIComponent(text)}`
+          : `/api/datasets/search?q=${encodeURIComponent(text)}`;
+        const rows = await fetchJson(path);
+        if (!Array.isArray(rows) || !rows.length) {
+          libraryModalStatus(body, "No matching result");
+          return;
+        }
+        libraryModalStatus(body, `${rows.length} result${rows.length === 1 ? "" : "s"}`);
+        rows.forEach((row) => {
+          const li = document.createElement("li");
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = `${row.repo_id} · ${row.downloads || 0} downloads`;
+          button.addEventListener("click", () => {
+            remote.value = row.repo_id;
+            if (isModel && !name.value) name.value = row.repo_id;
+          });
+          li.appendChild(button);
+          results.appendChild(li);
+        });
+      } catch (err) {
+        libraryModalStatus(body, err.message || String(err), true);
+      }
+    };
+    searchButton.addEventListener("click", runSearch);
+    query.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        runSearch();
+      }
     });
-  } catch (err) {
-    modelHubStatus(err.message || String(err), true);
-  }
-}
-
-function modelAddressFromManifest(payload, fallback = "") {
-  if (typeof payload === "string") return payload.trim() || fallback;
-  if (!payload || typeof payload !== "object") return fallback;
-  const keys = ["remote", "repo_id", "model_id", "path", "_name_or_path", "name_or_path", "id", "name"];
-  for (const key of keys) {
-    const value = String(payload[key] || "").trim();
-    if (value) return value;
-  }
-  return fallback;
-}
-
-async function addModelFromDroppedFile(file) {
-  if (!file) return;
-  const nativePath = String(file.path || "").trim();
-  if (nativePath) {
-    await addModelFromRemote(nativePath, file.name || nativePath);
-    return;
-  }
-  const text = await file.text();
-  let address = "";
-  try {
-    address = modelAddressFromManifest(JSON.parse(text));
-  } catch {
-    address = text.trim();
-  }
-  if (!address) {
-    throw new Error("the dropped file has no remote, repo_id, or path field");
-  }
-  if ($("md-remote")) $("md-remote").value = address;
-  const fallbackName = String(file.name || "").replace(/\.(json|txt)$/i, "");
-  await addModelFromRemote(address, fallbackName);
-}
-
-function bindModelDropZone() {
-  const zone = $("md-drop");
-  if (!zone) return;
-  ["dragenter", "dragover"].forEach((name) => {
-    zone.addEventListener(name, (event) => {
-      event.preventDefault();
-      zone.classList.add("drop-active");
+    submit.addEventListener("click", async () => {
+      const address = remote.value.trim();
+      if (!address) {
+        libraryModalStatus(body, "Enter an address first", true);
+        return;
+      }
+      submit.disabled = true;
+      try {
+        let saved;
+        if (isModel) {
+          saved = await addModelFromRemote(address, name.value.trim());
+          selectedModelId = String(saved.id || "");
+        } else {
+          saved = await api("/api/datasets/download", { remote: address, revision: revision.value.trim() });
+          selectedDatasetId = String(saved.repo_id || saved.id || "");
+        }
+        closeLibraryModal();
+        await refreshLibrarySection(isModel ? "models" : "datasets");
+      } catch (err) {
+        libraryModalStatus(body, err.message || String(err), true);
+      } finally {
+        submit.disabled = false;
+      }
     });
   });
-  ["dragleave", "drop"].forEach((name) => {
-    zone.addEventListener(name, () => zone.classList.remove("drop-active"));
-  });
-  zone.addEventListener("drop", async (event) => {
-    event.preventDefault();
-    const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
-    if (!file) return;
-    try {
-      await addModelFromDroppedFile(file);
-    } catch (err) {
-      modelLibraryStatus(`drop failed: ${err.message || err}`, true);
-    }
-  });
-  zone.addEventListener("keydown", (event) => {
-    if (event.target !== zone) return;
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    const input = $("md-file-input");
-    if (input) input.click();
+}
+
+function openEmptyDatasetModal() {
+  openLibraryModal("New empty dataset", (body) => {
+    const grid = document.createElement("div");
+    grid.className = "library-modal-grid";
+    const name = document.createElement("input");
+    name.type = "text";
+    name.placeholder = "dataset name";
+    name.setAttribute("aria-label", "Dataset name");
+    const repo = document.createElement("input");
+    repo.type = "text";
+    repo.placeholder = "repo id (optional)";
+    repo.setAttribute("aria-label", "Dataset repo id");
+    const fps = document.createElement("input");
+    fps.type = "number";
+    fps.min = "1";
+    fps.value = String(($("rec-action-fps") && $("rec-action-fps").value) || 15);
+    fps.setAttribute("aria-label", "Dataset FPS");
+    const robotType = document.createElement("input");
+    robotType.type = "text";
+    robotType.placeholder = "robot type";
+    robotType.value = String((meta.robot && meta.robot.type) || "");
+    robotType.setAttribute("aria-label", "Robot type");
+    grid.append(
+      modalField("Name", name),
+      modalField("Repo ID", repo),
+      modalField("FPS", fps),
+      modalField("Robot type", robotType),
+    );
+    const cameras = document.createElement("div");
+    cameras.className = "library-modal-cameras";
+    const cameraRows = ((last && last.cameras) || meta.cameras || []).filter(
+      (camera) => camera && camera.enabled && camera.show_main,
+    );
+    cameraRows.forEach((camera) => {
+      const label = document.createElement("label");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = true;
+      input.dataset.key = String(camera.label || camera.name || "");
+      input.dataset.width = String(camera.width || 640);
+      input.dataset.height = String(camera.height || 480);
+      label.append(input, document.createTextNode(String(camera.label || camera.name || "camera")));
+      cameras.appendChild(label);
+    });
+    const actions = document.createElement("div");
+    actions.className = "library-modal-actions";
+    const submit = document.createElement("button");
+    submit.type = "button";
+    submit.textContent = "Create";
+    actions.appendChild(submit);
+    body.append(grid, cameras, actions);
+    submit.addEventListener("click", async () => {
+      const datasetName = name.value.trim();
+      if (!datasetName) {
+        libraryModalStatus(body, "Dataset name is required", true);
+        return;
+      }
+      submit.disabled = true;
+      try {
+        const selectedCameras = [...cameras.querySelectorAll("input:checked")].map((input) => ({
+          key: input.dataset.key,
+          width: Number(input.dataset.width),
+          height: Number(input.dataset.height),
+        }));
+        await api("/api/datasets/empty", {
+          name: datasetName,
+          repo_id: repo.value.trim(),
+          fps: Number(fps.value) || 15,
+          robot_type: robotType.value.trim(),
+          cameras: selectedCameras,
+        });
+        closeLibraryModal();
+        await refreshLibrarySection("datasets");
+      } catch (err) {
+        libraryModalStatus(body, err.message || String(err), true);
+      } finally {
+        submit.disabled = false;
+      }
+    });
   });
 }
 
-bind("btn-md-search", searchModelHub);
-bind("btn-md-file", () => {
-  const input = $("md-file-input");
-  if (input) input.click();
-});
-bind("btn-md-add", () => {
-  const remote = $("md-remote") ? $("md-remote").value : "";
-  const name = $("md-name") ? $("md-name").value : "";
-  addModelFromRemote(remote, name).catch(toastError);
-});
-if ($("md-search")) {
-  $("md-search").addEventListener("keydown", (event) => {
-    if (event.key === "Enter") searchModelHub();
+function openMetadataSettingsModal() {
+  const kind = activeLibrarySearchKind.replace(/s$/, "");
+  const allFields = Object.keys(LIBRARY_META_LABELS);
+  openLibraryModal(`${activeLibrarySearchKind} metadata`, (body) => {
+    const grid = document.createElement("div");
+    grid.className = "library-modal-cameras";
+    const selected = new Set(libraryMetaFields[activeLibrarySearchKind] || []);
+    allFields.forEach((key) => {
+      const label = document.createElement("label");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = selected.has(key);
+      input.dataset.field = key;
+      label.append(input, document.createTextNode(LIBRARY_META_LABELS[key]));
+      grid.appendChild(label);
+    });
+    const actions = document.createElement("div");
+    actions.className = "library-modal-actions";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.textContent = "Save";
+    actions.appendChild(save);
+    body.append(grid, actions);
+    save.addEventListener("click", () => {
+      libraryMetaFields[activeLibrarySearchKind] = [...grid.querySelectorAll("input:checked")].map(
+        (input) => input.dataset.field,
+      );
+      saveJsonStorage(LIBRARY_META_FIELDS_KEY, libraryMetaFields);
+      closeLibraryModal();
+      renderLibrarySectionFor(kind);
+    });
   });
 }
-if ($("md-file-input")) {
-  $("md-file-input").addEventListener("change", (event) => {
-    const file = event.target.files && event.target.files[0];
-    addModelFromDroppedFile(file).catch((err) => modelLibraryStatus(err.message || String(err), true));
-    event.target.value = "";
+
+function renderMetadataMenu() {
+  const menu = $("lib-meta-menu");
+  if (!menu) return;
+  menu.innerHTML = "";
+  const title = document.createElement("div");
+  title.className = "meta-menu-title";
+  title.textContent = `${activeLibrarySearchKind} metadata`;
+  menu.appendChild(title);
+  const selected = new Set(libraryMetaFields[activeLibrarySearchKind] || []);
+  Object.entries(LIBRARY_META_LABELS).forEach(([key, labelText]) => {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = selected.has(key);
+    input.addEventListener("change", () => {
+      const next = new Set(libraryMetaFields[activeLibrarySearchKind] || []);
+      if (input.checked) next.add(key);
+      else next.delete(key);
+      libraryMetaFields[activeLibrarySearchKind] = Object.keys(LIBRARY_META_LABELS).filter((field) => next.has(field));
+      saveJsonStorage(LIBRARY_META_FIELDS_KEY, libraryMetaFields);
+      renderLibrarySectionFor(activeLibrarySearchKind.replace(/s$/, ""));
+    });
+    label.append(input, document.createTextNode(labelText));
+    menu.appendChild(label);
   });
 }
-bindModelDropZone();
+
+function toggleMetadataMenu() {
+  const menu = $("lib-meta-menu");
+  if (!menu) return;
+  $("ds-add-menu")?.classList.add("hidden");
+  const opening = menu.classList.contains("hidden");
+  if (opening) renderMetadataMenu();
+  menu.classList.toggle("hidden", !opening);
+}
+
+bind("btn-md-add", () => openDownloadModal("model"));
+bind("btn-lib-meta-settings", toggleMetadataMenu);
+bind("btn-ds-download", () => {
+  $("ds-add-menu")?.classList.add("hidden");
+  openDownloadModal("dataset");
+});
+bind("btn-ds-empty", () => {
+  $("ds-add-menu")?.classList.add("hidden");
+  openEmptyDatasetModal();
+});
+bind("btn-library-modal-close", closeLibraryModal);
+if ($("library-modal")) {
+  $("library-modal").addEventListener("click", (event) => {
+    if (event.target === $("library-modal")) closeLibraryModal();
+  });
+}
 
 const LIBRARY_CONFIG = {
   videos: { path: "/api/videos", group: "lib-videos", list: "vid-list", status: "vid-status", button: "btn-vid-refresh", render: renderVideos },
-  datasets: { path: "/api/datasets", group: "lib-datasets", list: "ds-list", status: "ds-status", button: "btn-ds-refresh", render: renderDatasets },
+  datasets: { path: "/api/datasets", group: "lib-datasets", list: "ds-list", status: "ds-status", button: "btn-ds-scan", render: renderDatasets },
   snapshots: { path: "/api/snapshots", group: "lib-snapshots", list: "snap-list", status: "snap-status", button: "btn-snap-refresh", render: renderSnapshots },
-  models: { path: "/api/models", group: "lib-models", list: "md-list", status: "md-status", button: "btn-md-refresh", render: renderModels },
+  models: { path: "/api/models", group: "lib-models", list: "md-list", status: "md-status", button: "btn-md-scan", render: renderModels },
 };
 
 function librarySearchPlaceholder(kind) {
   return kind === "models"
-    ? "Filter local models by title or note"
-    : "Search title or note";
+    ? "Filter models by title, metadata, or description"
+    : "Search title, metadata, or description";
 }
 
 function updateLibrarySearchUi() {
@@ -7049,6 +7473,22 @@ function updateLibrarySearchUi() {
 
 function selectLibrarySearchKind(kind) {
   activeLibrarySearchKind = kind;
+  const visibility = {
+    models: ["btn-md-add", "btn-md-scan"],
+    datasets: ["btn-ds-add", "btn-ds-scan"],
+    videos: ["btn-vid-refresh"],
+    snapshots: ["btn-snap-refresh"],
+  };
+  Object.values(visibility).flat().forEach((id) => {
+    const button = $(id);
+    if (button) button.hidden = true;
+  });
+  (visibility[kind] || []).forEach((id) => {
+    const button = $(id);
+    if (button) button.hidden = false;
+  });
+  $("ds-add-menu")?.classList.add("hidden");
+  $("lib-meta-menu")?.classList.add("hidden");
   updateLibrarySearchUi();
 }
 
@@ -7153,9 +7593,22 @@ function syncEpisodeSource(refreshedKind = "") {
 }
 
 bind("btn-vid-refresh", () => refreshLibrarySection("videos"));
-bind("btn-ds-refresh", () => refreshLibrarySection("datasets"));
+bind("btn-ds-add", () => {
+  $("ds-add-menu")?.classList.toggle("hidden");
+});
+bind("btn-ds-scan", () => refreshLibrarySection("datasets"));
 bind("btn-snap-refresh", () => refreshLibrarySection("snapshots"));
-bind("btn-md-refresh", () => refreshLibrarySection("models"));
+bind("btn-md-scan", () => refreshLibrarySection("models"));
+document.addEventListener("pointerdown", (event) => {
+  const datasetMenu = $("ds-add-menu");
+  if (datasetMenu && !datasetMenu.classList.contains("hidden") && !event.target.closest("#ds-add-menu, #btn-ds-add")) {
+    datasetMenu.classList.add("hidden");
+  }
+  const metaMenu = $("lib-meta-menu");
+  if (metaMenu && !metaMenu.classList.contains("hidden") && !event.target.closest("#lib-meta-menu, #btn-lib-meta-settings")) {
+    metaMenu.classList.add("hidden");
+  }
+});
 
 function fillPortSelect(id, ports, connectedPort, fallback) {
   const sel = $(id);
@@ -7296,4 +7749,3 @@ connectWs();
 refreshSessions();
 refreshLibrary();
 setInterval(refreshSessions, 8000);
-setInterval(refreshLibrary, 15000);

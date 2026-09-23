@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
-  <link rel="stylesheet" href="/lerobot/static/styles.css"/>
+  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260923-library-meta-10"/>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -95,67 +95,63 @@
       <div class="panel-body">
         <div class="library-tools">
           <nav id="library-tabs" class="panel-tabs library-tabs" role="tablist" aria-label="Library sections">
-            <button type="button" class="panel-tab active" id="lib-tab-videos" data-tab="videos" role="tab" aria-selected="true" aria-controls="lib-videos" tabindex="0">Videos</button>
+            <button type="button" class="panel-tab active" id="lib-tab-models" data-tab="models" role="tab" aria-selected="true" aria-controls="lib-models" tabindex="0">Models</button>
             <button type="button" class="panel-tab" id="lib-tab-datasets" data-tab="datasets" role="tab" aria-selected="false" aria-controls="lib-datasets" tabindex="-1">Datasets</button>
+            <button type="button" class="panel-tab" id="lib-tab-videos" data-tab="videos" role="tab" aria-selected="false" aria-controls="lib-videos" tabindex="-1">Videos</button>
             <button type="button" class="panel-tab" id="lib-tab-snapshots" data-tab="snapshots" role="tab" aria-selected="false" aria-controls="lib-snapshots" tabindex="-1">Snapshots</button>
-            <button type="button" class="panel-tab" id="lib-tab-models" data-tab="models" role="tab" aria-selected="false" aria-controls="lib-models" tabindex="-1">Models</button>
           </nav>
-          <label class="sr-only" for="lib-search">Search the active library section</label>
-          <div class="library-search">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
-            <input id="lib-search" type="search" placeholder="Search title or note" autocomplete="off"/>
-            <button type="button" id="btn-lib-search-clear" class="ghost icon-btn" title="Clear search" aria-label="Clear search" hidden>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
-            </button>
+          <div class="library-toolbar">
+            <label class="sr-only" for="lib-search">Search the active library section</label>
+            <div class="library-search">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+              <input id="lib-search" type="search" placeholder="Search title, metadata, or description" autocomplete="off"/>
+              <button type="button" id="btn-lib-search-clear" class="ghost icon-btn" title="Clear search" aria-label="Clear search" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
+              </button>
+            </div>
+            <div class="library-actions" aria-label="Library actions">
+              <button type="button" id="btn-lib-meta-settings" class="ghost icon-btn" title="Choose displayed metadata" aria-label="Choose displayed metadata">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>
+              </button>
+              <button type="button" id="btn-md-add" class="ghost icon-btn" title="Add model" aria-label="Add model">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+              </button>
+              <button type="button" id="btn-md-scan" class="ghost icon-btn" title="Scan local models" aria-label="Scan local models">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+              </button>
+              <button type="button" id="btn-ds-add" class="ghost icon-btn" title="Add dataset" aria-label="Add dataset" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+              </button>
+              <button type="button" id="btn-ds-scan" class="ghost icon-btn" title="Scan local datasets" aria-label="Scan local datasets" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+              </button>
+              <button type="button" id="btn-vid-refresh" class="ghost icon-btn" title="Refresh videos" aria-label="Refresh videos" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+              </button>
+              <button type="button" id="btn-snap-refresh" class="ghost icon-btn" title="Refresh snapshots" aria-label="Refresh snapshots" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+              </button>
+            </div>
+            <div id="ds-add-menu" class="library-menu hidden" role="menu" aria-label="Add dataset">
+              <button type="button" id="btn-ds-download" role="menuitem">Download from Hub</button>
+              <button type="button" id="btn-ds-empty" role="menuitem">New empty dataset</button>
+            </div>
+            <div id="lib-meta-menu" class="library-menu library-meta-menu hidden" role="menu" aria-label="Displayed metadata"></div>
           </div>
         </div>
-        <section class="library-group" id="lib-videos" data-tab-panel="videos" role="tabpanel" aria-labelledby="lib-tab-videos" tabindex="0">
-          <div class="library-heading">
-            <h3 id="lib-videos-title">Videos</h3>
-            <button type="button" id="btn-vid-refresh" class="ghost">Refresh</button>
-          </div>
+        <section class="library-group" id="lib-videos" data-tab-panel="videos" role="tabpanel" aria-labelledby="lib-tab-videos" tabindex="0" hidden>
           <p id="vid-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="vid-list" class="lib-list" aria-busy="false"></ol>
         </section>
         <section class="library-group" id="lib-datasets" data-tab-panel="datasets" role="tabpanel" aria-labelledby="lib-tab-datasets" tabindex="0" hidden>
-          <div class="library-heading">
-            <h3 id="lib-datasets-title">Datasets</h3>
-            <button type="button" id="btn-ds-refresh" class="ghost">Scan cache</button>
-          </div>
           <p id="ds-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="ds-list" class="lib-list" aria-busy="false"></ol>
         </section>
         <section class="library-group" id="lib-snapshots" data-tab-panel="snapshots" role="tabpanel" aria-labelledby="lib-tab-snapshots" tabindex="0" hidden>
-          <div class="library-heading">
-            <h3 id="lib-snapshots-title">Snapshots</h3>
-            <button type="button" id="btn-snap-refresh" class="ghost">Refresh</button>
-          </div>
           <p id="snap-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="snap-list" class="lib-list" aria-busy="false"></ol>
         </section>
-        <section class="library-group" id="lib-models" data-tab-panel="models" role="tabpanel" aria-labelledby="lib-tab-models" tabindex="0" hidden>
-          <div class="library-heading">
-            <h3 id="lib-models-title">Models</h3>
-            <button type="button" id="btn-md-refresh" class="ghost">Rescan</button>
-          </div>
-          <div id="md-drop" class="model-drop" tabindex="0" role="region" aria-label="Add model from Hugging Face or a dropped model card">
-            <p class="model-drop-hint">
-              Search the Hub, drop a model card (.json / .txt), or paste a local model folder path.
-              <button type="button" id="btn-md-file" class="ghost">Choose file</button>
-            </p>
-            <input id="md-file-input" type="file" accept=".json,.txt" hidden/>
-            <div class="model-search">
-              <input id="md-search" type="search" placeholder="Search Hugging Face models" aria-label="Search Hugging Face models"/>
-              <button type="button" id="btn-md-search" class="ghost">Search</button>
-            </div>
-            <p id="md-hub-status" class="library-status" role="status" aria-live="polite"></p>
-            <ol id="md-hub-list" class="lib-list model-hub-list" aria-busy="false"></ol>
-            <div class="model-add">
-              <input id="md-remote" type="text" placeholder="org/name, huggingface.co URL, or local path" aria-label="Model remote address"/>
-              <input id="md-name" type="text" placeholder="display name (optional)" aria-label="Model display name"/>
-              <button type="button" id="btn-md-add">Add model</button>
-            </div>
-          </div>
+        <section class="library-group" id="lib-models" data-tab-panel="models" role="tabpanel" aria-labelledby="lib-tab-models" tabindex="0">
           <p id="md-status" class="library-status" role="status" aria-live="polite"></p>
           <ol id="md-list" class="lib-list" aria-busy="false"></ol>
         </section>
@@ -181,7 +177,6 @@
           <div class="episode-source-copy">
             <h2 id="ep-title">—</h2>
             <p id="ep-subtitle" class="episode-source-subtitle" hidden></p>
-            <p id="ep-description" class="episode-source-description" hidden></p>
           </div>
           <button type="button" id="btn-ep-close" class="ghost icon-btn" aria-label="Close episode selection" title="Close episode selection">×</button>
         </header>
@@ -201,6 +196,7 @@
             <span id="snapshot-badge" class="replay-tag snapshot hidden">SNAPSHOT</span>
             <span id="replay-title">—</span>
             <span id="replay-status" class="replay-status" role="status" aria-live="polite"></span>
+            <button type="button" id="viz-exit" class="ghost replay-exit video-exit hidden">EXIT</button>
           </div>
           <div class="replay-transport" role="group" aria-label="Replay transport">
             <button type="button" id="viz-play" class="ghost icon-btn" title="Play" aria-label="Play">
@@ -214,7 +210,6 @@
             <output id="viz-t" for="replay-seek" aria-live="off">0.00s / 0.00s</output>
           </div>
         </header>
-        <button type="button" id="viz-exit" class="ghost replay-exit video-exit hidden">EXIT</button>
         <div id="viz-cams" class="viz-cams"></div>
       </div>
     </section>
@@ -512,7 +507,6 @@
           </div>
           <div id="dbg-eval" class="debug-eval hidden" aria-live="polite"></div>
           <p id="dbg-status" class="hw-status" role="status" aria-live="polite">idle</p>
-          <div id="dbg-snap-editor" class="snap-editor hidden"></div>
         </div>
         </div>
       </section>
@@ -557,6 +551,18 @@
     </section>
   </main>
 
-  <script src="/lerobot/static/app.js"></script>
+  <div id="library-modal" class="library-modal hidden" role="dialog" aria-modal="true" aria-labelledby="library-modal-title">
+    <div class="library-modal-card">
+      <header class="library-modal-head">
+        <h2 id="library-modal-title">Add</h2>
+        <button type="button" id="btn-library-modal-close" class="ghost icon-btn" title="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
+        </button>
+      </header>
+      <div id="library-modal-body" class="library-modal-body"></div>
+    </div>
+  </div>
+
+  <script src="/lerobot/static/app.js?v=20260923-library-meta-10"></script>
 </body>
 </html>

@@ -103,6 +103,34 @@ def _normalize_source(value: Any) -> dict[str, Any] | None:
     return source or None
 
 
+def _normalize_notes(value: Any) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(note).strip() for note in value if str(note).strip()]
+
+
+def _snapshot_source_label(row: dict[str, Any]) -> str:
+    if row.get("origin") == "replay" and row.get("source"):
+        source = row["source"]
+        parts = [str(source.get("kind") or ""), str(source.get("id") or "")]
+        if source.get("episode") is not None:
+            parts.append(f"ep {source['episode']}")
+        if source.get("elapsed_s") is not None:
+            parts.append(f"{float(source['elapsed_s']):.2f}s")
+        return " · ".join(part for part in parts if part) or "replay"
+    return "hardware"
+
+
+def default_snapshot_note(row: dict[str, Any]) -> str:
+    cameras = len(row.get("cameras") or [])
+    created = str(row.get("created_utc") or "")
+    created_label = created[:10] if created else "unknown date"
+    return f"{_snapshot_source_label(row)} · {cameras} cameras · {created_label}"
+
+
 def _camera_payload(item: Any) -> tuple[str, bytes]:
     """Return a normalized camera key and decoded JPEG bytes.
 
@@ -233,14 +261,19 @@ class SnapshotLibrary:
         origin = str(raw.get("origin") or "hardware")
         if origin not in {"hardware", "replay"}:
             origin = "hardware"
+        notes = _normalize_notes(raw.get("notes", raw.get("note")))
         return {
             "id": path.name,
+            "path": str(path),
             "created_utc": str(raw.get("created_utc")),
             "updated_utc": str(raw.get("updated_utc") or raw.get("created_utc")),
             "name": str(raw.get("name") or ""),
             "task": str(raw.get("task") or ""),
-            "note": str(raw.get("note") or ""),
+            "notes": notes,
+            "note": "\n".join(notes),
+            "_notes_initialized": "notes" in raw or "note" in raw,
             "description": str(raw.get("description") or ""),
+            "metadata": dict(raw.get("metadata") or {}),
             "origin": origin,
             "source": _normalize_source(raw.get("source")),
             "joints": _normalize_joints(raw.get("joints")),
@@ -324,7 +357,9 @@ class SnapshotLibrary:
         name: str = "",
         task: str = "",
         note: str = "",
+        notes: list[str] | None = None,
         description: str = "",
+        metadata: dict[str, Any] | None = None,
         origin: str = "hardware",
         source: dict[str, Any] | None = None,
         joints: dict[str, Any] | None = None,
@@ -353,14 +388,27 @@ class SnapshotLibrary:
                     first_image = image_path
             self._write_preview(snapshot_dir, first_image)
             now = _utc_now()
+            normalized_notes = _normalize_notes(notes) if notes is not None else _normalize_notes(note)
+            if not normalized_notes:
+                normalized_notes = [
+                    default_snapshot_note(
+                        {
+                            "origin": origin,
+                            "source": _normalize_source(source),
+                            "cameras": camera_entries,
+                            "created_utc": now,
+                        }
+                    )
+                ]
             manifest = {
                 "id": snapshot_dir.name,
                 "created_utc": now,
                 "updated_utc": now,
                 "name": str(name or ""),
                 "task": str(task or ""),
-                "note": str(note or ""),
+                "notes": normalized_notes,
                 "description": str(description or ""),
+                "metadata": dict(metadata or {}),
                 "origin": origin,
                 "source": _normalize_source(source) if origin == "replay" else None,
                 "joints": _normalize_joints(joints),
@@ -381,9 +429,15 @@ class SnapshotLibrary:
                 if origin not in {"hardware", "replay"}:
                     raise ValueError("origin must be 'hardware' or 'replay'")
                 manifest["origin"] = origin
-            for key in ("name", "task", "note", "description"):
+            for key in ("name", "task", "description"):
                 if key in payload and payload[key] is not None:
                     manifest[key] = str(payload[key])
+            if "notes" in payload and payload["notes"] is not None:
+                manifest["notes"] = _normalize_notes(payload["notes"])
+            elif "note" in payload and payload["note"] is not None:
+                manifest["notes"] = _normalize_notes(payload["note"])
+            if "metadata" in payload and isinstance(payload["metadata"], dict):
+                manifest["metadata"] = dict(payload["metadata"])
             if "source" in payload:
                 manifest["source"] = (
                     _normalize_source(payload["source"])
@@ -442,3 +496,20 @@ class SnapshotLibrary:
         if not path.is_file():
             raise FileNotFoundError("preview")
         return path
+
+    def ensure_default_note(self, snapshot_id: str) -> dict[str, Any]:
+        """Seed one editable metadata note for snapshots created by older versions."""
+        path = self._snapshot_dir(snapshot_id)
+        with self._lock:
+            manifest_path = path / "snapshot.json"
+            raw = _read_json(manifest_path)
+            if not raw:
+                raise FileNotFoundError(snapshot_id)
+            if "notes" in raw or "note" in raw:
+                return self.get(snapshot_id)
+            row = self.get(snapshot_id)
+            raw["notes"] = [default_snapshot_note(row)]
+            raw.pop("note", None)
+            raw["updated_utc"] = _utc_now()
+            _write_json(manifest_path, raw)
+            return self.get(snapshot_id)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,7 +18,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import MonitorConfig
+from .dataset_hub import (
+    DatasetHubError,
+    create_empty_dataset,
+    download_hf_dataset,
+    search_hf_datasets,
+)
 from .hub import RuntimeHub
+from .library import library_metadata
 from .metrics import evaluate_action_chunk
 from .model_hub import ModelHubError, search_hf_models
 from .preview import (
@@ -113,6 +121,12 @@ class ReorderBody(BaseModel):
     order: list[int] = Field(default_factory=list)
 
 
+class EpisodeReorderBody(BaseModel):
+    kind: str
+    id: str
+    order: list[int] = Field(default_factory=list)
+
+
 class EpisodeEditBody(BaseModel):
     kind: str
     id: str
@@ -125,8 +139,16 @@ class EpisodeEditBody(BaseModel):
 class LibraryEditBody(BaseModel):
     kind: str
     id: str
+    name: str | None = None
     note: str | None = None
+    notes: list[str] | None = None
     description: str | None = None
+    task: str | None = None
+    repo_id: str | None = None
+    remote: str | None = None
+    revision: str | None = None
+    path: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class SnapshotCameraBody(BaseModel):
@@ -138,7 +160,9 @@ class SnapshotCreateBody(BaseModel):
     name: str = ""
     task: str = ""
     note: str = ""
+    notes: list[str] | None = None
     description: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
     origin: str = "hardware"
     source: dict[str, Any] | None = None
     joints: dict[str, float] = Field(default_factory=dict)
@@ -149,7 +173,9 @@ class SnapshotUpdateBody(BaseModel):
     name: str | None = None
     task: str | None = None
     note: str | None = None
+    notes: list[str] | None = None
     description: str | None = None
+    metadata: dict[str, Any] | None = None
     origin: str | None = None
     source: dict[str, Any] | None = None
     joints: dict[str, float] | None = None
@@ -180,8 +206,23 @@ class ModelRegisterBody(BaseModel):
 class ModelSaveBody(BaseModel):
     name: str | None = None
     remote: str | None = None
+    path: str | None = None
     revision: str | None = None
     note: str | None = None
+
+
+class DatasetDownloadBody(BaseModel):
+    remote: str
+    revision: str = ""
+    name: str = ""
+
+
+class DatasetEmptyBody(BaseModel):
+    name: str
+    repo_id: str = ""
+    fps: int = 15
+    robot_type: str = ""
+    cameras: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AutoRecordBody(BaseModel):
@@ -564,10 +605,77 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     def _merge_library_override(kind: str, source_id: str, row: dict[str, Any]) -> dict[str, Any]:
         merged = dict(row)
         saved = hub.store.library_override(kind, source_id)
-        for field in ("note", "description"):
+        for field in ("name", "description", "task", "repo_id", "path", "source", "remote", "revision"):
             if field in saved:
                 merged[field] = saved[field]
+        merged["description"] = str(saved.get("description") or merged.get("description") or "")
+        merged["metadata"] = library_metadata(kind, merged)
+        if isinstance(saved.get("metadata"), dict):
+            merged["metadata"].update(saved["metadata"])
+        if kind == "video" and merged["description"]:
+            parts = merged["description"].split(" · ")
+            if parts[0].endswith(" episodes"):
+                parts[0] = f"{merged['metadata'].get('episodes', 1)} episodes"
+                merged["description"] = " · ".join(parts)
+        if kind == "dataset":
+            managed_name = merged.get("name") if merged.get("managed") else ""
+            merged["display_name"] = str(
+                saved.get("name")
+                or managed_name
+                or merged.get("title")
+                or merged.get("repo_id")
+                or merged.get("id")
+                or source_id
+            )
+        else:
+            merged["display_name"] = str(
+                saved.get("name") or merged.get("name") or merged.get("repo_id") or merged.get("id") or source_id
+            )
         return merged
+
+    def _merge_snapshot_metadata(row: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(row)
+        merged.pop("_notes_initialized", None)
+        merged["display_name"] = str(merged.get("name") or merged.get("id") or "")
+        legacy_notes = [str(note) for note in (merged.pop("notes", []) or []) if str(note).strip()]
+        merged["description"] = str(merged.get("description") or "\n".join(legacy_notes))
+        merged["metadata"] = library_metadata("snapshot", merged)
+        return merged
+
+    def _resolve_library_row(kind: str, source_id: str) -> dict[str, Any]:
+        if kind == "video":
+            row = hub.videos.get(source_id)
+            row = _merge_library_override("video", source_id, row)
+            row["episodes"] = _merge_episode_overrides("video", source_id, row.get("episodes") or [])
+            return row
+        if kind == "dataset":
+            return _merge_library_override("dataset", source_id, hub.resolve_dataset(source_id))
+        if kind == "model":
+            row = next(
+                (
+                    item
+                    for item in hub.models()
+                    if str(item.get("id") or "") == str(source_id)
+                ),
+                None,
+            )
+            if row is None:
+                raise KeyError(source_id)
+            return _merge_library_override("model", source_id, row)
+        if kind == "snapshot":
+            return _merge_snapshot_metadata(hub.snapshots.get(source_id))
+        raise ValueError(f"unknown library kind '{kind}'")
+
+    def _delete_resource_path(path: str | Path | None) -> None:
+        if not path:
+            return
+        target = Path(path).expanduser().resolve()
+        if not target.exists() or target == Path(target.anchor):
+            return
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
 
     @router.get("/api/videos")
     async def list_videos() -> list[dict[str, Any]]:
@@ -592,6 +700,16 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 task=body.task,
                 repo_id=body.repo_id,
             )
+
+    @router.post("/api/videos/{video_id}/duplicate")
+    async def duplicate_video(video_id: str) -> dict[str, Any]:
+        try:
+            row = await asyncio.to_thread(hub.videos.duplicate, video_id)
+            return _merge_library_override("video", str(row["id"]), row)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @router.get("/api/videos/{video_id}")
     async def get_video(video_id: str) -> dict[str, Any]:
@@ -689,32 +807,198 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             for row in rows
         ]
 
+    @router.get("/api/datasets/search")
+    async def search_datasets(q: str, limit: int = 20) -> list[dict[str, Any]]:
+        try:
+            return await asyncio.to_thread(
+                search_hf_datasets,
+                q,
+                limit=max(1, min(int(limit), 50)),
+            )
+        except DatasetHubError as exc:
+            raise HTTPException(502, str(exc)) from exc
+
+    @router.post("/api/datasets/download")
+    async def download_dataset(body: DatasetDownloadBody) -> dict[str, Any]:
+        async with library_mutation_lock:
+            try:
+                row = await asyncio.to_thread(
+                    hub.dataset_registry.register,
+                    remote=body.remote,
+                    name=body.name,
+                    revision=body.revision,
+                )
+            except DatasetHubError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        source_id = str(row.get("repo_id") or row.get("id") or body.remote)
+        return _merge_library_override("dataset", source_id, row)
+
+    @router.post("/api/datasets/empty")
+    async def create_empty_dataset_route(body: DatasetEmptyBody) -> dict[str, Any]:
+        cameras = list(body.cameras or [])
+        if not cameras:
+            cameras = [
+                {
+                    "key": str(camera.get("label") or camera.get("name") or ""),
+                    "width": camera.get("width"),
+                    "height": camera.get("height"),
+                }
+                for camera in hub.cameras.snapshots()
+                if camera.get("enabled") and camera.get("show_main")
+            ]
+        async with library_mutation_lock:
+            try:
+                created = await asyncio.to_thread(
+                    create_empty_dataset,
+                    name=body.name,
+                    repo_id=body.repo_id,
+                    fps=body.fps,
+                    robot_type=body.robot_type or config.robot.type,
+                    cameras=cameras,
+                )
+            except DatasetHubError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            row = await asyncio.to_thread(
+                hub.dataset_registry.register,
+                remote=str(created["path"]),
+                name=str(created.get("title") or body.name),
+                revision="",
+                repo_id=str(created.get("repo_id") or ""),
+            )
+        return _merge_library_override("dataset", str(row.get("id") or row.get("repo_id")), row)
+
+    @router.post("/api/datasets/{dataset_id}/download")
+    async def download_dataset_local(dataset_id: str) -> dict[str, Any]:
+        try:
+            row = await asyncio.to_thread(hub.dataset_registry.update, dataset_id)
+            return _merge_library_override("dataset", dataset_id, row)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except DatasetHubError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.post("/api/datasets/{dataset_id}/upload")
+    async def upload_dataset(dataset_id: str) -> dict[str, Any]:
+        try:
+            row = await asyncio.to_thread(hub.dataset_registry.upload, dataset_id)
+            return _merge_library_override("dataset", dataset_id, row)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except DatasetHubError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @router.put("/api/library")
     async def edit_library(body: LibraryEditBody) -> dict[str, Any]:
-        payload = {
-            key: value
-            for key, value in (("note", body.note), ("description", body.description))
-            if value is not None
-        }
+        payload: dict[str, Any] = {}
+        for key, value in (
+            ("name", body.name),
+            ("description", body.description),
+            ("task", body.task),
+            ("repo_id", body.repo_id),
+            ("remote", body.remote),
+            ("revision", body.revision),
+            ("path", body.path),
+            ("metadata", body.metadata),
+        ):
+            if value is not None:
+                payload[key] = value
+        if body.note is not None:
+            payload["description"] = body.note.strip()
+        if body.notes is not None:
+            payload["description"] = "\n".join(str(note).strip() for note in body.notes if str(note).strip())
         try:
-            saved = await asyncio.to_thread(
-                hub.store.save_library_override,
-                body.kind,
-                body.id,
-                payload,
-            )
+            if body.kind == "snapshot":
+                await asyncio.to_thread(hub.snapshots.update, body.id, payload)
+            elif body.kind == "dataset":
+                source_payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key in {"name", "repo_id", "remote", "revision", "path"}
+                }
+                if source_payload:
+                    await asyncio.to_thread(hub.dataset_registry.save, body.id, source_payload)
+                metadata_payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key in {"description", "task", "metadata"}
+                }
+                if metadata_payload:
+                    await asyncio.to_thread(hub.store.save_library_override, "dataset", body.id, metadata_payload)
+            elif body.kind == "model":
+                source_payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key in {"name", "remote", "revision", "path"}
+                }
+                if source_payload:
+                    await asyncio.to_thread(hub.model_registry.save, body.id, source_payload)
+                metadata_payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key in {"name", "description", "metadata"}
+                }
+                if metadata_payload:
+                    await asyncio.to_thread(hub.store.save_library_override, "model", body.id, metadata_payload)
+            elif body.kind == "video":
+                await asyncio.to_thread(hub.store.save_library_override, body.kind, body.id, payload)
+            else:
+                raise ValueError(f"unknown library kind '{body.kind}'")
+            return await asyncio.to_thread(_resolve_library_row, body.kind, body.id)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
         except (KeyError, ValueError) as exc:
             raise HTTPException(400, str(exc)) from exc
-        return {"kind": body.kind, "id": body.id, **saved}
+
+    @router.delete("/api/library")
+    async def delete_library(kind: str, id: str) -> dict[str, Any]:
+        try:
+            if kind == "video":
+                row = await asyncio.to_thread(hub.videos.get, id)
+                async with library_mutation_lock:
+                    await asyncio.to_thread(hub.videos.delete, id)
+                await asyncio.to_thread(hub.store.delete_episode_overrides, "video", id)
+                await asyncio.to_thread(hub.store.delete_library_override, "video", id)
+                await asyncio.to_thread(hub.store.delete_episode_view, "video", id)
+            elif kind == "snapshot":
+                row = await asyncio.to_thread(hub.snapshots.get, id)
+                await asyncio.to_thread(hub.snapshots.delete, id)
+            elif kind == "model":
+                row = next(
+                    (
+                        item
+                        for item in await asyncio.to_thread(hub.models)
+                        if str(item.get("id") or "") == str(id)
+                    ),
+                    None,
+                )
+                if row is None:
+                    raise FileNotFoundError(id)
+                await asyncio.to_thread(hub.model_registry.delete, id)
+                await asyncio.to_thread(hub.store.delete_library_override, "model", id)
+                await asyncio.to_thread(_delete_resource_path, row.get("path"))
+            elif kind == "dataset":
+                row = await asyncio.to_thread(hub.resolve_dataset, id)
+                await asyncio.to_thread(hub.dataset_registry.delete, id)
+                await asyncio.to_thread(hub.store.delete_library_override, "dataset", id)
+                await asyncio.to_thread(hub.store.delete_episode_overrides, "dataset", id)
+                await asyncio.to_thread(hub.store.delete_episode_view, "dataset", id)
+                await asyncio.to_thread(_delete_resource_path, row.get("path"))
+            else:
+                raise ValueError(f"unknown library kind '{kind}'")
+            return {"ok": True, "kind": kind, "id": id}
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     def _episode_source(kind: str, source_id: str) -> tuple[dict[str, Any], int, bool]:
         """Resolve a library entry to (row, episode count, playable)."""
         if kind == "video":
-            meta = hub.videos.get(source_id)
+            meta = _merge_library_override("video", source_id, hub.videos.get(source_id))
             return meta, len(meta.get("episodes") or []), True
         if kind != "dataset":
             raise ValueError(f"unknown episode source kind '{kind}'")
-        row = hub.resolve_dataset(source_id)
+        row = _merge_library_override("dataset", source_id, hub.resolve_dataset(source_id))
         return row, lerobot_episode_count(Path(row["path"])), bool(row.get("playable"))
 
     @router.get("/api/episodes")
@@ -730,32 +1014,32 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 _episode_item("video", id, int(ep.get("index", i)), playable=True, row=ep)
                 for i, ep in enumerate(row.get("episodes") or [])
             ]
-            title = row.get("name") or row.get("repo_id") or id
+            title = row.get("display_name") or row.get("name") or row.get("repo_id") or id
             subtitle = row.get("task") or row.get("repo_id") or "Local recording"
-            description = row.get("description") or ""
         else:
             has_video = bool(row.get("has_video"))
             episodes = [
                 _episode_item("dataset", id, index, playable=playable, row={"videos": has_video})
                 for index in range(count)
             ]
-            title = row.get("title") or row.get("repo_id") or row.get("name") or id
+            title = row.get("display_name") or row.get("title") or row.get("repo_id") or row.get("name") or id
             fallback_bits = [str(row.get("source") or "dataset")]
             if row.get("fps"):
                 fallback_bits.append(f"{row['fps']} fps")
             fallback_bits.append(f"{count} episodes")
             subtitle = row.get("subtitle") or row.get("task") or " · ".join(fallback_bits)
-            description = row.get("description") or ""
+        view = hub.store.episode_view(kind, id)
+        hidden = {int(index) for index in view.get("hidden") or []}
+        episodes = [item for item in episodes if int(item["index"]) not in hidden]
+        by_index = {int(item["index"]): item for item in episodes}
+        requested = [int(index) for index in view.get("order") or []]
+        ordered = [by_index.pop(index) for index in requested if index in by_index]
+        ordered.extend(by_index[index] for index in sorted(by_index))
+        episodes = ordered
         source = {
             "title": str(title),
             "subtitle": str(subtitle) if isinstance(subtitle, str) else "",
-            "description": str(description) if isinstance(description, str) else "",
         }
-        saved = hub.store.library_override(kind, id)
-        if "note" in saved:
-            source["note"] = saved["note"]
-        if "description" in saved:
-            source["description"] = saved["description"]
         return {
             "kind": kind,
             "id": id,
@@ -804,23 +1088,44 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         finally:
             hub.loop.recording_mutation_lock.release()
 
+    @router.delete("/api/episodes")
+    async def delete_episode(kind: str, id: str, episode: int) -> dict[str, Any]:
+        if kind == "video":
+            return await delete_video_episode(id, episode)
+        if kind != "dataset":
+            raise HTTPException(400, f"unknown episode source kind '{kind}'")
+        view = hub.store.episode_view(kind, id)
+        hidden = {int(index) for index in view.get("hidden") or []}
+        hidden.add(int(episode))
+        await asyncio.to_thread(hub.store.save_episode_view, kind, id, {"hidden": sorted(hidden)})
+        return {"ok": True, "hidden": sorted(hidden)}
+
+    @router.post("/api/episodes/reorder")
+    async def reorder_episodes(body: EpisodeReorderBody) -> dict[str, Any]:
+        if body.kind == "video":
+            return await reorder_video_episodes(body.id, ReorderBody(order=body.order))
+        if body.kind != "dataset":
+            raise HTTPException(400, f"unknown episode source kind '{body.kind}'")
+        await asyncio.to_thread(hub.store.save_episode_view, body.kind, body.id, {"order": body.order})
+        return {"ok": True, "order": body.order}
+
     @router.get("/api/preview")
     async def preview(kind: str, id: str, episode: int = 0) -> dict[str, Any]:
         def load_preview() -> dict[str, Any]:
             if kind == "video":
-                meta = hub.videos.get(id)
+                meta = _merge_library_override("video", id, hub.videos.get(id))
                 loaded = local_episode_payload(Path(meta["path"]), episode)
                 loaded["episodes"] = len(meta.get("episodes") or [])
-                loaded["title"] = meta.get("name") or id
+                loaded["title"] = meta.get("display_name") or meta.get("name") or id
                 loaded["id"] = id
                 loaded["kind"] = "video"
                 loaded["action_fps"] = meta.get("action_fps") or meta.get("fps")
                 loaded["video_fps"] = meta.get("video_fps") or meta.get("fps")
             else:
-                row = hub.resolve_dataset(id)
+                row = _merge_library_override("dataset", id, hub.resolve_dataset(id))
                 root = Path(row["path"])
                 loaded = lerobot_episode_payload(root, episode)
-                loaded["title"] = row.get("repo_id") or id
+                loaded["title"] = row.get("display_name") or row.get("repo_id") or id
                 loaded["id"] = id
                 loaded["path"] = str(root)
                 loaded["kind"] = "dataset"
@@ -859,7 +1164,11 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.get("/api/models")
     async def list_models() -> list[dict[str, Any]]:
-        return await asyncio.to_thread(hub.models)
+        rows = await asyncio.to_thread(hub.models)
+        return [
+            _merge_library_override("model", str(row.get("id") or row.get("name") or ""), row)
+            for row in rows
+        ]
 
     @router.get("/api/models/search")
     async def search_models(q: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -871,7 +1180,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.post("/api/models")
     async def register_model(body: ModelRegisterBody) -> dict[str, Any]:
         try:
-            return await asyncio.to_thread(
+            row = await asyncio.to_thread(
                 hub.model_registry.register,
                 remote=body.remote,
                 name=body.name,
@@ -879,17 +1188,33 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 note=body.note,
                 download=body.download,
             )
+            return await asyncio.to_thread(
+                _merge_library_override,
+                "model",
+                str(row.get("id") or body.remote),
+                row,
+            )
         except ModelHubError as exc:
             raise HTTPException(400, str(exc)) from exc
 
     @router.put("/api/models/{model_id}")
     async def save_model(model_id: str, body: ModelSaveBody) -> dict[str, Any]:
+        payload = body.model_dump(exclude_unset=True)
         try:
-            return await asyncio.to_thread(
+            row = await asyncio.to_thread(
                 hub.model_registry.save,
                 model_id,
-                body.model_dump(exclude_unset=True),
+                payload,
             )
+            override: dict[str, Any] = {}
+            if "name" in payload and payload["name"] is not None:
+                override["name"] = str(payload["name"])
+            if "note" in payload and payload["note"] is not None:
+                note = str(payload["note"]).strip()
+                override["notes"] = [note] if note else []
+            if override:
+                await asyncio.to_thread(hub.store.save_library_override, "model", model_id, override)
+            return await asyncio.to_thread(_merge_library_override, "model", model_id, row)
         except KeyError as exc:
             raise HTTPException(404, f"unknown model '{model_id}'") from exc
         except ModelHubError as exc:
@@ -904,10 +1229,24 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         except ModelHubError as exc:
             raise HTTPException(400, str(exc)) from exc
 
+    @router.post("/api/models/{model_id}/download")
+    async def download_model(model_id: str) -> dict[str, Any]:
+        return await update_model(model_id)
+
+    @router.post("/api/models/{model_id}/upload")
+    async def upload_model(model_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(hub.model_registry.upload, model_id)
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown model '{model_id}'") from exc
+        except ModelHubError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @router.delete("/api/models/{model_id}")
     async def delete_model(model_id: str) -> dict[str, Any]:
         try:
             await asyncio.to_thread(hub.model_registry.delete, model_id)
+            await asyncio.to_thread(hub.store.delete_library_override, "model", model_id)
         except KeyError as exc:
             raise HTTPException(404, f"unknown model '{model_id}'") from exc
         return {"ok": True}
@@ -994,22 +1333,31 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.get("/api/snapshots")
     async def list_snapshots() -> list[dict[str, Any]]:
-        return await asyncio.to_thread(hub.snapshots.list)
+        rows = await asyncio.to_thread(hub.snapshots.list)
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            if not row.get("_notes_initialized"):
+                row = await asyncio.to_thread(hub.snapshots.ensure_default_note, str(row["id"]))
+            result.append(_merge_snapshot_metadata(row))
+        return result
 
     @router.post("/api/snapshots")
     async def create_snapshot(body: SnapshotCreateBody) -> dict[str, Any]:
         try:
-            return await asyncio.to_thread(
+            row = await asyncio.to_thread(
                 hub.snapshots.create,
                 name=body.name,
                 task=body.task,
                 note=body.note,
+                notes=body.notes,
                 description=body.description,
+                metadata=body.metadata,
                 origin=body.origin,
                 source=body.source,
                 joints=body.joints,
                 cameras=[camera.model_dump() for camera in body.cameras],
             )
+            return _merge_snapshot_metadata(row)
         except SnapshotTooLargeError as exc:
             raise HTTPException(413, str(exc)) from exc
         except ValueError as exc:
@@ -1018,7 +1366,10 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.get("/api/snapshots/{snapshot_id}")
     async def get_snapshot(snapshot_id: str) -> dict[str, Any]:
         try:
-            return await asyncio.to_thread(hub.snapshots.get, snapshot_id)
+            row = await asyncio.to_thread(hub.snapshots.get, snapshot_id)
+            if not row.get("_notes_initialized"):
+                row = await asyncio.to_thread(hub.snapshots.ensure_default_note, snapshot_id)
+            return _merge_snapshot_metadata(row)
         except FileNotFoundError as exc:
             raise HTTPException(404, f"unknown snapshot '{snapshot_id}'") from exc
         except ValueError as exc:
@@ -1027,11 +1378,12 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.put("/api/snapshots/{snapshot_id}")
     async def update_snapshot(snapshot_id: str, body: SnapshotUpdateBody) -> dict[str, Any]:
         try:
-            return await asyncio.to_thread(
+            row = await asyncio.to_thread(
                 hub.snapshots.update,
                 snapshot_id,
                 body.model_dump(exclude_none=True),
             )
+            return _merge_snapshot_metadata(row)
         except FileNotFoundError as exc:
             raise HTTPException(404, f"unknown snapshot '{snapshot_id}'") from exc
         except SnapshotTooLargeError as exc:
@@ -1052,7 +1404,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.post("/api/snapshots/{snapshot_id}/duplicate")
     async def duplicate_snapshot(snapshot_id: str) -> dict[str, Any]:
         try:
-            return await asyncio.to_thread(hub.snapshots.duplicate, snapshot_id)
+            row = await asyncio.to_thread(hub.snapshots.duplicate, snapshot_id)
+            return _merge_snapshot_metadata(row)
         except FileNotFoundError as exc:
             raise HTTPException(404, f"unknown snapshot '{snapshot_id}'") from exc
         except ValueError as exc:

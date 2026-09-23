@@ -129,10 +129,22 @@ def test_library_overrides_roundtrip_and_delete(tmp_path: Path) -> None:
 
     again = JsonStore(tmp_path / "store.json")
     assert again.library_override("video", "blocks_2026") == {
-        "note": "updated",
-        "description": "local capture",
+        "description": "updated",
     }
-    assert again.library_override("dataset", "user/so101") == {"note": "baseline"}
+    assert again.library_override("dataset", "user/so101") == {"description": "baseline"}
 
     again.delete_library_override("video", "blocks_2026")
     assert again.library_override("video", "blocks_2026") == {}
+
+
+def test_episode_view_order_and_hidden_roundtrip(tmp_path: Path) -> None:
+    store = JsonStore(tmp_path / "store.json")
+    store.save_episode_view("dataset", "user/blocks", {"order": [2, 0, 1], "hidden": [1]})
+
+    again = JsonStore(tmp_path / "store.json")
+    assert again.episode_view("dataset", "user/blocks") == {
+        "order": [2, 0, 1],
+        "hidden": [1],
+    }
+    again.delete_episode_view("dataset", "user/blocks")
+    assert again.episode_view("dataset", "user/blocks") == {}

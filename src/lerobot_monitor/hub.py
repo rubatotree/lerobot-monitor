@@ -9,8 +9,9 @@ from pathlib import Path
 
 from .cameras import CameraHub
 from .config import MonitorConfig
+from .dataset_hub import DatasetRegistry
 from .leader import LeaderArm
-from .library import VideoLibrary, list_hf_datasets
+from .library import VideoLibrary
 from .loop import ControlLoop
 from .model_hub import ModelRegistry
 from .robot import FollowerArm
@@ -33,6 +34,10 @@ class RuntimeHub:
             self.store,
             [Path(p) for p in config.library.models_roots],
         )
+        dataset_roots = list(config.library.dataset_roots)
+        if config.library.datasets_root:
+            dataset_roots.append(Path(config.library.datasets_root))
+        self.dataset_registry = DatasetRegistry(self.store, dataset_roots)
         self.follower = FollowerArm(config.robot)
         self.leader = LeaderArm(config.leader)
         self._snapshot: dict[str, Any] = {}
@@ -52,9 +57,18 @@ class RuntimeHub:
             self._snapshot = snapshot
 
     def start(self) -> None:
+        self._trim_video_library()
         self.cameras.start()
         self.loop.start()
         self._restore_active_hardware_preset()
+
+    def _trim_video_library(self) -> None:
+        for row in self.videos.trim_all_to_first_episode():
+            dataset_id = str(row.get("id") or "")
+            first = row.get("trimmed_from_episode")
+            if dataset_id and first is not None:
+                self.store.remap_episode_overrides("video", dataset_id, {str(int(first)): 0})
+                self.store.delete_episode_view("video", dataset_id)
 
     def _restore_active_hardware_preset(self) -> None:
         ui = self.store.ui()
@@ -153,16 +167,10 @@ class RuntimeHub:
         return items
 
     def hf_datasets(self) -> list[dict[str, Any]]:
-        extra = list(self.config.library.dataset_roots)
-        if self.config.library.datasets_root:
-            extra.append(Path(self.config.library.datasets_root))
-        return list_hf_datasets(extra)
+        return self.dataset_registry.list()
 
     def resolve_dataset(self, repo_id: str) -> dict[str, Any]:
-        for row in self.hf_datasets():
-            if row.get("repo_id") == repo_id or row.get("id") == repo_id:
-                return row
-        raise FileNotFoundError(repo_id)
+        return self.dataset_registry.get(repo_id)
 
     def models(self) -> list[dict[str, Any]]:
         return self.model_registry.list()

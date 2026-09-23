@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -226,7 +227,6 @@ def test_episode_edit_persists(tmp_path: Path, monkeypatch) -> None:
         assert listed.json()["source"] == {
             "title": "blocks",
             "subtitle": "sort",
-            "description": "",
         }
         assert listed.json()["title"] == listed.json()["source"]["title"]
 
@@ -295,11 +295,11 @@ def test_episode_edit_persists(tmp_path: Path, monkeypatch) -> None:
         saved_ui = client.put("/lerobot/api/ui", json={"selected_video": video_id})
         assert saved_ui.json()["selected_video"] == video_id
 
-    reopened = TestClient(create_app(cfg))
-    with reopened:
-        listed = reopened.get("/lerobot/api/episodes", params={"kind": "video", "id": video_id})
-        assert [row["name"] for row in listed.json()["episodes"]] == ["episode-2", "episode-1"]
-        assert reopened.get("/lerobot/api/ui").json()["selected_video"] == video_id
+        reopened = TestClient(create_app(cfg))
+        with reopened:
+            listed = reopened.get("/lerobot/api/episodes", params={"kind": "video", "id": video_id})
+            assert [row["name"] for row in listed.json()["episodes"]] == ["episode-2"]
+            assert reopened.get("/lerobot/api/ui").json()["selected_video"] == video_id
 
 
 def test_library_notes_and_descriptions_merge_into_lists(tmp_path: Path, monkeypatch) -> None:
@@ -328,22 +328,29 @@ def test_library_notes_and_descriptions_merge_into_lists(tmp_path: Path, monkeyp
         video_id = client.post("/lerobot/api/videos", json={"name": "blocks", "task": "sort"}).json()["id"]
         saved = client.put(
             "/lerobot/api/library",
-            json={"kind": "video", "id": video_id, "note": "check lighting", "description": "local run"},
+            json={"kind": "video", "id": video_id, "description": "local run"},
         )
         assert saved.status_code == 200
-        assert saved.json()["note"] == "check lighting"
+        assert saved.json()["description"] == "local run"
+        assert saved.json()["metadata"]["path"].endswith(video_id)
 
         listed_video = next(row for row in client.get("/lerobot/api/videos").json() if row["id"] == video_id)
-        assert listed_video["note"] == "check lighting"
         assert listed_video["description"] == "local run"
-        assert client.get(f"/lerobot/api/videos/{video_id}").json()["note"] == "check lighting"
+        assert client.get(f"/lerobot/api/videos/{video_id}").json()["description"] == "local run"
+
+        reordered = client.put(
+            "/lerobot/api/library",
+            json={"kind": "video", "id": video_id, "description": "second\nfirst"},
+        )
+        assert reordered.status_code == 200
+        assert reordered.json()["description"] == "second\nfirst"
 
         saved_dataset = client.put(
             "/lerobot/api/library",
             json={
                 "kind": "dataset",
                 "id": "user/series",
-                "note": "baseline",
+                "name": "Renamed Series",
                 "description": "Monitor description",
             },
         )
@@ -351,21 +358,58 @@ def test_library_notes_and_descriptions_merge_into_lists(tmp_path: Path, monkeyp
         listed_dataset = next(
             row for row in client.get("/lerobot/api/datasets").json() if row["repo_id"] == "user/series"
         )
-        assert listed_dataset["note"] == "baseline"
+        assert listed_dataset["display_name"] == "Renamed Series"
         assert listed_dataset["description"] == "Monitor description"
+        assert listed_dataset["metadata"]["episodes"] == 1
+        assert listed_dataset["metadata"]["fps"] == 10
 
         episodes = client.get("/lerobot/api/episodes", params={"kind": "dataset", "id": "user/series"})
         assert episodes.status_code == 200
-        assert episodes.json()["source"]["description"] == "Monitor description"
-        assert episodes.json()["source"]["note"] == "baseline"
+        assert "description" not in episodes.json()["source"]
 
         assert client.put(
             "/lerobot/api/library",
             json={"kind": "unknown", "id": "x", "note": "nope"},
         ).status_code == 400
 
-        assert client.delete(f"/lerobot/api/videos/{video_id}").status_code == 200
+        assert client.delete(
+            "/lerobot/api/library",
+            params={"kind": "video", "id": video_id},
+        ).status_code == 200
         assert app.state.hub.store.library_override("video", video_id) == {}
+
+
+def test_empty_dataset_api_creates_readable_lerobot_skeleton(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot"))
+    monkeypatch.delenv("LEROBOT_HOME", raising=False)
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/lerobot/api/datasets/empty",
+            json={
+                "name": "Empty demo",
+                "repo_id": "user/empty_demo",
+                "fps": 20,
+                "robot_type": "so101_follower",
+                "cameras": [{"key": "front", "width": 320, "height": 240}],
+            },
+        )
+        assert created.status_code == 200
+        row = created.json()
+        assert row["repo_id"] == "user/empty_demo"
+        assert row["metadata"]["episodes"] == 0
+        assert row["metadata"]["fps"] == 20
+
+        info = json.loads(
+            (Path(row["path"]) / "meta" / "info.json").read_text(encoding="utf-8")
+        )
+        assert info["total_episodes"] == 0
+        assert info["features"]["observation.images.front"]["shape"] == [240, 320, 3]
+
+        listed = client.get("/lerobot/api/datasets")
+        assert any(item["repo_id"] == "user/empty_demo" for item in listed.json())
 
 
 def _lifecycle_config(tmp_path: Path) -> MonitorConfig:
@@ -516,8 +560,21 @@ def test_series_only_dataset_is_previewable_and_json_safe(tmp_path: Path, monkey
         assert episodes.json()["source"] == {
             "title": "Series Demo",
             "subtitle": "Reach target",
-            "description": "States only",
         }
+        reordered = client.post(
+            "/lerobot/api/episodes/reorder",
+            json={"kind": "dataset", "id": "user/series", "order": [0]},
+        )
+        assert reordered.status_code == 200
+        deleted = client.delete(
+            "/lerobot/api/episodes",
+            params={"kind": "dataset", "id": "user/series", "episode": 0},
+        )
+        assert deleted.status_code == 200
+        assert client.get(
+            "/lerobot/api/episodes",
+            params={"kind": "dataset", "id": "user/series"},
+        ).json()["episodes"] == []
 
         preview = client.get(
             "/lerobot/api/preview",
@@ -910,18 +967,23 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="snap-list"',
         'id="lib-search"',
         'id="btn-lib-search-clear"',
+        'id="btn-md-add"',
+        'id="btn-md-scan"',
+        'id="btn-ds-add"',
+        'id="btn-ds-scan"',
+        'id="btn-ds-download"',
+        'id="btn-ds-empty"',
+        'id="library-modal"',
         'id="viz-exit"',
         'id="side-tabs"',
         'data-tab="joints"',
         'data-tab-panel="joints"',
-        'id="dbg-snap-editor"',
         'data-panel="debug"',
         'id="btn-dbg-run"',
         'id="btn-dbg-send"',
         'id="dbg-cam-map"',
         'id="dbg-eval"',
         'id="action-legend"',
-        'id="md-file-input"',
         'id="pol-path-menu"',
         'id="preset-toolbar"',
         'id="preset-select"',
@@ -939,6 +1001,17 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'aria-label="Leader device"',
     ):
         assert marker in page.text
+    assert (
+        page.text.find('data-tab="models"')
+        < page.text.find('data-tab="datasets"')
+        < page.text.find('data-tab="videos"')
+        < page.text.find('data-tab="snapshots"')
+    )
+    assert re.search(
+        r'id="replay-status".*id="viz-exit".*</header>',
+        page.text,
+        re.DOTALL,
+    )
 
 
 def test_model_registry_api_round_trip(tmp_path: Path, monkeypatch) -> None:
@@ -975,12 +1048,25 @@ def test_model_registry_api_round_trip(tmp_path: Path, monkeypatch) -> None:
         assert [entry["id"] for entry in listed.json()] == [row["id"]]
 
         saved = client.put(
-            f"/lerobot/api/models/{row['id']}",
-            json={"name": "ACT renamed", "revision": "main"},
+            "/lerobot/api/library",
+            json={
+                "kind": "model",
+                "id": row["id"],
+                "name": "ACT renamed",
+                "description": "best checkpoint",
+            },
         )
         assert saved.status_code == 200
-        assert saved.json()["name"] == "ACT renamed"
-        assert saved.json()["revision"] == "main"
+        assert saved.json()["display_name"] == "ACT renamed"
+        assert saved.json()["description"] == "best checkpoint"
+        assert saved.json()["metadata"]["repo_id"] == "lerobot/act_aloha"
+
+        technical = client.put(
+            f"/lerobot/api/models/{row['id']}",
+            json={"revision": "main"},
+        )
+        assert technical.status_code == 200
+        assert technical.json()["revision"] == "main"
 
         updated = client.post(f"/lerobot/api/models/{row['id']}/update")
         assert updated.status_code == 200
@@ -1035,6 +1121,13 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert page.status_code == 200
     assert ".library-search" in css.text
     assert ".library-tools" in css.text
+    assert ".library-toolbar" in css.text
+    assert ".library-modal" in css.text
+    assert ".library-modal-body textarea" in css.text
+    assert ".library-meta-menu" in css.text
+    assert ".lib-meta" in css.text
+    assert ".lib-description" in css.text
+    assert ".library-menu" in css.text
     assert ".side-tools" in css.text
     assert ".preset-name-popover" in css.text
     assert ".preset-icon-btn.loading" in css.text
@@ -1061,6 +1154,17 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert 'key: "prediction"' in script.text
     assert "chart-legend-toggle" in script.text
     assert "function applyChartLegendVisibility" in script.text
+    assert "setInterval(refreshLibrary" not in script.text
+    assert "LIBRARY_META_FIELDS_KEY" in script.text
+    assert "function makeLibraryItem" in script.text
+    assert "function renderLibraryMetadata" in script.text
+    assert "Object.keys(metadata)" in script.text
+    assert "function renderMetadataMenu" in script.text
+    assert "function duplicateLibraryResource" in script.text
+    assert "function clearLibrarySelection" in script.text
+    assert "function beginLibraryRename" not in script.text
+    assert "lib-rename" not in script.text
+    assert 'id="btn-lib-meta-settings"' in page.text
     assert 'id: "modeMarkers"' in script.text
     assert "MODE_MARKER_LABEL_OFFSET_PX" in script.text
     assert 'currentControlMode() === "rollout"' in script.text

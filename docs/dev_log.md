@@ -1,5 +1,41 @@
 # Dev log
 
+## 2026-09-23（Library 资源管理器重构）
+
+- Library 标签顺序固定为 Models / Datasets / Videos / Snapshots，无保存偏好时默认
+  Models；列表标题只显示资源名，结构化 metadata 独立显示在标题下方，每行两个字段。
+- metadata 保存时间、来源、本地路径、上游 repo_id、revision、policy type、episode
+  数量、fps、task、robot type 等字段；搜索栏同行提供设置按钮，可选择每个标签实际
+  展示的字段并持久化。
+- 多 note 模型收敛为单个 `description`，只在资源被选中后显示并可原地编辑；旧 note
+  在加载时合并迁移到 description。Episode 管理器中的 description 入口已移除。
+- Models、Datasets 改为 Add/Scan 图标工具栏。Add 使用搜索式弹层；Datasets 的 Add
+  提供 Hub 下载与 New empty dataset。空数据集写入有效 LeRobot v3 骨架，并按当前
+  JOINT_ORDER 与启用 Main view 相机生成 action/state/video features。
+- Videos 每个 recording 只显示一行，点击直接进入主预览并使用预览栏切换 episode；
+  Datasets 继续保留 Episode 列。预览栏 Snapshot EDIT 与 Debug 内隐藏编辑器已删除。
+- 四类资源都可从资源管理器删除。Models、Datasets 统一提供编辑来源、上传覆盖云端和
+  下载覆盖本地三个操作；无 repo_id 时上传按钮标暗，无上游关联时下载按钮标暗，本地
+  cache 与上游资源使用同一套行外观。新增 DatasetRegistry，并让扫描资源和注册资源
+  使用统一列表、编辑、删除、下载与上传语义。
+- Videos 启动时只保留第一个 episode，后续录制结束也会自动裁剪；旧 episode 缺失的
+  `duration_s` 会从 `joints.csv` 最后时间戳恢复，并回写 episode/root meta。
+- Episode 查看器对所有来源提供编辑、删除和拖动排序；Video 使用原有物理 episode
+  操作，Dataset 使用持久化 episode view override 调整顺序和隐藏项。
+- 移除 Library 15 秒自动轮询，保留初始加载、操作后刷新和手动 Scan/Refresh。
+- 新增 `GET /api/datasets/search`、`POST /api/datasets/download`、
+  `POST /api/datasets/empty`；数据集下载后必须包含 `meta/info.json`，空数据集使用
+  临时目录原子创建。
+- 验证：排除 `test_sim.py` 为 `172 passed`；完整测试为 `201 passed, 2 failed`，
+  失败均为既有 `test_sim` 模拟总线初始位姿/动作落点断言。`node --check`、
+  Python compile、`git diff --check` 通过。
+- Chrome/IAB 浏览器检查通过：metadata 位于标题下方且每行两个字段、设置弹层、单个
+  来源编辑按钮、上传/下载/删除按钮、选中后 description、Datasets Add 菜单、Videos
+  直进预览且无 Episode 列与无 console error。空数据集由 `LeRobotDatasetMetadata`
+  实测读取成功：0 episodes、20 fps、单路 front video key。
+- 尚未在真实串口/相机环境验证新增弹层触控拖动、真实 Hub 大体积数据集下载和录制后
+  元信息 note 的实际内容；这些边界需要在设备与网络环境确认。
+
 ## 2026-09-22（Joints 面板显式连接与同步源）
 
 - Joints 面板新增同步源、Speed cap 和 Serial control。默认 `Follower / 180°/s /

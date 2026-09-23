@@ -134,6 +134,21 @@ def download_hf_model(repo_id: str, revision: str = "") -> str:
         raise ModelHubError(f"could not download {repo_id}: {exc}") from exc
 
 
+def upload_hf_model(repo_id: str, path: str, revision: str = "") -> None:
+    """Upload a local policy directory to its Hugging Face model repo."""
+    hub = _hub_module()
+    try:
+        hub.create_repo(repo_id, repo_type="model", exist_ok=True)
+        hub.upload_folder(
+            repo_id=repo_id,
+            repo_type="model",
+            folder_path=path,
+            revision=revision or None,
+        )
+    except Exception as exc:  # noqa: BLE001 - Hub/auth errors are user-facing
+        raise ModelHubError(f"could not upload {repo_id}: {exc}") from exc
+
+
 def resolve_remote(remote: str, *, revision: str = "") -> dict[str, Any]:
     """Turn a remote address into a local policy directory."""
     parsed = parse_remote(remote, revision=revision)
@@ -226,28 +241,40 @@ class ModelRegistry:
         """Edit name / remote address / revision / note of a registered model."""
         entry = self.store.model(model_id)
         if entry is None:
-            raise KeyError(model_id)
+            scanned = next((row for row in self.list() if str(row.get("id") or "") == str(model_id)), None)
+            if scanned is None:
+                raise KeyError(model_id)
+            entry = {
+                key: value
+                for key, value in scanned.items()
+                if key not in {"managed", "playable", "missing"}
+            }
+            entry.setdefault("created_utc", _utc_now())
         if "name" in payload and payload["name"] is not None:
             entry["name"] = str(payload["name"]).strip() or entry.get("name") or model_id
         if "note" in payload and payload["note"] is not None:
             entry["note"] = str(payload["note"])
-        if payload.get("remote") is not None:
-            remote = str(payload["remote"]).strip()
+        source = payload.get("remote", payload.get("path"))
+        if source is not None:
+            remote = str(source).strip()
             if not remote:
                 raise ModelHubError("remote address is empty")
             parsed = parse_remote(remote)
-            if parsed.remote != entry.get("remote"):
-                # A new address invalidates the old weights until Update runs.
-                entry.update(
-                    {
-                        "source": parsed.source,
-                        "remote": parsed.remote,
-                        "repo_id": parsed.repo_id,
-                        "path": "",
-                        "revision": parsed.revision,
-                    }
-                )
-        if payload.get("revision") is not None:
+            requested_revision = (
+                str(payload["revision"]).strip()
+                if payload.get("revision") is not None
+                else parsed.revision
+            )
+            entry.update(
+                {
+                    "source": parsed.source,
+                    "remote": parsed.remote,
+                    "repo_id": parsed.repo_id,
+                    "revision": requested_revision,
+                }
+            )
+            entry.update(resolve_remote(remote, revision=str(entry.get("revision") or "")))
+        elif payload.get("revision") is not None:
             entry["revision"] = str(payload["revision"]).strip()
         entry["updated_utc"] = _utc_now()
         return self._decorate(self.store.put_model(entry))
@@ -256,7 +283,10 @@ class ModelRegistry:
         """Re-resolve the remote address, pulling the newest weights for a repo."""
         entry = self.store.model(model_id)
         if entry is None:
-            raise KeyError(model_id)
+            row = next((item for item in self.list() if str(item.get("id") or "") == str(model_id)), None)
+            if row is None:
+                raise KeyError(model_id)
+            entry = dict(row)
         remote = str(entry.get("remote") or "")
         if not remote:
             raise ModelHubError("model has no remote address to update from")
@@ -265,9 +295,25 @@ class ModelRegistry:
         return self._decorate(self.store.put_model(entry))
 
     def delete(self, model_id: str) -> None:
-        if self.store.model(model_id) is None:
-            raise KeyError(model_id)
-        self.store.delete_model(model_id)
+        if self.store.model(model_id) is not None:
+            self.store.delete_model(model_id)
+
+    def upload(self, model_id: str) -> dict[str, Any]:
+        entry = self.store.model(model_id)
+        if entry is None:
+            row = next((item for item in self.list() if str(item.get("id") or "") == str(model_id)), None)
+            if row is None:
+                raise KeyError(model_id)
+            entry = dict(row)
+        repo_id = str(entry.get("repo_id") or "").strip()
+        path = str(entry.get("path") or "").strip()
+        if not repo_id:
+            raise ModelHubError("model has no upstream Hugging Face repo_id")
+        if not Path(path).is_dir():
+            raise ModelHubError(f"model path not found: {path}")
+        upload_hf_model(repo_id, path, str(entry.get("revision") or ""))
+        entry["updated_utc"] = _utc_now()
+        return self._decorate(self.store.put_model(entry))
 
     def _find_registered(self, parsed: ModelRemote) -> dict[str, Any] | None:
         path_key = _path_key(parsed.path) if parsed.path else ""

@@ -1,3 +1,4 @@
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -5,6 +6,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from lerobot_monitor import dataset_hub
+from lerobot_monitor.dataset_hub import (
+    DatasetRegistry,
+    create_empty_dataset,
+    download_hf_dataset,
+    search_hf_datasets,
+)
 from lerobot_monitor.library import (
     DatasetRecorder,
     VideoLibrary,
@@ -12,6 +20,7 @@ from lerobot_monitor.library import (
     list_local_models,
 )
 from lerobot_monitor.session import mosaic_bgr
+from lerobot_monitor.store import JsonStore
 from lerobot_monitor.types import JOINT_ORDER
 
 
@@ -175,6 +184,52 @@ def test_video_library_create_is_atomic_across_instances(tmp_path: Path, monkeyp
         assert saved["worker"] == row["worker"]
 
 
+def test_video_library_duplicate_copies_episode_data(tmp_path: Path) -> None:
+    lib = VideoLibrary(tmp_path / "videos")
+    created = lib.create("blocks", fps=5)
+    episode = Path(created["path"]) / "episodes" / "000000"
+    episode.mkdir(parents=True)
+    (episode / "joints.csv").write_text("t,obs.gripper\n0,1\n", encoding="utf-8")
+
+    copied = lib.duplicate(created["id"], name="blocks copy")
+    assert copied["id"] != created["id"]
+    assert copied["name"] == "blocks copy"
+    assert (Path(copied["path"]) / "episodes" / "000000" / "joints.csv").is_file()
+
+
+def test_video_library_trim_keeps_first_episode(tmp_path: Path) -> None:
+    lib = VideoLibrary(tmp_path / "videos")
+    created = lib.create("blocks", fps=5)
+    pose = {name: float(i) for i, name in enumerate(JOINT_ORDER)}
+    frame = np.zeros((8, 10, 3), dtype=np.uint8)
+    rec = DatasetRecorder(Path(created["path"]), fps=5, kind="record", merge=True)
+    rec.add_frame(pose, pose, {"front": frame}, episode_index=0)
+    rec.add_frame(pose, pose, {"front": frame}, episode_index=1)
+    rec.close()
+    assert len(lib.get(created["id"])["episodes"]) == 2
+
+    trimmed = lib.trim_to_first_episode(created["id"])
+    assert len(trimmed["episodes"]) == 1
+    assert trimmed["episodes"][0]["index"] == 0
+    assert (Path(created["path"]) / "episodes" / "000000").is_dir()
+
+
+def test_video_library_recovers_missing_duration_from_joints_csv(tmp_path: Path) -> None:
+    lib = VideoLibrary(tmp_path / "videos")
+    created = lib.create("blocks", fps=15)
+    episode = Path(created["path"]) / "episodes" / "000000"
+    episode.mkdir(parents=True)
+    (episode / "joints.csv").write_text(
+        "t,obs.gripper\n0.0,1\n51.1124,2\n",
+        encoding="utf-8",
+    )
+
+    recovered = lib.get(created["id"])
+    assert recovered["duration_s"] == pytest.approx(51.1124)
+    assert recovered["episodes"][0]["duration_s"] == pytest.approx(51.1124)
+    assert json.loads((episode / "meta.json").read_text(encoding="utf-8"))["duration_s"] == pytest.approx(51.1124)
+
+
 def test_list_hf_datasets_hub_and_lerobot(tmp_path: Path, monkeypatch) -> None:
     hf = tmp_path / "hf"
     hub = hf / "hub" / "datasets--user--blocks"
@@ -313,3 +368,93 @@ def test_list_local_models_skips_generic_hf_model(tmp_path: Path, monkeypatch) -
     (generic / "config.json").write_text('{"model_type": "gpt2"}\n', encoding="utf-8")
     (generic / "model.safetensors").write_bytes(b"x")
     assert list_local_models([]) == []
+
+
+def test_create_empty_lerobot_dataset(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot"))
+    monkeypatch.delenv("LEROBOT_HOME", raising=False)
+    created = create_empty_dataset(
+        name="Empty demo",
+        repo_id="user/empty_demo",
+        fps=20,
+        robot_type="so101_follower",
+        cameras=[{"key": "front camera", "width": 640, "height": 480}],
+    )
+
+    root = Path(created["path"])
+    info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert info["codebase_version"] == "v3.0"
+    assert info["fps"] == 20
+    assert info["total_episodes"] == 0
+    assert info["features"]["action"]["shape"] == [6]
+    assert info["features"]["observation.images.front_camera"]["shape"] == [480, 640, 3]
+    assert (root / "data").is_dir()
+    assert (root / "videos").is_dir()
+
+
+def test_dataset_hub_search_and_download_validation(tmp_path: Path, monkeypatch) -> None:
+    dataset_root = tmp_path / "hub" / "snapshots" / "rev"
+    (dataset_root / "meta").mkdir(parents=True)
+    (dataset_root / "meta" / "info.json").write_text('{"fps": 15, "total_episodes": 0}\n', encoding="utf-8")
+
+    class Row:
+        id = "user/blocks"
+        downloads = 7
+        likes = 2
+        last_modified = "2026-09-23"
+        tags = ["lerobot"]
+
+    class Api:
+        def list_datasets(self, **kwargs):
+            return [Row()]
+
+    class Hub:
+        HfApi = Api
+
+        @staticmethod
+        def snapshot_download(**kwargs):
+            assert kwargs["repo_type"] == "dataset"
+            return str(dataset_root)
+
+    monkeypatch.setattr(dataset_hub, "_hub_module", lambda: Hub)
+    rows = search_hf_datasets("blocks")
+    assert rows == [
+        {
+            "repo_id": "user/blocks",
+            "downloads": 7,
+            "likes": 2,
+            "last_modified": "2026-09-23",
+            "tags": ["lerobot"],
+        }
+    ]
+    assert download_hf_dataset("user/blocks") == str(dataset_root)
+
+
+def test_dataset_registry_edits_source_and_uploads(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot"))
+    created = create_empty_dataset(name="Demo", repo_id="user/demo", fps=15)
+    store = JsonStore(tmp_path / "store.json")
+    registry = DatasetRegistry(store, [])
+    row = registry.register(
+        remote=str(created["path"]),
+        name="Demo",
+        repo_id="user/demo",
+    )
+    assert row["repo_id"] == "user/demo"
+    assert row["episodes"] == 0
+
+    calls: list[tuple[str, str]] = []
+
+    class Hub:
+        @staticmethod
+        def create_repo(repo_id, repo_type="dataset", exist_ok=True):
+            calls.append(("create", repo_id))
+
+        @staticmethod
+        def upload_folder(**kwargs):
+            calls.append(("upload", kwargs["repo_id"]))
+
+    monkeypatch.setattr(dataset_hub, "_hub_module", lambda: Hub)
+    uploaded = registry.upload(row["id"])
+    assert uploaded["repo_id"] == "user/demo"
+    assert calls == [("create", "user/demo"), ("upload", "user/demo")]

@@ -33,6 +33,46 @@ Browser  --HTTP/WS/MJPEG-->  FastAPI
 7. 本机 policy 扫描：HF hub cache、HF_LEROBOT_HOME、outputs/checkpoints
 8. Episode 管理：独立 Episode 列、命名/任务/备注编辑、逐条播放，回放时下方 Joint state / Control state 时间条
 
+## 已完成（2026-09-23）：Library 资源管理器重构
+
+目标：把左侧 Library 收敛为紧凑、可重复操作的资源管理器，统一四类资源的
+metadata、description、来源编辑、同步与删除入口，并移除不必要的自动刷新和预览
+编辑入口。
+
+实现边界：
+
+- 标签顺序固定为 Models / Datasets / Videos / Snapshots；无保存偏好时默认 Models。
+- 列表标题只显示资源名，结构化 metadata 在标题下方显示，每行两个字段；搜索栏
+  同行提供设置按钮，可选择每个标签实际展示的 metadata 字段。
+- metadata 包含时间、来源、本地路径、上游 repo_id、revision、资源属性和 episode
+  统计等。多 note 收敛为单个 description，仅资源被选中后显示和编辑。
+- Models、Datasets 使用与 Scan 并列的 Add 图标；Datasets 的 Add 提供 Hub 下载与
+  新建空数据集，空数据集写入有效 LeRobot v3 骨架。
+- Videos 每个 recording 一行，直接进入主预览并在预览栏切换 episode；Datasets 保留
+  Episode 列。Videos、Snapshots 的 `EDIT` 只存在于 Library 选中行。
+- Models、Datasets 的来源可编辑；上传覆盖云端、下载覆盖本地使用统一按钮，没有
+  上游 repo_id 或本地 path 时对应按钮标暗。四类资源均可在资源管理器中删除。
+- Episode 查看器对所有来源提供编辑、删除和拖动排序；Dataset 顺序与隐藏项使用
+  episode view override 持久化。
+- 移除 Library 15 秒轮询，仅保留初始加载、操作后刷新和手动 Scan/Refresh。
+
+验收：后端迁移与统一 metadata/来源/删除/同步 API 测试通过；前端静态契约、JS
+语法和浏览器 smoke 覆盖标签顺序、metadata 设置与展示、description、来源编辑、
+资源删除、视频直进预览、episode 操作、无预览 EDIT 与停止自动轮询。
+
+最终实现与验证：
+
+- 四类资源统一结构化 metadata 和单个 description；旧 note 自动迁移，metadata
+  字段可由设置按钮控制显示，description 仅在选中项展开。
+- Models/Datasets 工具栏改为 Add + Scan 图标，数据集支持 Hub 下载和有效 LeRobot v3
+  空数据集创建；空数据集已由 `LeRobotDatasetMetadata` 实测读取。
+- Videos 已改为单 recording 行并直进主预览，Datasets 保留 Episode 列；预览栏
+  Snapshot EDIT 与 Debug 编辑器移除。Models/Datasets 支持编辑来源、上传覆盖云端、
+  下载覆盖本地和删除；Episode 支持编辑、删除与排序。
+- Library 15 秒轮询已删除。非仿真测试 `172 passed`；完整测试 `201 passed, 2 failed`，
+  失败均为既有模拟总线初始位姿/动作落点断言。JS/Python 语法与 diff 检查通过，浏览器检查
+  覆盖主要交互且无 console error。
+
 ## 已完成（2026-09-22）：Joints 面板显式连接与同步源
 
 目标：把 joints 滑条从“首次拖动隐式占用串口”改为显式控制面。串口开关决定是否操作

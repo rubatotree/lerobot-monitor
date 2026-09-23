@@ -2593,8 +2593,8 @@ body.dragging-row { cursor: row-resize; user-select: none; }
   flex: 1 1 auto;
   min-height: 110px;
   overflow: hidden;
-  background: #080a11;
-  border: 1px solid #20253a;
+  background: var(--bg);
+  border: 1px solid var(--line);
   border-radius: 4px;
 }
 .preview-stage canvas {
@@ -2605,19 +2605,25 @@ body.dragging-row { cursor: row-resize; user-select: none; }
 }
 .preview-view-buttons {
   position: absolute;
-  top: 4px;
-  right: 4px;
+  bottom: 6px;
+  right: 6px;
   z-index: 2;
   display: flex;
   gap: 2px;
 }
 .preview-view-buttons button {
-  width: 21px;
-  height: 18px;
-  color: #aeb5d2;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 3px;
+  color: var(--text);
   font-family: "IBM Plex Mono", ui-monospace, monospace;
   font-size: 8px;
-  background: rgb(12 14 22 / 0.82);
+  background: color-mix(in srgb, var(--bg) 45%, transparent);
+  border-color: color-mix(in srgb, var(--line) 55%, transparent);
+}
+.preview-view-buttons button:hover,
+.preview-view-buttons button:focus-visible {
+  background: color-mix(in srgb, var(--bg) 90%, transparent);
 }
 .preview-view-buttons button:hover,
 .preview-model-row button:hover,

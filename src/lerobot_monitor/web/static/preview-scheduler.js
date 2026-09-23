@@ -94,13 +94,14 @@ export function createPreviewScheduler({
 }
 
 export function advancePose(display, target, elapsedMs, applyJoint) {
-  // Match the former 0.28 blend at 30 Hz, independent of camera frame rate.
-  const alpha = 1 - Math.exp(-elapsedMs / 101.47);
+  // A 55 ms response stays visibly smooth at 30 Hz while settling in roughly
+  // half a second. Time-based interpolation remains independent of frame rate.
+  const alpha = 1 - Math.exp(-elapsedMs / 55);
   let active = false;
   for (const [name, value] of Object.entries(target)) {
     const previous = display[name];
     const next = Number.isFinite(previous) ? previous + (value - previous) * alpha : value;
-    display[name] = Math.abs(value - next) <= 1e-4 ? value : next;
+    display[name] = Math.abs(value - next) <= 0.01 ? value : next;
     active ||= display[name] !== value;
     if (display[name] !== previous) applyJoint(name, display[name]);
   }

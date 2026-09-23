@@ -76,8 +76,9 @@ test("pose converges exactly, then both views remain idle for five seconds", () 
   const target = { shoulder: 90 };
   const f = fixture((dt) => advancePose(display, target, dt, () => {}));
   f.scheduler.invalidate({ pose: true });
-  f.advance(2500);
+  f.advance(700);
   assert.equal(display.shoulder, 90);
+  assert.ok(f.frames.pose.length <= 18);
   assert.equal(f.queued.size, 0);
   const counts = f.scheduler.debugInfo();
   f.advance(5000);

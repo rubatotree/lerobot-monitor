@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { createPreviewScheduler, advancePose } from "./preview-scheduler.js";
+import { createPreviewScheduler, advancePose } from "./preview-scheduler.js?v=20260923-arm-preview-2";
 import URDFLoader from "./vendor/urdf/URDFLoader.js";
 
 const BASE = (document.documentElement.dataset.base || "/lerobot").replace(/\/$/, "");
@@ -110,8 +110,10 @@ function setAutoBadge(label) {
   const badge = $("preview-auto-badge");
   if (!badge) return;
   const source = $("preview-source")?.value || "auto";
-  badge.hidden = source !== "auto";
-  badge.textContent = source === "auto" ? `AUTO · ${label || "follower"}` : "";
+  const hidden = source !== "auto";
+  const text = hidden ? "" : `AUTO · ${label || "follower"}`;
+  if (badge.hidden !== hidden) badge.hidden = hidden;
+  if (badge.textContent !== text) badge.textContent = text;
 }
 
 function livePose(name) {
@@ -274,14 +276,16 @@ function initViewport() {
   const host = $("preview-stage");
   if (!host) return;
   const renderer = new THREE.WebGLRenderer({
-    antialias: false,
-    alpha: true,
+    antialias: true,
+    alpha: false,
     powerPreference: "low-power",
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   host.appendChild(renderer.domElement);
   const scene = new THREE.Scene();
+  const theme = getComputedStyle(document.documentElement);
+  scene.background = new THREE.Color(theme.getPropertyValue("--bg").trim() || "#0c0e16");
   const camera = new THREE.PerspectiveCamera(42, 1, 0.01, 100);
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = false;
@@ -289,16 +293,14 @@ function initViewport() {
   controls.minDistance = 0.08;
   controls.maxDistance = 12;
   controls.addEventListener("change", () => scheduleFrame({ main: true }));
-  scene.add(new THREE.HemisphereLight(0xe7edff, 0x222637, 2.2));
-  const key = new THREE.DirectionalLight(0xffffff, 2.4);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x707070, 1.5));
+  const key = new THREE.DirectionalLight(0xffffff, 1.5);
   key.position.set(2.5, 4, 3);
   scene.add(key);
-  const rim = new THREE.DirectionalLight(0x7c8cff, 1.1);
-  rim.position.set(-3, 1, -2);
-  scene.add(rim);
-  const grid = new THREE.GridHelper(2, 20, 0x2c3348, 0x1d2232);
+  const gridColor = new THREE.Color(theme.getPropertyValue("--line").trim() || "#2c3148");
+  const grid = new THREE.GridHelper(2, 20, gridColor, gridColor);
   grid.material.transparent = true;
-  grid.material.opacity = 0.45;
+  grid.material.opacity = 0.3;
   scene.add(grid);
   state.renderer = renderer;
   state.scene = scene;
@@ -327,7 +329,7 @@ function initWristRenderer() {
   state.wristCamera = new THREE.PerspectiveCamera(60, 16 / 9, 0.005, 20);
   state.wristRenderer = new THREE.WebGLRenderer({
     canvas,
-    antialias: false,
+    antialias: true,
     alpha: false,
     powerPreference: "low-power",
   });
@@ -342,7 +344,7 @@ function resize() {
   if (!host) return;
   const width = Math.max(1, host.clientWidth);
   const height = Math.max(1, host.clientHeight);
-  const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.25);
+  const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
   if (state.viewportWidth === width && state.viewportHeight === height
       && state.renderer.getPixelRatio() === pixelRatio) return;
   state.viewportWidth = width;
@@ -378,11 +380,11 @@ function applyPose(pose) {
 }
 
 const wristScratch = {
-  box: new THREE.Box3(),
   mount: new THREE.Vector3(),
   target: new THREE.Vector3(),
   forward: new THREE.Vector3(),
-  size: new THREE.Vector3(),
+  up: new THREE.Vector3(),
+  quaternion: new THREE.Quaternion(),
 };
 
 function updateWristCamera() {
@@ -391,22 +393,18 @@ function updateWristCamera() {
   const lookAt = state.robot.links?.[state.model.wrist_camera?.look_at_link];
   if (!mount || !lookAt) return;
   const scratch = wristScratch;
-  scratch.box.setFromObject(mount);
-  if (scratch.box.isEmpty()) {
-    mount.getWorldPosition(scratch.mount);
-    scratch.size.set(0, 0, 0);
-  } else {
-    scratch.box.getCenter(scratch.mount);
-    scratch.box.getSize(scratch.size);
-  }
+  mount.getWorldPosition(scratch.mount);
   lookAt.getWorldPosition(scratch.target);
-  scratch.forward.copy(scratch.mount).sub(scratch.target);
+  scratch.forward.copy(scratch.target).sub(scratch.mount);
   if (scratch.forward.lengthSq() < 1e-10) scratch.forward.set(0, 0, -1);
   scratch.forward.normalize();
-  const standoff = Math.max(0.12, scratch.size.length() * 1.4);
-  state.wristCamera.position.copy(scratch.mount).addScaledVector(scratch.forward, standoff);
-  state.wristCamera.up.set(0, 1, 0);
-  state.wristCamera.lookAt(scratch.target.addScaledVector(scratch.forward, 0.08));
+  // The look-at link is the camera frame at the gripper tip. Its +Z axis
+  // points out of the gripper and +Y supplies roll-stable camera up.
+  lookAt.getWorldQuaternion(scratch.quaternion);
+  scratch.up.set(0, 1, 0).applyQuaternion(scratch.quaternion).normalize();
+  state.wristCamera.position.copy(scratch.target);
+  state.wristCamera.up.copy(scratch.up);
+  state.wristCamera.lookAt(scratch.target.add(scratch.forward));
 }
 
 function syncVisibility() {
@@ -473,9 +471,39 @@ function disposeViewport() {
   if (state.wristRenderer) {
     state.wristRenderer.dispose();
     state.wristRenderer.forceContextLoss?.();
+    // A deliberately lost WebGL context cannot be reused on the next power-on.
+    const canvas = state.wristRenderer.domElement;
+    canvas.replaceWith(canvas.cloneNode(false));
   }
   state.wristRenderer = null;
   state.wristCamera = null;
+}
+
+function prepareModelAppearance(robot, model) {
+  // Only the bundled SO-101 opts into the monitor palette. Imported materials
+  // (including sidedness, textures and transparency) retain their meaning.
+  if (!model.builtin || model.id !== "so101") return;
+  const palette = { "3d_printed": "#aeb8c8", sts3215: "#343b48" };
+  const shared = new Map();
+  const replaced = new Set();
+  function materialFor(original) {
+    const color = palette[original.name];
+    if (!color) return original;
+    if (!shared.has(original.name)) {
+      shared.set(original.name, new THREE.MeshLambertMaterial({
+        name: original.name, color, side: THREE.FrontSide,
+      }));
+    }
+    replaced.add(original);
+    return shared.get(original.name);
+  }
+  robot.traverse((child) => {
+    if (!child.isMesh) return;
+    child.castShadow = child.receiveShadow = false;
+    if (Array.isArray(child.material)) child.material = child.material.map(materialFor);
+    else if (child.material) child.material = materialFor(child.material);
+  });
+  for (const material of replaced) material.dispose();
 }
 
 async function loadModel(modelId) {
@@ -512,6 +540,7 @@ async function loadModel(modelId) {
     disposeObject(state.robot);
   }
   loaded.rotation.x = -Math.PI / 2;
+  prepareModelAppearance(loaded, model);
   state.scene.add(loaded);
   state.robot = loaded;
   state.model = model;
@@ -768,9 +797,13 @@ export const RobotPreview = {
 
   debugInfo() {
     return {
+      mainFrames: 0,
+      wristFrames: 0,
+      poseSteps: 0,
+      pendingFrames: 0,
+      poseActive: false,
       ...state.scheduler?.debugInfo(),
       powered: state.powered,
-      pendingFrames: state.scheduler?.debugInfo().pendingFrames || 0,
       pixelRatio: state.renderer?.getPixelRatio() || 0,
       antialias: state.renderer?.getContext().getContextAttributes()?.antialias ?? false,
       wristAntialias: state.wristRenderer?.getContext().getContextAttributes()?.antialias ?? false,

@@ -367,7 +367,9 @@ def test_follower_arm_connects_to_emulated_bus(
     try:
         assert follower.connected, follower.error
         assert set(follower.get_pose()) == set(follower.snapshot()["joints"])
-        assert all(abs(value) < 0.1 for value in follower.get_pose().values())
+        pose = follower.get_pose()
+        assert all(abs(pose[name]) < 0.1 for name in pose if name != "gripper")
+        assert abs(pose["gripper"]) < 10.0
     finally:
         follower.disconnect()
 

@@ -2855,8 +2855,103 @@ function setTaskButton(id, on, label) {
   el.setAttribute("aria-pressed", String(on));
 }
 
+function setSelectValue(select, value) {
+  if (!select) return;
+  const wanted = String(value || "");
+  select.value = [...select.options].some((option) => option.value === wanted) ? wanted : "";
+}
+
+function modelOptionLabel(model) {
+  return [libraryDisplayName("model", model), model.policy_type, model.source].filter(Boolean).join(" · ");
+}
+
+function populateModelSelect(select, selectedValue = "") {
+  if (!select) return;
+  const current = String(selectedValue || select.value || "");
+  select.innerHTML = "";
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "Choose a Library model";
+  select.appendChild(none);
+  modelsCache.forEach((model) => {
+    const option = document.createElement("option");
+    option.value = String(model.path || "");
+    option.textContent = modelOptionLabel(model);
+    option.disabled = !model.path;
+    select.appendChild(option);
+  });
+  setSelectValue(select, current);
+  if (select.id === "pol-path") {
+    select.dataset.modelId = modelsCache.find((model) => model.path === select.value)?.id || "";
+  } else if (select.id === "dbg-policy") {
+    select.dataset.modelId = modelsCache.find((model) => model.path === select.value)?.id || "";
+    if ($("dbg-path")) $("dbg-path").value = select.value;
+  }
+}
+
+function populateModelSelects() {
+  populateModelSelect($("pol-path"));
+  populateModelSelect($("dbg-policy"));
+}
+
+function parentPath(path) {
+  const text = String(path || "").replace(/[\\/]+$/, "");
+  const cut = Math.max(text.lastIndexOf("\\"), text.lastIndexOf("/"));
+  return cut > 0 ? text.slice(0, cut) : "";
+}
+
+function recordDatasetValue() {
+  const repo = $("rec-repo") ? $("rec-repo").value.trim() : "";
+  const row = datasetsCache.find((item) => (item.repo_id || item.id) === repo);
+  return row ? `dataset:${row.repo_id || row.id}` : "__new__";
+}
+
+function populateRecordDatasetSelect() {
+  const select = $("rec-dataset-select");
+  if (!select) return;
+  const current = select.value || recordDatasetValue();
+  select.innerHTML = "";
+  const fresh = document.createElement("option");
+  fresh.value = "__new__";
+  fresh.textContent = "New dataset";
+  select.appendChild(fresh);
+  if (datasetsCache.length) {
+    const group = document.createElement("optgroup");
+    group.label = "Datasets";
+    datasetsCache.forEach((row) => {
+      const option = document.createElement("option");
+      option.value = `dataset:${row.repo_id || row.id}`;
+      option.textContent = libraryDisplayName("dataset", row);
+      group.appendChild(option);
+    });
+    select.appendChild(group);
+  }
+  setSelectValue(select, current);
+  if (!select.value) select.value = "__new__";
+}
+
+function syncRecordDatasetSelection() {
+  const select = $("rec-dataset-select");
+  if (!select) return;
+  const value = select.value || "__new__";
+  if (value.startsWith("dataset:")) {
+    const id = value.slice("dataset:".length);
+    const row = datasetsCache.find((item) => String(item.repo_id || item.id) === id);
+    if ($("rec-repo")) $("rec-repo").value = id;
+    if ($("rec-root")) {
+      $("rec-root").value = row && row.source !== "hub" && row.path
+        ? parentPath(row.path)
+        : String((meta.recording && meta.recording.root) || meta.recording_root || "");
+    }
+  } else {
+    if ($("rec-repo")) $("rec-repo").value = "";
+    if ($("rec-root")) $("rec-root").value = String((meta.recording && meta.recording.root) || meta.recording_root || "");
+  }
+  updateRecordDestinationUi();
+  persistUi();
+}
+
 function recordFields() {
-  const resume = !!($("chk-rec-resume") && $("chk-rec-resume").checked);
   const actionFps = Number($("rec-action-fps").value) || 15;
   const videoFps = Number($("rec-video-fps").value) || actionFps;
   return {
@@ -2870,12 +2965,10 @@ function recordFields() {
     fps: actionFps,
     format: ($("rec-format") && $("rec-format").value) || "mp4",
     root: ($("rec-root") && $("rec-root").value) || "",
-    resume,
+    resume: false,
     video: !($("chk-rec-video") ) || $("chk-rec-video").checked,
     streaming_encoding: !($("chk-rec-stream-enc")) || $("chk-rec-stream-enc").checked,
     encoder_threads: Number($("rec-enc-threads") && $("rec-enc-threads").value) || 2,
-    video_id: resume && selectedVideoId ? selectedVideoId : undefined,
-    dataset_id: resume && selectedVideoId ? selectedVideoId : undefined,
     merge: true,
   };
 }
@@ -2905,36 +2998,6 @@ function browsedLocalVideoId() {
 }
 
 function updateResumeTargetUi() {
-  const target = $("resume-target");
-  const text = $("resume-target-text");
-  const use = $("btn-rec-use-video");
-  const clear = $("btn-rec-clear-video");
-  const resume = !!($("chk-rec-resume") && $("chk-rec-resume").checked);
-  const browsedId = browsedLocalVideoId();
-  const targetRow = selectedVideoId ? videosCache.find((row) => row.id === selectedVideoId) : null;
-  const exists = !!targetRow;
-  if (text) {
-    const targetActionFps = targetRow && (targetRow.action_fps || targetRow.fps);
-    const targetVideoFps = targetRow && (targetRow.video_fps || targetRow.fps);
-    const targetFormat = targetRow && (targetRow.format || targetRow.video_format);
-    const targetMeta = [
-      targetActionFps ? `${targetActionFps} action Hz` : "",
-      targetVideoFps ? `${targetVideoFps} video Hz` : "",
-      targetFormat || "",
-    ].filter(Boolean).join(" · ");
-    text.textContent = exists
-      ? `Resume target: ${selectedVideoId}${targetMeta ? ` · target ${targetMeta}` : ""}`
-      : (selectedVideoId ? `Resume target unavailable: ${selectedVideoId}` : "Resume target: none");
-  }
-  if (target) {
-    target.classList.toggle("ready", exists);
-    target.classList.toggle("required", resume && !exists);
-  }
-  if (use) {
-    use.disabled = !browsedId || browsedId === selectedVideoId;
-    use.textContent = browsedId ? `Use ${browsedId}` : "Use browsed video";
-  }
-  if (clear) clear.disabled = !selectedVideoId;
   updateRecordDestinationUi();
 }
 function applyRecordFields(p) {
@@ -2950,12 +3013,12 @@ function applyRecordFields(p) {
   if (videoFps != null && $("rec-video-fps")) $("rec-video-fps").value = videoFps;
   if (p.format != null && $("rec-format")) $("rec-format").value = p.format;
   if (p.root != null && $("rec-root")) $("rec-root").value = p.root;
-  if (p.resume != null && $("chk-rec-resume")) $("chk-rec-resume").checked = !!p.resume;
   if (p.video != null && $("chk-rec-video")) $("chk-rec-video").checked = !!p.video;
   if (p.streaming_encoding != null && $("chk-rec-stream-enc")) $("chk-rec-stream-enc").checked = !!p.streaming_encoding;
   if (p.encoder_threads != null && $("rec-enc-threads")) $("rec-enc-threads").value = p.encoder_threads;
-  if (p.resume && p.video_id) selectedVideoId = p.video_id;
-  else if (p.resume && p.dataset_id) selectedVideoId = p.dataset_id;
+  populateRecordDatasetSelect();
+  setSelectValue($("rec-dataset-select"), recordDatasetValue());
+  syncRecordDatasetSelection();
   updateResumeTargetUi();
 }
 function kvPairs(hostId = "roll-kv") {
@@ -3026,6 +3089,8 @@ function applyRolloutFields(p) {
   const policyFps = p.policy_fps ?? p.fps;
   if (policyFps != null && $("pol-fps")) $("pol-fps").value = policyFps;
   if (p.extra != null) setKvPairs(p.extra);
+  populateModelSelects();
+  setSelectValue($("pol-path"), String(p.policy_path || ""));
 }
 
 function serialPresetSpec(role) {
@@ -3327,7 +3392,7 @@ function updateTaskInfo() {
     ...extraFlags(roll.extra),
   ]);
 }
-["rec-task", "rec-repo", "rec-ep", "rec-reset", "rec-num", "rec-action-fps", "rec-video-fps", "rec-format", "rec-root", "chk-rec-resume", "chk-rec-video", "chk-rec-stream-enc", "rec-enc-threads", "pol-path", "pol-task", "pol-dur", "pol-fps", "pol-dev", "arm-port", "leader-port"].forEach((id) => {
+["rec-task", "rec-dataset-select", "rec-repo", "rec-ep", "rec-reset", "rec-num", "rec-action-fps", "rec-video-fps", "rec-format", "rec-root", "chk-rec-video", "chk-rec-stream-enc", "rec-enc-threads", "pol-path", "pol-task", "pol-dur", "pol-fps", "pol-dev", "arm-port", "leader-port"].forEach((id) => {
   const el = $(id);
   if (!el) return;
   el.addEventListener("change", persistUi);
@@ -3346,53 +3411,11 @@ function updateTaskInfo() {
     syncDevicePowerButtons((last && last.robot) || {}, (last && last.leader) || {});
   });
 });
-if ($("pol-path")) {
-  const input = $("pol-path");
-  input.addEventListener("input", () => {
-    openPolicyPicker();
-    renderPolicyPickerMenu();
-  });
-  input.addEventListener("keydown", (event) => {
-    const menu = $("pol-path-menu");
-    const rows = menu ? [...menu.querySelectorAll(".policy-picker-option:not(:disabled)")] : [];
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      if (!menu || menu.classList.contains("hidden")) openPolicyPicker();
-      setPolicyPickerActive(policyPickerActive + 1);
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      if (!menu || menu.classList.contains("hidden")) openPolicyPicker();
-      setPolicyPickerActive(policyPickerActive <= 0 ? rows.length - 1 : policyPickerActive - 1);
-    } else if (event.key === "Enter" && policyPickerActive >= 0 && rows[policyPickerActive]) {
-      event.preventDefault();
-      rows[policyPickerActive].click();
-    } else if (event.key === "Escape") {
-      closePolicyPicker();
-    } else if (event.key === "Tab") {
-      closePolicyPicker();
-    }
+if ($("rec-dataset-select")) {
+  $("rec-dataset-select").addEventListener("change", () => {
+    syncRecordDatasetSelection();
   });
 }
-bind("btn-pol-path-menu", togglePolicyPicker);
-document.addEventListener("pointerdown", (event) => {
-  const picker = event.target && event.target.closest && event.target.closest(".policy-picker");
-  if (!picker) closePolicyPicker();
-});
-window.addEventListener("resize", positionPolicyPickerMenu);
-window.addEventListener("scroll", positionPolicyPickerMenu, true);
-if ($("chk-rec-resume")) $("chk-rec-resume").addEventListener("change", updateResumeTargetUi);
-bind("btn-rec-use-video", () => {
-  const id = browsedLocalVideoId();
-  if (!id) return;
-  selectedVideoId = id;
-  updateResumeTargetUi();
-  persistUi();
-});
-bind("btn-rec-clear-video", () => {
-  selectedVideoId = "";
-  updateResumeTargetUi();
-  persistUi();
-});
 
 function setSelectedPreset(kind, name) {
   if (name) presetSelections[kind] = name;
@@ -4563,6 +4586,7 @@ function renderVideos() {
   const ol = $("vid-list");
   if (!ol) return;
   ol.innerHTML = "";
+  populateRecordDatasetSelect();
   if (!videosCache.length) {
     const state = libraryState.videos;
     const message = state.loading ? "Loading local videos…" : state.error ? `Could not load videos: ${state.error}` : "No local video found";
@@ -4577,12 +4601,14 @@ function renderVideos() {
   rows.forEach((vid) => {
     ol.appendChild(makeLibraryItem("video", vid, () => selectVideo(vid.id), libraryResourceTools("video", vid)));
   });
+  populateRecordDatasetSelect();
 }
 
 function renderDatasets() {
   const ol = $("ds-list");
   if (!ol) return;
   ol.innerHTML = "";
+  populateRecordDatasetSelect();
   if (!datasetsCache.length) {
     const state = libraryState.datasets;
     const message = state.loading ? "Loading datasets…" : state.error ? `Could not load datasets: ${state.error}` : "No dataset found";
@@ -4598,6 +4624,7 @@ function renderDatasets() {
     const id = ds.repo_id || ds.id;
     ol.appendChild(makeLibraryItem("dataset", ds, () => selectHfDataset(ds), libraryResourceTools("dataset", ds)));
   });
+  populateRecordDatasetSelect();
 }
 
 function snapshotSourceLabel(snapshot) {
@@ -4977,6 +5004,8 @@ function applyDebugFields(preset) {
   if (preset.camera_map != null) applyDebugCameraMap(preset.camera_map);
   const select = $("dbg-policy");
   if (select && preset.policy_path) select.value = preset.policy_path;
+  populateModelSelects();
+  setSelectValue($("dbg-policy"), String(preset.policy_path || ""));
   renderDebugPanel();
 }
 
@@ -6855,10 +6884,7 @@ function renderModels() {
   const ol = $("md-list");
   if (!ol) return;
   ol.innerHTML = "";
-  renderPolicyPickerMenu();
-  const select = $("dbg-policy");
-  const selected = select ? select.value : "";
-  if (select) select.innerHTML = `<option value="">—</option>`;
+  populateModelSelects();
   if (!modelsCache.length) {
     const state = libraryState.models;
     const message = state.loading ? "Loading policies…" : state.error ? `Could not load policies: ${state.error}` : "No local policy found";
@@ -6871,15 +6897,6 @@ function renderModels() {
     ol.innerHTML = `<li class="library-message">${libraryFilterMessage("model")}</li>`;
   }
   modelsCache.forEach((m) => {
-    if (select) {
-      const source = m.source === "hub" ? "hf cache" : m.source || "local";
-      const parts = [m.name, m.policy_type, source].filter(Boolean);
-      const option = document.createElement("option");
-      option.value = m.path;
-      option.textContent = parts.join("  ·  ");
-      option.disabled = !m.path;
-      select.appendChild(option);
-    }
     if (!visibleIds.has(m.id)) return;
     const tools = libraryResourceTools("model", m);
     const li = makeLibraryItem("model", m, () => {
@@ -6897,7 +6914,7 @@ function renderModels() {
     }, tools);
     ol.appendChild(li);
   });
-  if (select && selected) select.value = selected;
+  populateModelSelects();
 }
 
 let policyPickerActive = -1;

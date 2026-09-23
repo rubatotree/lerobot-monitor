@@ -20,6 +20,9 @@
   使用统一列表、编辑、删除、下载与上传语义。
 - Videos 启动时只保留第一个 episode，后续录制结束也会自动裁剪；旧 episode 缺失的
   `duration_s` 会从 `joints.csv` 最后时间戳恢复，并回写 episode/root meta。
+- Record / Rollout / Debug 的 Library 依赖改为下拉选择：Record 只列 Datasets，
+  Rollout 与 Debug 只列 Models；路径保存在隐藏字段中，不再要求手动输入。Record 和
+  Rollout 标题移除，Teleop 标题改为与 Task 一致的标签样式。
 - Episode 查看器对所有来源提供编辑、删除和拖动排序；Video 使用原有物理 episode
   操作，Dataset 使用持久化 episode view override 调整顺序和隐藏项。
 - 移除 Library 15 秒自动轮询，保留初始加载、操作后刷新和手动 Scan/Refresh。

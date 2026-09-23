@@ -2117,6 +2117,7 @@ select {
   min-height: 32px;
   color: inherit;
 }
+.library-select { width: 100%; min-width: 0; }
 #arm-port, #leader-port { width: 100%; min-width: 0; }
 .task-info {
   margin-top: 8px;

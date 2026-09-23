@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
-  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260923-library-meta-10"/>
+  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260923-library-selects-2"/>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -323,13 +323,15 @@
       <section class="panel side-tab-panel" id="record-panel" data-panel="record" data-tab-panel="record" role="tabpanel" aria-labelledby="side-tab-record" hidden>
         <div class="panel-body">
             <div class="task-block">
-              <h3>Record</h3>
+              <label>Dataset
+                <select id="rec-dataset-select" class="library-select">
+                  <option value="__new__">New dataset</option>
+                </select>
+              </label>
               <label>Task
                 <input id="rec-task" type="text" placeholder="classify the blocks"/>
               </label>
-              <label>Repo id
-                <input id="rec-repo" type="text" placeholder="user/dataset"/>
-              </label>
+              <input id="rec-repo" type="hidden"/>
               <label>Episodes
                 <input id="rec-num" type="number" value="50" min="1" step="1"/>
               </label>
@@ -355,22 +357,9 @@
                     <option value="avi">avi</option>
                   </select>
               </label>
-              <label>Save path
-                <input id="rec-root" type="text" placeholder="data/datasets"/>
-              </label>
+              <input id="rec-root" type="hidden"/>
               <div id="record-destination" class="record-destination" role="status" aria-live="polite">
                 Destination: data/datasets/&lt;session&gt;
-              </div>
-              <label class="check">
-                <input type="checkbox" id="chk-rec-resume"/>
-                Continue recording
-              </label>
-              <div class="resume-target" id="resume-target" role="status" aria-live="polite">
-                <span id="resume-target-text">Resume target: none</span>
-                <div class="row-actions">
-                  <button type="button" id="btn-rec-use-video" class="ghost" disabled>Use browsed video</button>
-                  <button type="button" id="btn-rec-clear-video" class="ghost" disabled>Clear</button>
-                </div>
               </div>
               <label class="check">
                 <input type="checkbox" id="chk-rec-video" checked/>
@@ -392,7 +381,7 @@
               </details>
             </div>
             <div class="task-block">
-              <h3>Teleop</h3>
+              <label>Teleop</label>
               <details class="task-info">
                 <summary>Command preview</summary>
                 <pre id="info-teleop"></pre>
@@ -404,15 +393,8 @@
       <section class="panel side-tab-panel" id="rollout-panel" data-panel="rollout" data-tab-panel="rollout" role="tabpanel" aria-labelledby="side-tab-rollout" hidden>
         <div class="panel-body">
             <div class="task-block">
-              <h3>Rollout</h3>
-              <label>Policy path
-                <span class="policy-picker">
-                  <input id="pol-path" type="text" autocomplete="off" aria-autocomplete="list" aria-expanded="false" aria-controls="pol-path-menu" placeholder="rubatotree/so101_classify_the_blocks_act_512"/>
-                  <button type="button" id="btn-pol-path-menu" class="policy-picker-toggle" aria-label="Choose cached policy" title="Choose cached policy">
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-                  </button>
-                  <div id="pol-path-menu" class="policy-picker-menu hidden" role="listbox" aria-label="Cached policies"></div>
-                </span>
+              <label>Model
+                <select id="pol-path" class="library-select" aria-label="Rollout model"></select>
               </label>
               <label>Instruction
                 <input id="pol-task" type="text" placeholder="Match each loose plastic block to the examples in the organizer and put it in the matching compartment."/>
@@ -475,12 +457,10 @@
       <section class="panel side-tab-panel" id="debug-panel" data-panel="debug" data-tab-panel="debug" role="tabpanel" aria-labelledby="side-tab-debug" hidden>
         <div class="panel-body">
         <div class="task-block">
-          <label>Policy
+          <label>Model
             <select id="dbg-policy"></select>
           </label>
-          <label>Path
-            <input id="dbg-path" type="text" placeholder="rubatotree/so101_classify_the_blocks_act_512"/>
-          </label>
+          <input id="dbg-path" type="hidden"/>
           <label>Instruction
             <input id="dbg-task" type="text" placeholder="pick up the block"/>
           </label>
@@ -563,6 +543,6 @@
     </div>
   </div>
 
-  <script src="/lerobot/static/app.js?v=20260923-library-meta-10"></script>
+  <script src="/lerobot/static/app.js?v=20260923-library-selects-2"></script>
 </body>
 </html>

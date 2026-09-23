@@ -69,6 +69,8 @@ metadata、description、来源编辑、同步与删除入口，并移除不必�
 - Videos 已改为单 recording 行并直进主预览，Datasets 保留 Episode 列；预览栏
   Snapshot EDIT 与 Debug 编辑器移除。Models/Datasets 支持编辑来源、上传覆盖云端、
   下载覆盖本地和删除；Episode 支持编辑、删除与排序。
+- Record / Rollout / Debug 统一从 Library 下拉选择 Datasets 或 Models，不再手填
+  repo_id/path；Record 与 Rollout 标题移除，Teleop 标题使用标签字体。
 - Library 15 秒轮询已删除。非仿真测试 `172 passed`；完整测试 `201 passed, 2 failed`，
   失败均为既有模拟总线初始位姿/动作落点断言。JS/Python 语法与 diff 检查通过，浏览器检查
   覆盖主要交互且无 console error。

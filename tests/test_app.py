@@ -974,6 +974,8 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="btn-ds-download"',
         'id="btn-ds-empty"',
         'id="library-modal"',
+        'id="rec-dataset-select"',
+        'class="library-select" aria-label="Rollout model"',
         'id="viz-exit"',
         'id="side-tabs"',
         'data-tab="joints"',
@@ -984,7 +986,6 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="dbg-cam-map"',
         'id="dbg-eval"',
         'id="action-legend"',
-        'id="pol-path-menu"',
         'id="preset-toolbar"',
         'id="preset-select"',
         'id="btn-preset-load"',
@@ -1012,6 +1013,10 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         page.text,
         re.DOTALL,
     )
+    assert "<h3>Record</h3>" not in page.text
+    assert "<h3>Rollout</h3>" not in page.text
+    assert "<label>Teleop</label>" in page.text
+    assert page.text.find('id="rec-dataset-select"') < page.text.find('id="rec-task"')
 
 
 def test_model_registry_api_round_trip(tmp_path: Path, monkeypatch) -> None:
@@ -1125,6 +1130,7 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert ".library-modal" in css.text
     assert ".library-modal-body textarea" in css.text
     assert ".library-meta-menu" in css.text
+    assert ".library-select" in css.text
     assert ".lib-meta" in css.text
     assert ".lib-description" in css.text
     assert ".library-menu" in css.text
@@ -1162,6 +1168,9 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert "function renderMetadataMenu" in script.text
     assert "function duplicateLibraryResource" in script.text
     assert "function clearLibrarySelection" in script.text
+    assert "function populateRecordDatasetSelect" in script.text
+    assert "function syncRecordDatasetSelection" in script.text
+    assert "function populateModelSelects" in script.text
     assert "function beginLibraryRename" not in script.text
     assert "lib-rename" not in script.text
     assert 'id="btn-lib-meta-settings"' in page.text

@@ -28,6 +28,7 @@ from .hub import RuntimeHub
 from .library import library_metadata
 from .metrics import evaluate_action_chunk
 from .model_hub import ModelHubError, search_hf_models
+from .robot_models import RobotModelError, search_hf_robot_models
 from .preview import (
     find_lerobot_video,
     lerobot_episode_count,
@@ -208,6 +209,21 @@ class ModelSaveBody(BaseModel):
     remote: str | None = None
     path: str | None = None
     revision: str | None = None
+
+
+class RobotModelInstallBody(BaseModel):
+    remote: str
+    name: str = ""
+    revision: str = ""
+    download: bool = True
+
+
+class RobotModelActiveBody(BaseModel):
+    id: str
+
+
+class VirtualFollowerBody(BaseModel):
+    model_id: str = ""
     note: str | None = None
 
 
@@ -431,6 +447,15 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.post("/api/robot/disconnect")
     async def robot_disconnect() -> dict[str, Any]:
         return await _submit("disconnect_robot")
+
+    @router.post("/api/virtual-follower/connect")
+    async def virtual_follower_connect(body: VirtualFollowerBody = VirtualFollowerBody()) -> dict[str, Any]:
+        payload = {"model_id": body.model_id} if body.model_id else {}
+        return await _submit("virtual_connect", payload)
+
+    @router.post("/api/virtual-follower/disconnect")
+    async def virtual_follower_disconnect() -> dict[str, Any]:
+        return await _submit("virtual_disconnect")
 
     @router.post("/api/leader/connect")
     async def leader_connect(body: ConnectBody = ConnectBody()) -> dict[str, Any]:
@@ -1257,6 +1282,94 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(404, f"unknown model '{model_id}'") from exc
         return {"ok": True}
+
+    @router.get("/api/robot-models")
+    async def list_robot_models() -> list[dict[str, Any]]:
+        return await asyncio.to_thread(hub.robot_model_registry.list)
+
+    @router.get("/api/robot-models/search")
+    async def search_robot_models(q: str, limit: int = 20) -> list[dict[str, Any]]:
+        try:
+            return await asyncio.to_thread(
+                search_hf_robot_models,
+                q,
+                limit=max(1, min(int(limit), 50)),
+            )
+        except RobotModelError as exc:
+            raise HTTPException(502, str(exc)) from exc
+
+    @router.post("/api/robot-models")
+    async def install_robot_model(body: RobotModelInstallBody) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                hub.robot_model_registry.register,
+                remote=body.remote,
+                name=body.name,
+                revision=body.revision,
+                download=body.download,
+            )
+        except RobotModelError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.post("/api/robot-models/active")
+    async def activate_robot_model(body: RobotModelActiveBody) -> dict[str, Any]:
+        try:
+            row = await asyncio.to_thread(hub.robot_model_registry.activate, body.id)
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown robot model '{body.id}'") from exc
+        except RobotModelError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        robot_types = [str(value) for value in row.get("robot_types") or []]
+        await _submit(
+            "set_virtual_model",
+            {
+                "model_id": row["id"],
+                "robot_type": robot_types[0] if robot_types else "",
+            },
+        )
+        return row
+
+    @router.post("/api/robot-models/{model_id}/update")
+    async def update_robot_model(model_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(hub.robot_model_registry.update, model_id)
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown robot model '{model_id}'") from exc
+        except RobotModelError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.delete("/api/robot-models/{model_id}")
+    async def delete_robot_model(model_id: str) -> dict[str, Any]:
+        try:
+            await asyncio.to_thread(hub.robot_model_registry.delete, model_id)
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown robot model '{model_id}'") from exc
+        except RobotModelError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"ok": True}
+
+    @router.get("/api/robot-models/{model_id}/manifest")
+    async def robot_model_manifest(model_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(hub.robot_model_registry.get, model_id)
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown robot model '{model_id}'") from exc
+
+    @router.get("/api/robot-models/{model_id}/files/{relative_path:path}")
+    async def robot_model_file(model_id: str, relative_path: str) -> FileResponse:
+        try:
+            path = await asyncio.to_thread(
+                hub.robot_model_registry.resolve_file,
+                model_id,
+                relative_path,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown robot model '{model_id}'") from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(404, "robot-model file not found") from exc
+        except RobotModelError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return FileResponse(path)
 
     @router.post("/api/debug/infer")
     async def debug_infer(body: DebugInferBody) -> dict[str, Any]:

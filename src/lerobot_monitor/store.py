@@ -32,6 +32,8 @@ class JsonStore:
             "models": [],
             "datasets": [],
             "episode_views": {kind: {} for kind in EPISODE_KINDS},
+            "robot_models": [],
+            "active_robot_model": "",
         }
         self._load()
         self._ensure_default_poses()
@@ -76,6 +78,12 @@ class JsonStore:
         datasets = raw.get("datasets")
         if isinstance(datasets, list):
             self._data["datasets"] = [dict(entry) for entry in datasets if isinstance(entry, dict)]
+        robot_models = raw.get("robot_models")
+        if isinstance(robot_models, list):
+            self._data["robot_models"] = [
+                dict(entry) for entry in robot_models if isinstance(entry, dict)
+            ]
+        self._data["active_robot_model"] = str(raw.get("active_robot_model") or "")
         episode_views = raw.get("episode_views")
         if isinstance(episode_views, dict):
             for kind in EPISODE_KINDS:
@@ -393,6 +401,56 @@ class JsonStore:
                 entry for entry in self._data["models"] if str(entry.get("id") or "") != key
             ]
             self._write()
+
+    def robot_models(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(entry) for entry in self._data["robot_models"]]
+
+    def robot_model(self, model_id: str) -> dict[str, Any] | None:
+        key = str(model_id)
+        with self._lock:
+            for entry in self._data["robot_models"]:
+                if str(entry.get("id") or "") == key:
+                    return dict(entry)
+        return None
+
+    def put_robot_model(self, entry: dict[str, Any]) -> dict[str, Any]:
+        key = str(entry.get("id") or "").strip()
+        if not key:
+            raise ValueError("robot model id is empty")
+        payload = dict(entry)
+        payload["id"] = key
+        with self._lock:
+            for index, saved in enumerate(self._data["robot_models"]):
+                if str(saved.get("id") or "") == key:
+                    self._data["robot_models"][index] = payload
+                    break
+            else:
+                self._data["robot_models"].append(payload)
+            self._write()
+        return dict(payload)
+
+    def delete_robot_model(self, model_id: str) -> None:
+        key = str(model_id)
+        with self._lock:
+            self._data["robot_models"] = [
+                entry
+                for entry in self._data["robot_models"]
+                if str(entry.get("id") or "") != key
+            ]
+            if str(self._data.get("active_robot_model") or "") == key:
+                self._data["active_robot_model"] = ""
+            self._write()
+
+    def active_robot_model(self) -> str:
+        with self._lock:
+            return str(self._data.get("active_robot_model") or "")
+
+    def set_active_robot_model(self, model_id: str) -> str:
+        with self._lock:
+            self._data["active_robot_model"] = str(model_id or "")
+            self._write()
+            return str(self._data["active_robot_model"])
 
     def datasets(self) -> list[dict[str, Any]]:
         """User-registered datasets; scan results stay separate."""

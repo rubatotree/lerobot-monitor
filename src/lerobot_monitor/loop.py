@@ -33,6 +33,7 @@ from .policy import (
 from .robot import FollowerArm
 from .store import JsonStore
 from .types import JOINT_ORDER, RELAX_POSE, lerp_pose, merge_partial
+from .virtual_follower import VIRTUAL_PORT
 
 logger = logging.getLogger(__name__)
 _LOG_SKIP_PREFIXES = ("uvicorn.access", "lerobot_monitor")
@@ -233,6 +234,8 @@ class ControlLoop:
         self._hardware_apply_force = threading.Event()
         self._estop = threading.Event()
         self._ui_log_handler: logging.Handler | None = None
+        self._virtual_power_enabled = bool(config.virtual_follower.enabled)
+        self._virtual_model_id = str(config.virtual_follower.model_id or "so101")
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -947,6 +950,12 @@ class ControlLoop:
     def _run(self) -> None:
         if self.config.robot.auto_connect:
             self._connect_follower()
+        if (
+            not self.follower.connected
+            and self._virtual_power_enabled
+            and self.config.virtual_follower.auto_connect
+        ):
+            self._connect_virtual_follower()
         period = 1.0 / max(1.0, self.config.control.fps)
         fps_n = 0
         fps_t = time.perf_counter()
@@ -992,6 +1001,34 @@ class ControlLoop:
             self.mode = "offline"
             self.log("error", f"follower connect failed: {exc}")
 
+    def _connect_virtual_follower(self) -> None:
+        if not self._virtual_power_enabled:
+            return
+        if self.follower.connected and not self._follower_is_virtual():
+            return
+        try:
+            self.follower.connect_virtual(
+                model_id=self._virtual_model_id,
+                robot_type=self.config.robot.type,
+            )
+            self._clear_debug_lease()
+            pose = self.follower.get_pose()
+            self.joints = dict(pose)
+            if not self.latched:
+                self.latched = dict(pose)
+            self.mode = "idle"
+            self.last_error = None
+            self._touch_bus()
+            self.log("info", f"virtual follower online ({self._virtual_model_id})")
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = str(exc)
+            self.follower.error = str(exc)
+            self.mode = "offline"
+            self.log("error", f"virtual follower connect failed: {exc}")
+
+    def _follower_is_virtual(self) -> bool:
+        return self.follower.is_virtual is True
+
     def _require_follower_connected(self, action: str) -> None:
         if not self.follower.connected:
             error = f"{action} requires a connected follower arm; use Connect arm first"
@@ -1016,6 +1053,13 @@ class ControlLoop:
         self.mode = "estop" if reason == "estop" or self._estop.is_set() else "offline"
         self._pending_release = None
         self.log("info", f"released follower serial ({reason})")
+        if (
+            reason not in {"estop", "force_disconnect"}
+            and self._virtual_power_enabled
+            and self.config.virtual_follower.auto_connect
+            and not self._estop.is_set()
+        ):
+            self._connect_virtual_follower()
         if self._pending_release_reply is not None:
             self._pending_release_reply.put({"ok": True})
             self._pending_release_reply = None
@@ -1121,8 +1165,14 @@ class ControlLoop:
             self._reply(cmd, ok=True, released=released)
         elif kind == "connect_robot":
             self._require_no_debug_lease("connect follower")
+            requested_port = str(p.get("port") or "")
+            if requested_port == VIRTUAL_PORT:
+                self._virtual_power_enabled = True
+                self._connect_virtual_follower()
+                self._reply(cmd, ok=self.follower.connected, error=self.follower.error)
+                return
             if p.get("port"):
-                self.follower.config.port = str(p["port"])
+                self.follower.config.port = requested_port
             if p.get("id"):
                 self.follower.config.id = str(p["id"])
             if self.follower.connected:
@@ -1134,6 +1184,11 @@ class ControlLoop:
         elif kind == "disconnect_robot":
             self._clear_debug_lease()
             self._close_writer()
+            if self._follower_is_virtual():
+                self._virtual_power_enabled = False
+                self._release_follower("virtual_disconnect")
+                self._reply(cmd, ok=True)
+                return
             if self.follower.connected:
                 if self._pending_release:
                     self._reply(cmd, ok=True, pending=True)
@@ -1144,6 +1199,32 @@ class ControlLoop:
             else:
                 self.mode = "offline"
                 self._reply(cmd, ok=True)
+        elif kind == "virtual_connect":
+            self._require_no_debug_lease("connect virtual follower")
+            if p.get("model_id"):
+                self._virtual_model_id = str(p["model_id"])
+            self._virtual_power_enabled = True
+            if self.follower.connected and not self._follower_is_virtual():
+                self.follower.set_virtual_model(self._virtual_model_id, self.config.robot.type)
+            else:
+                self._connect_virtual_follower()
+            self._reply(cmd, ok=self.follower.connected, error=self.follower.error)
+        elif kind == "virtual_disconnect":
+            self._clear_debug_lease()
+            self._close_writer()
+            self._virtual_power_enabled = False
+            if self._follower_is_virtual():
+                self._release_follower("virtual_disconnect")
+            else:
+                self.mode = "idle" if self.follower.connected else "offline"
+            self._reply(cmd, ok=True)
+        elif kind == "set_virtual_model":
+            model_id = str(p.get("model_id") or "").strip()
+            if not model_id:
+                raise ValueError("model_id is empty")
+            self._virtual_model_id = model_id
+            self.follower.set_virtual_model(model_id, str(p.get("robot_type") or "") or None)
+            self._reply(cmd, ok=True, model_id=model_id)
         elif kind == "connect_leader":
             if p.get("port"):
                 self.leader.config.port = str(p["port"])
@@ -1345,6 +1426,8 @@ class ControlLoop:
             self._require_no_debug_lease("resume")
             self._clear_live_control()
             self._estop.clear()
+            if not self.follower.connected and self._virtual_power_enabled:
+                self._connect_virtual_follower()
             self._require_follower_connected("resume torque")
             self.follower.enable_torque()
             pose = self.follower.get_pose()

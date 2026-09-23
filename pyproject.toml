@@ -29,7 +29,7 @@ lerobot-monitor = "lerobot_monitor.__main__:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-lerobot_monitor = ["web/static/*"]
+lerobot_monitor = ["web/static/**/*", "robot_models/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

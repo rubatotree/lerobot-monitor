@@ -15,6 +15,11 @@ robot:
   auto_connect: false
   disable_torque_on_disconnect: true
 
+virtual_follower:
+  enabled: true
+  auto_connect: true
+  model_id: so101
+
 leader:
   type: so101_leader
   port: COM5
@@ -53,6 +58,11 @@ library:
   models_roots:
     - data/models
     - ../outputs
+
+robot_models:
+  root: data/robot_models
+  max_file_mb: 128
+  max_bundle_mb: 512
 
 rollout:
   device: cuda

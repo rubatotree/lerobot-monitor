@@ -25,6 +25,14 @@ class RobotConfig(BaseModel):
     calibrate: bool = False
 
 
+class VirtualFollowerConfig(BaseModel):
+    """Defaults for the in-process preview arm used when hardware is absent."""
+
+    enabled: bool = True
+    auto_connect: bool = True
+    model_id: str = "so101"
+
+
 class LeaderConfig(BaseModel):
     type: str = "so101_leader"
     port: str = "COM5"
@@ -91,6 +99,12 @@ class LibraryConfig(BaseModel):
     models_roots: list[Path] = Field(default_factory=lambda: [Path("data/models"), Path("../outputs")])
 
 
+class RobotModelsConfig(BaseModel):
+    root: Path = Path("data/robot_models")
+    max_file_mb: int = 128
+    max_bundle_mb: int = 512
+
+
 class RolloutConfig(BaseModel):
     device: str = "cuda"
     default_duration_s: float = 60.0
@@ -102,6 +116,7 @@ class MonitorConfig(BaseModel):
     store_path: Path = Path("data/monitor_store.json")
     server: ServerConfig = Field(default_factory=ServerConfig)
     robot: RobotConfig = Field(default_factory=RobotConfig)
+    virtual_follower: VirtualFollowerConfig = Field(default_factory=VirtualFollowerConfig)
     leader: LeaderConfig = Field(default_factory=LeaderConfig)
     cameras: CamerasConfig = Field(default_factory=CamerasConfig)
 
@@ -116,6 +131,7 @@ class MonitorConfig(BaseModel):
     control: ControlConfig = Field(default_factory=ControlConfig)
     recording: RecordingConfig = Field(default_factory=RecordingConfig)
     library: LibraryConfig = Field(default_factory=LibraryConfig)
+    robot_models: RobotModelsConfig = Field(default_factory=RobotModelsConfig)
     rollout: RolloutConfig = Field(default_factory=RolloutConfig)
 
     def videos_root(self) -> Path:

@@ -47,7 +47,8 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert res.status_code == 200
         body = res.json()
         assert "mode" in body
-        assert body["robot"]["connected"] is False
+        assert body["robot"]["connected"] is True
+        assert body["robot"]["virtual"] is True
         assert body["leader_joints"] == {}
         meta = client.get("/lerobot/api/meta")
         assert meta.status_code == 200
@@ -73,6 +74,9 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert html.count(b"Command preview") == 4
         assert b"<summary>Info</summary>" not in html
         assert b"arm-port" in html
+        assert b'id="arm-preview"' in html
+        assert b'id="preview-source"' in html
+        assert b'id="split-preview"' in html
         assert b"info-roll" in html
         assert b"btn-hdr-scan" in html
         assert b"btn-hdr-stop" in html
@@ -126,6 +130,14 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         models = client.get("/lerobot/api/models")
         assert models.status_code == 200
         assert isinstance(models.json(), list)
+        robot_models = client.get("/lerobot/api/robot-models")
+        assert robot_models.status_code == 200
+        assert robot_models.json()[0]["id"] == "so101"
+        assert client.get("/lerobot/api/robot-models/so101/manifest").json()["urdf"] == "so101.urdf"
+        assert client.get("/lerobot/api/robot-models/so101/files/so101.urdf").status_code == 200
+        assert client.post("/lerobot/api/robot-models/active", json={"id": "so101"}).status_code == 200
+        assert client.post("/lerobot/api/virtual-follower/disconnect").status_code == 200
+        assert client.post("/lerobot/api/virtual-follower/connect", json={"model_id": "so101"}).status_code == 200
         assert b"btn-teleop-on" not in html
         assert b"btn-rec-on" not in html
         assert b"btn-roll-on" not in html

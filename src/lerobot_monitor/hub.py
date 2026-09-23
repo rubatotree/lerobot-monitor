@@ -15,6 +15,7 @@ from .library import VideoLibrary
 from .loop import ControlLoop
 from .model_hub import ModelRegistry
 from .robot import FollowerArm
+from .robot_models import RobotModelRegistry
 from .runtime import format_runtime, probe_runtime
 from .session import list_sessions
 from .snapshots import SnapshotLibrary
@@ -34,6 +35,15 @@ class RuntimeHub:
             self.store,
             [Path(p) for p in config.library.models_roots],
         )
+        self.robot_model_registry = RobotModelRegistry(
+            self.store,
+            Path(config.robot_models.root),
+            max_file_mb=config.robot_models.max_file_mb,
+            max_bundle_mb=config.robot_models.max_bundle_mb,
+        )
+        active_robot_model = self.robot_model_registry.active()
+        if active_robot_model:
+            self.config.virtual_follower.model_id = active_robot_model
         dataset_roots = list(config.library.dataset_roots)
         if config.library.datasets_root:
             dataset_roots.append(Path(config.library.datasets_root))
@@ -123,6 +133,12 @@ class RuntimeHub:
                 "port": self.config.robot.port,
                 "id": self.config.robot.id,
                 "use_degrees": self.config.robot.use_degrees,
+            },
+            "virtual_follower": {
+                "enabled": self.config.virtual_follower.enabled,
+                "auto_connect": self.config.virtual_follower.auto_connect,
+                "model_id": self.robot_model_registry.active(),
+                "port": "virtual://preview",
             },
             "leader": {
                 "type": self.config.leader.type,

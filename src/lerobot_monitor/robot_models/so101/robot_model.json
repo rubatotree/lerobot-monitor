@@ -1,0 +1,32 @@
+{
+  "schema": "lerobot.monitor.robot_model/v1",
+  "id": "so101",
+  "name": "SO-101 / SO-100",
+  "robot_types": [
+    "so101_follower",
+    "so100_follower"
+  ],
+  "urdf": "so101.urdf",
+  "packages": {},
+  "joint_map": {
+    "shoulder_pan": "shoulder_pan",
+    "shoulder_lift": "shoulder_lift",
+    "elbow_flex": "elbow_flex",
+    "wrist_flex": "wrist_flex",
+    "wrist_roll": "wrist_roll",
+    "gripper": "gripper"
+  },
+  "wrist_camera": {
+    "link": "gripper_link",
+    "look_at_link": "gripper_frame_link",
+    "fov": 60
+  },
+  "default_pose": {
+    "shoulder_pan": -4.0,
+    "shoulder_lift": -103.0,
+    "elbow_flex": 97.0,
+    "wrist_flex": 78.0,
+    "wrist_roll": -65.0,
+    "gripper": 0.0
+  }
+}

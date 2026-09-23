@@ -9,7 +9,15 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
   <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260923-episode-details-2"/>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script src="/lerobot/static/vendor/chart/chart.umd.min.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/lerobot/static/vendor/three/three.module.js",
+        "three/examples/jsm/": "/lerobot/static/vendor/three/examples/jsm/"
+      }
+    }
+  </script>
 </head>
 <body>
   <header class="topbar">
@@ -185,6 +193,12 @@
     </aside>
     <div id="split-ep" class="split col hidden" role="separator" aria-orientation="vertical"></div>
     <section id="cameras" aria-label="cameras">
+      <div id="preview-wrist" class="preview-wrist" data-corner="bottom-right">
+        <canvas id="preview-wrist-canvas" width="320" height="180" aria-label="Virtual wrist camera"></canvas>
+        <button type="button" id="preview-wrist-corner" class="preview-wrist-corner" title="Move wrist camera" aria-label="Move wrist camera">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8h8v8H8z"/><path d="M5 9V5h4M15 5h4v4M19 15v4h-4M9 19H5v-4"/></svg>
+        </button>
+      </div>
       <div id="camera-empty" class="camera-empty" role="status">
         <strong>No camera in the main view</strong>
         <span>Scan for devices, then enable a camera and its Main view option under Hardware.</span>
@@ -495,6 +509,50 @@
 
     <div id="split-h" class="split row" role="separator" aria-orientation="horizontal"></div>
     <section id="bottom">
+      <aside id="arm-preview" class="panel arm-preview" aria-label="Arm preview">
+        <div class="preview-head">
+          <div class="preview-title">
+            <h2>Arm preview</h2>
+            <span id="preview-auto-badge" class="preview-auto-badge" hidden></span>
+          </div>
+          <button type="button" id="preview-power" class="preview-power" aria-pressed="false" title="Turn virtual arm on">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9"/><path d="M6.3 6.3a8 8 0 1 0 11.4 0"/></svg>
+          </button>
+        </div>
+        <div class="preview-toolbar">
+          <select id="preview-model" aria-label="Robot model"></select>
+          <select id="preview-source" aria-label="Preview action source">
+            <option value="auto">Auto</option>
+            <option value="joints">Joints</option>
+            <option value="joint_state">Joint state</option>
+            <option value="commanded_action">Commanded</option>
+            <option value="prediction">Prediction</option>
+          </select>
+          <button type="button" id="preview-wrist-toggle" class="preview-icon" aria-pressed="false" title="Toggle virtual wrist camera">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13" r="3"/></svg>
+          </button>
+        </div>
+        <div id="preview-stage" class="preview-stage">
+          <div class="preview-view-buttons" role="group" aria-label="Preview views">
+            <button type="button" id="preview-view-iso" title="Isometric view">ISO</button>
+            <button type="button" id="preview-view-front" title="Front view">F</button>
+            <button type="button" id="preview-view-side" title="Side view">S</button>
+            <button type="button" id="preview-view-top" title="Top view">T</button>
+            <button type="button" id="preview-view-reset" title="Reset focus">R</button>
+          </div>
+        </div>
+        <details id="preview-model-tools" class="preview-model-tools">
+          <summary>Model</summary>
+          <div class="preview-model-row">
+            <input id="preview-model-source" type="text" placeholder="org/repo or local path" aria-label="Robot model source"/>
+            <button type="button" id="preview-model-install" title="Install robot model">+</button>
+            <button type="button" id="preview-model-update" title="Update robot model">↻</button>
+            <button type="button" id="preview-model-delete" title="Delete robot model">−</button>
+          </div>
+          <p id="preview-model-status" class="preview-model-status" role="status"></p>
+        </details>
+      </aside>
+      <div id="split-preview" class="split col" role="separator" aria-orientation="vertical" aria-label="Resize arm preview" aria-valuemin="200" aria-valuemax="480" aria-valuenow="280" tabindex="0"></div>
       <aside id="action-legend" class="chart-legend bottom-legend" aria-label="Joint chart legend"></aside>
       <div class="chart-wrap panel" data-panel="chart-state">
         <div class="panel-heading">
@@ -544,5 +602,6 @@
   </div>
 
   <script src="/lerobot/static/app.js?v=20260923-episode-details-2"></script>
+  <script type="module" src="/lerobot/static/robot-preview.js"></script>
 </body>
 </html>

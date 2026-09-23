@@ -1,5 +1,22 @@
 # Dev log
 
+## 2026-09-23（3D 虚拟从臂预览）
+
+- 新增 `VirtualFollowerArm` 与 `virtual://preview`：无硬件时默认自动连接，真实从臂
+  显式连接时优先接管；关闭 Arm preview 会停止渲染、释放 WebGL context 并断开虚拟
+  follower。E-STOP 和 force disconnect 不自动恢复虚拟连接。
+- 新增 `RobotModelRegistry` 与 `robot_model.json` 清单。内置 SO-101 URDF/STL 资产，
+  支持本地目录和 Hugging Face 仓库安装；REST 覆盖列表、搜索、安装、更新、删除、
+  激活、manifest 与安全文件服务，限制路径穿越、符号链接和包体积。
+- 新增 `robot-preview.js`：本地 Three.js/URDFLoader 场景、OrbitControls、视图预设、
+  双击聚焦、动作来源解析、Auto 关注跟随和虚拟腕部相机。`app.js` 只推送状态、replay
+  时间与 hover 上下文，预览模块自行处理插值、回退和 GPU 生命周期。
+- 底部布局新增可拖动宽度分隔条；宽度支持键盘调整、双击复位和 localStorage 持久化。
+  预览关闭时移除 canvas；页面不可见或预览不可见时停止 RAF，腕部相机按 10 FPS 渲染。
+- 验证：`211 passed`，`node --check`、Python compile、`git diff --check` 通过；
+  Playwright 桌面与 900px 窄屏 smoke 通过，覆盖模型加载、Auto joints/prediction
+  徽标、宽度持久化、腕部相机、关闭/重开虚拟 follower 和无页面横向溢出。
+
 ## 2026-09-23（Library 资源管理器重构）
 
 - Library 标签顺序固定为 Models / Datasets / Videos / Snapshots，无保存偏好时默认

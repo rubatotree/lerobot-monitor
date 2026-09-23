@@ -939,6 +939,26 @@ function renderChartHoverTooltip(chart, seconds, pointerX, pointerY) {
   tooltip.dataset.timeValue = String(model.time);
   tooltip.hidden = false;
   positionChartHoverTooltip(chart, pointerX, pointerY);
+  if (window.RobotPreview && (chart === actionChart || chart === stateChart)) {
+    const pose = {};
+    let hasPrediction = false;
+    model.rows.forEach((row) => {
+      const predicted = row.predictedVisible && row.predicted ? Number(row.predicted.y) : Number.NaN;
+      const actual = row.actualVisible && row.actual ? Number(row.actual.y) : Number.NaN;
+      const value = Number.isFinite(predicted) ? predicted : actual;
+      if (Number.isFinite(value)) pose[row.name] = value;
+      if (Number.isFinite(predicted)) hasPrediction = true;
+    });
+    if (Object.keys(pose).length) {
+      window.RobotPreview.setFocusContext(
+        chart === actionChart ? "action_chart" : "joint_chart",
+        {
+          pose,
+          source: chart === actionChart && hasPrediction ? "prediction" : "action",
+        },
+      );
+    }
+  }
 }
 
 function scheduleChartHoverTooltip(chart, seconds, pointerX, pointerY) {
@@ -2266,6 +2286,11 @@ function ensureJointRows(names) {
       slider.value = String(value);
       num.value = fmt(value);
       markJointEdited(name);
+      if (window.RobotPreview) {
+        const pose = { ...targets };
+        window.RobotPreview.setSliderTargets(pose);
+        window.RobotPreview.setFocusContext("joint_slider", { pose });
+      }
       queueLive(name, value);
     };
     slider.addEventListener("input", () => applyValue(slider.value));
@@ -2593,6 +2618,7 @@ async function refreshSessions() {
 
 function applyStatus(d) {
   last = d;
+  window.RobotPreview?.setStatus(d);
   const backendMode = d.display_mode || d.mode || "offline";
   const pending = d.task && d.task.pending;
   // Joints Serial control uses jog as its transport mode. It must not be treated
@@ -4009,7 +4035,14 @@ if ($("episodes") && $("episodes").classList.contains("hidden")) {
 }
 
 const LAYOUT_KEY = "lerobot-monitor-layout";
-const LAYOUT_DEFAULT = { sideW: 360, bottomH: 320, logW: 480, libW: 320, epW: 280 };
+const LAYOUT_DEFAULT = {
+  sideW: 360,
+  bottomH: 320,
+  logW: 480,
+  libW: 320,
+  epW: 280,
+  previewW: 280,
+};
 
 function loadLayout() {
   try { return { ...LAYOUT_DEFAULT, ...JSON.parse(localStorage.getItem(LAYOUT_KEY) || "{}") }; }
@@ -4020,12 +4053,25 @@ function applyLayout(layout) {
   const bottom = $("bottom");
   if (!root) return;
   const libCollapsed = $("library") && $("library").classList.contains("collapsed");
+  const previewMax = bottom && bottom.clientWidth
+    ? Math.max(200, Math.min(480, bottom.clientWidth * 0.4))
+    : 480;
+  const previewW = Math.min(
+    previewMax,
+    Math.max(200, Number(layout.previewW) || LAYOUT_DEFAULT.previewW),
+  );
+  layout.previewW = previewW;
   root.style.setProperty("--lib-w", `${libCollapsed ? 44 : layout.libW}px`);
   root.style.setProperty("--ep-w", `${layout.epW}px`);
   root.style.setProperty("--side-w", `${layout.sideW}px`);
   root.style.setProperty("--bottom-h", `${layout.bottomH}px`);
   root.style.setProperty("--log-w", `${layout.logW}px`);
-  if (bottom) bottom.style.setProperty("--log-w", `${layout.logW}px`);
+  root.style.setProperty("--preview-w", `${previewW}px`);
+  if (bottom) {
+    bottom.style.setProperty("--log-w", `${layout.logW}px`);
+    bottom.style.setProperty("--preview-w", `${previewW}px`);
+  }
+  $("split-preview")?.setAttribute("aria-valuenow", String(previewW));
 }
 function saveLayout(layout) {
   localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
@@ -4087,8 +4133,51 @@ function initSplitters() {
     layout.logW = clamp(box.right - e.clientX, 160, box.width - 120);
     applyLayout(layout);
   });
+  const previewSplit = $("split-preview");
+  drag(previewSplit, (e) => {
+    const box = bottom.getBoundingClientRect();
+    const max = Math.max(200, Math.min(480, box.width * 0.4));
+    layout.previewW = clamp(e.clientX - box.left, 200, max);
+    applyLayout(layout);
+  });
+  previewSplit?.addEventListener("dblclick", () => {
+    layout.previewW = LAYOUT_DEFAULT.previewW;
+    applyLayout(layout);
+    saveLayout(layout);
+  });
+  previewSplit?.addEventListener("keydown", (event) => {
+    const step = event.shiftKey ? 32 : 8;
+    if (event.key === "ArrowLeft") layout.previewW -= step;
+    else if (event.key === "ArrowRight") layout.previewW += step;
+    else if (event.key === "Home") layout.previewW = 200;
+    else if (event.key === "End") layout.previewW = 480;
+    else return;
+    event.preventDefault();
+    const box = bottom.getBoundingClientRect();
+    layout.previewW = clamp(
+      layout.previewW,
+      200,
+      Math.max(200, Math.min(480, box.width * 0.4)),
+    );
+    applyLayout(layout);
+    saveLayout(layout);
+  });
+  window.addEventListener("resize", () => applyLayout(layout));
 }
 initSplitters();
+
+const previewCameraHost = $("cameras");
+if (previewCameraHost) {
+  previewCameraHost.addEventListener("pointerenter", () => {
+    window.RobotPreview?.setFocusContext("main_camera");
+  });
+  previewCameraHost.addEventListener("pointerleave", () => {
+    window.RobotPreview?.setFocusContext(null);
+  });
+  previewCameraHost.addEventListener("focusin", () => {
+    window.RobotPreview?.setFocusContext("main_camera");
+  });
+}
 
 initTabList("library-tabs", "lerobot-monitor-library-tab", "models", selectLibrarySearchKind);
 initTabList("side-tabs", "lerobot-monitor-side-tab", "joints", (kind) => {
@@ -5993,6 +6082,7 @@ function leaveReplay() {
   if (!replayActive) return;
   previewRequestGeneration += 1;
   replayActive = false;
+  window.RobotPreview?.setTimelineFrame({ active: false, elapsed: 0, duration: 0 });
   replaySeekId = null;
   replayScrubPointerId = null;
   replayScrubWasPlaying = false;
@@ -6126,6 +6216,16 @@ function updateReplayBar(elapsed, duration) {
   if ($("viz-t")) $("viz-t").value = `${elapsed.toFixed(2)}s / ${duration.toFixed(2)}s`;
   [stateChart, actionChart].forEach((chart) => syncReplayChart(chart, elapsed, duration));
   syncReplayJointPanel(elapsed);
+  if (window.RobotPreview) {
+    window.RobotPreview.setTimelineFrame({
+      active: replayActive && vizState.previewReady,
+      elapsed,
+      duration,
+      jointState: sampleReplayJointPose("obs.", elapsed),
+      commandedAction: sampleReplayJointPose("act.", elapsed),
+      predictionAction: samplePosePoints(chunkOverlayPoints(), elapsed),
+    });
+  }
 }
 
 function previewFileUrl(kind, id, episode, cam) {
@@ -6323,6 +6423,9 @@ function updateChartHoverFromClient(chart, event) {
   ) {
     chart.$pointerPosition = null;
     hideChartHoverTooltip(chart);
+    if (window.RobotPreview && (chart === actionChart || chart === stateChart)) {
+      window.RobotPreview.setFocusContext(null);
+    }
     if (chart.$timeAxis === false) chart.draw();
     return;
   }
@@ -6754,6 +6857,50 @@ function sampleJointSeries(times, track, elapsed) {
     joints[name] = a + (b - a) * weight;
   }
   return Object.keys(joints).length ? joints : null;
+}
+
+function samplePosePoints(points, elapsed) {
+  if (!Array.isArray(points) || !points.length) return null;
+  const ordered = points
+    .map((point) => ({ x: Number(point.x), joints: point.joints || {} }))
+    .filter((point) => Number.isFinite(point.x))
+    .sort((left, right) => left.x - right.x);
+  if (!ordered.length) return null;
+  const first = ordered[0];
+  const last = ordered[ordered.length - 1];
+  const spacing = ordered.length > 1 ? (last.x - first.x) / (ordered.length - 1) : 0.35;
+  const tolerance = Math.max(0.05, spacing * 0.75);
+  if (elapsed < first.x - tolerance || elapsed > last.x + tolerance) return null;
+  if (elapsed <= first.x) return finitePose(first.joints);
+  if (elapsed >= last.x) return finitePose(last.joints);
+  for (let index = 1; index < ordered.length; index += 1) {
+    const right = ordered[index];
+    const left = ordered[index - 1];
+    if (elapsed > right.x) continue;
+    const span = right.x - left.x;
+    const weight = span > 0 ? (elapsed - left.x) / span : 0;
+    const pose = {};
+    const names = new Set([...Object.keys(left.joints), ...Object.keys(right.joints)]);
+    names.forEach((name) => {
+      const a = Number(left.joints[name]);
+      const b = Number(right.joints[name]);
+      if (Number.isFinite(a) && Number.isFinite(b)) pose[name] = a + (b - a) * weight;
+      else if (Number.isFinite(a)) pose[name] = a;
+      else if (Number.isFinite(b)) pose[name] = b;
+    });
+    return finitePose(pose);
+  }
+  return null;
+}
+
+function finitePose(pose) {
+  if (!pose || typeof pose !== "object") return null;
+  const out = {};
+  Object.entries(pose).forEach(([name, value]) => {
+    const number = Number(value);
+    if (Number.isFinite(number)) out[name] = number;
+  });
+  return Object.keys(out).length ? out : null;
 }
 
 function sampleReplayJointPose(prefix, elapsed) {
@@ -7865,6 +8012,19 @@ async function refreshPorts() {
   try {
     const ports = await fetch(BASE + "/api/ports").then((r) => r.json());
     lastPorts = Array.isArray(ports) ? ports : [];
+    const virtualPort = (meta.virtual_follower && meta.virtual_follower.port) || "virtual://preview";
+    if (!lastPorts.some((row) => row.port === virtualPort)) {
+      lastPorts = [
+        {
+          port: virtualPort,
+          name: "virtual follower",
+          description: "3D preview follower",
+          likely: true,
+          virtual: true,
+        },
+        ...lastPorts,
+      ];
+    }
     const robot = (last && last.robot) || {};
     const leader = (last && last.leader) || {};
     const uiHw = (meta.ui && meta.ui.hardware) || {};
@@ -7872,7 +8032,7 @@ async function refreshPorts() {
       "arm-port",
       lastPorts,
       robot.connected ? robot.port : "",
-      savedPortValue(uiHw, "arm_port", meta.robot && meta.robot.port),
+      virtualPort,
     );
     fillPortSelect(
       "leader-port",

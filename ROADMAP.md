@@ -33,6 +33,66 @@ Browser  --HTTP/WS/MJPEG-->  FastAPI
 7. 本机 policy 扫描：HF hub cache、HF_LEROBOT_HOME、outputs/checkpoints
 8. Episode 管理：独立 Episode 列、命名/任务/备注编辑、逐条播放，回放时下方 Joint state / Control state 时间条
 
+## 已完成（2026-09-23）：3D 虚拟从臂预览
+
+目标：在底部栏最左侧加入可调宽度的 3D 机械臂预览。预览支持型号选择与下载、
+视角操作、腕部虚拟相机、动作来源选择、Auto 关注跟随，并可在无硬件时作为
+虚拟 follower 接入现有控制循环。
+
+架构边界：
+
+- 后端新增理想位置跟踪的 `VirtualFollowerArm`，继续遵守 `FollowerArm` 接口；
+  控制线程仍是唯一控制状态所有者，预览只读取快照并提交显式连接命令。
+- 新增独立 `RobotModelRegistry` 与 `robot_model.json` 清单。内置 SO-101，
+  支持本地路径与 Hugging Face 仓库；URDF/mesh 只作为数据加载，不执行代码。
+- 前端新增独立 `robot-preview.js` ES module，负责 Three.js 场景、动作来源解析、
+  Auto 上下文、腕部相机和 GPU 生命周期；`app.js` 只推送状态与关注上下文。
+- 底部布局新增可拖拽的预览宽度分隔条。宽度、来源和电源状态持久化；窄屏改为
+  纵向堆叠并关闭宽度拖拽。
+
+核心模块：
+
+1. `virtual_follower.py`：连接状态、关节目标、力矩、E-STOP 和 snapshot。
+2. `robot_models.py`：内置包发现、本地/Hub 安装、manifest 校验和安全文件服务。
+3. `robot-preview.js`：URDF 加载、OrbitControls、聚焦、腕部相机和 Auto 来源。
+4. `loop.py` / `hub.py` / `app.py`：虚拟臂自动连接、真实臂优先级、REST 契约。
+5. `index.html` / `styles.css` / `app.js`：底部可调布局、控件和关注事件桥接。
+
+技术难点与对策：
+
+- URDF mesh 引用可能包含相对路径、`package://` 或不同格式。型号清单允许声明
+  package 根；文件服务严格限制在包目录内，加载失败只影响当前型号并回退旧场景。
+- 浏览器 WebGL context 与 GPU 能耗需要可控。预览静止、不可见或电源关闭时停止
+  RAF；关闭时主动 dispose 几何、材质、纹理和 renderer context。
+- 图表 hover、joint 滑条和主相机可能同时争夺 Auto 来源。使用固定优先级和短时
+  保持窗口，避免每帧抖动；Auto 不修改后端控制状态。
+- 真实 follower 与虚拟 follower 的连接所有权必须唯一。显式真实臂连接优先，
+  断开清理完成后才恢复虚拟臂，避免旧 generation 覆盖新连接。
+
+里程碑：
+
+- [x] M1 虚拟 follower 与自动连接策略、后端测试。
+- [x] M2 型号注册表、内置 SO-101 包、REST 与安全校验。
+- [x] M3 可调宽度布局、Three.js 场景、视角与型号切换。
+- [x] M4 动作来源、Auto 跟随、腕部虚拟相机和 GPU 生命周期。
+- [x] M5 自动化回归、浏览器视觉验收、文档和原子提交。
+
+最终实现与验证：
+
+- `FollowerArm` 增加内存后端；默认自动连接 `virtual://preview`，真实臂显式连接时
+  接管，真实臂断开后恢复虚拟臂；关闭预览或 E-STOP 时不会错误复活虚拟连接。
+- `RobotModelRegistry` 支持内置 SO-101、本地型号目录和 Hugging Face 仓库；型号清单
+  校验 URDF、joint map、路径边界、符号链接与文件/整包大小。前端通过本地 vendor 的
+  Three.js、URDFLoader、STLLoader 与 ColladaLoader 加载，不依赖运行时 CDN。
+- 底部预览宽度可拖动、键盘调整、双击复位并持久化；Three.js 使用 `ResizeObserver`
+  同步画布尺寸。窄屏下预览全宽显示并隐藏宽度分隔条。
+- Auto 来源已覆盖 joint 滑条、动作曲线、joint-state 曲线、主相机和默认 follower；
+  prediction 缺档时按 prediction → command → state → live 回退。腕部相机通过第二台
+  PerspectiveCamera 渲染，并在主视区四角间切换。
+- 自动化：`211 passed`；`node --check`、Python compile 与 `git diff --check` 通过。
+  Playwright 桌面/窄屏 smoke 验证 3D 渲染调用、型号加载、Auto 徽标、宽度持久化、
+  腕部相机、关闭后 WebGL/虚拟 follower 释放和无横向溢出。
+
 ## 已完成（2026-09-23）：Library 资源管理器重构
 
 目标：把左侧 Library 收敛为紧凑、可重复操作的资源管理器，统一四类资源的

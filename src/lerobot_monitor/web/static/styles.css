@@ -14,6 +14,7 @@
   --warn: #d4a017;
   --err: #e06b7a;
   --rec: #e06b7a;
+  --preview-w: 280px;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1343,6 +1344,48 @@ main.episodes-closed {
   grid-template-columns: repeat(var(--cc, 1), 1fr);
   grid-template-rows: repeat(var(--cr, 1), 1fr);
   min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+.preview-wrist {
+  position: absolute;
+  z-index: 8;
+  display: none;
+  width: min(220px, 34%);
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  background: #05060b;
+  border: 1px solid var(--accent-dim);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.42);
+}
+.preview-wrist.on { display: block; }
+.preview-wrist[data-corner="bottom-right"] { right: 12px; bottom: 12px; }
+.preview-wrist[data-corner="bottom-left"] { left: 12px; bottom: 12px; }
+.preview-wrist[data-corner="top-right"] { right: 12px; top: 12px; }
+.preview-wrist[data-corner="top-left"] { left: 12px; top: 12px; }
+.preview-wrist canvas { width: 100%; height: 100%; display: block; }
+.preview-wrist-corner {
+  position: absolute;
+  right: 3px;
+  top: 3px;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: #dfe3ff;
+  background: rgb(9 11 18 / 0.72);
+  border: 1px solid rgb(255 255 255 / 0.2);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.preview-wrist-corner svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
 }
 .camera-empty { grid-column: 1 / -1; grid-row: 1 / -1; align-self: center; justify-self: center; display: flex; max-width: 42ch; flex-direction: column; gap: 6px; padding: 20px; color: var(--muted); text-align: center; line-height: 1.5; }
 .camera-empty strong { color: var(--text); font-size: 14px; font-weight: 500; }
@@ -2438,15 +2481,195 @@ body.dragging-row { cursor: row-resize; user-select: none; }
 
 #bottom {
   display: grid;
-  grid-template-columns: 136px minmax(0, 1fr) minmax(0, 1fr) 8px var(--log-w, 480px);
+  grid-template-columns:
+    var(--preview-w, 280px) 6px 136px minmax(0, 1fr) minmax(0, 1fr) 8px var(--log-w, 480px);
   min-height: 0;
   min-width: 0;
 }
-.bottom-legend { grid-column: 1; }
-.chart-wrap[data-panel="chart-state"] { grid-column: 2; }
-.chart-wrap[data-panel="chart-action"] { grid-column: 3; }
-#split-log { grid-column: 4; }
-.log-wrap { grid-column: 5; }
+.arm-preview { grid-column: 1; }
+#split-preview { grid-column: 2; }
+.bottom-legend { grid-column: 3; }
+.chart-wrap[data-panel="chart-state"] { grid-column: 4; }
+.chart-wrap[data-panel="chart-action"] { grid-column: 5; }
+#split-log { grid-column: 6; }
+.log-wrap { grid-column: 7; }
+.arm-preview {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 7px 8px 6px;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  overflow: hidden;
+}
+.preview-head,
+.preview-toolbar,
+.preview-title {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.preview-head {
+  justify-content: space-between;
+  gap: 6px;
+}
+.preview-title {
+  gap: 6px;
+  min-width: 0;
+}
+.preview-title h2 {
+  margin: 0;
+  white-space: nowrap;
+}
+.preview-auto-badge {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--accent);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.preview-power,
+.preview-icon,
+.preview-view-buttons button,
+.preview-model-row button {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--muted);
+  background: #11131f;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.preview-power {
+  width: 25px;
+  height: 25px;
+  flex: 0 0 25px;
+}
+.preview-power.on {
+  color: var(--ok);
+  border-color: #2d4d42;
+  background: #14231e;
+}
+.preview-power svg,
+.preview-icon svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+.preview-toolbar {
+  gap: 4px;
+}
+.preview-toolbar select {
+  min-width: 0;
+  height: 25px;
+  padding: 0 4px;
+  color: var(--muted);
+  background: #11131f;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 9px;
+}
+#preview-model { flex: 1 1 48%; }
+#preview-source { flex: 1 1 38%; }
+.preview-icon {
+  width: 25px;
+  height: 25px;
+  flex: 0 0 25px;
+}
+.preview-icon[aria-pressed="true"] {
+  color: var(--blue);
+  border-color: #334d78;
+}
+.preview-stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 110px;
+  overflow: hidden;
+  background: #080a11;
+  border: 1px solid #20253a;
+  border-radius: 4px;
+}
+.preview-stage canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+}
+.preview-view-buttons {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 2;
+  display: flex;
+  gap: 2px;
+}
+.preview-view-buttons button {
+  width: 21px;
+  height: 18px;
+  color: #aeb5d2;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 8px;
+  background: rgb(12 14 22 / 0.82);
+}
+.preview-view-buttons button:hover,
+.preview-model-row button:hover,
+.preview-power:hover,
+.preview-icon:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.preview-model-tools {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 9px;
+}
+.preview-model-tools summary {
+  cursor: pointer;
+  user-select: none;
+}
+.preview-model-row {
+  display: flex;
+  gap: 3px;
+  margin-top: 4px;
+}
+.preview-model-row input {
+  min-width: 0;
+  flex: 1;
+  height: 23px;
+  padding: 0 4px;
+  color: var(--text);
+  background: #0b0d15;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-size: 9px;
+}
+.preview-model-row button {
+  width: 23px;
+  height: 23px;
+  flex: 0 0 23px;
+  font-size: 13px;
+}
+.preview-model-status {
+  min-height: 12px;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.preview-model-status.error { color: var(--err); }
+.arm-preview.preview-off .preview-stage {
+  background: #090b12;
+}
+.arm-preview.preview-off .preview-stage canvas { display: none; }
 .chart-wrap, .log-wrap {
   background: var(--bg);
   padding: 8px 12px;
@@ -2779,9 +3002,15 @@ body.dragging-row { cursor: row-resize; user-select: none; }
     min-height: 0;
   }
   #bottom > .bottom-legend,
+  #bottom > .arm-preview,
   #bottom .chart-wrap,
   #bottom .log-wrap {
     grid-column: 1;
+  }
+  #bottom > .arm-preview {
+    width: 100%;
+    min-height: 250px;
+    height: 250px;
   }
   #bottom > .bottom-legend {
     width: 100%;

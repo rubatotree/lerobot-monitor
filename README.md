@@ -19,6 +19,14 @@ cd d:\repos\lerobot\lerobot-monitor
 
 ## 界面
 
+- Arm preview：底部左侧的 3D 机械臂预览，宽度可拖拽并持久化。支持
+  orbit / pan / zoom、双击连杆聚焦、ISO / Front / Side / Top 预设、内置 SO-101，
+  以及本地目录或 Hugging Face `robot_model.json` 型号包。动作来源可选 Joints、
+  Joint state、Commanded、Prediction 或 Auto；Auto 会按 joint 滑条、动作曲线 hover、
+  state 曲线 hover、主相机关注的优先级切换，并在 prediction 缺档时逐级回退。
+- Virtual follower：没有真实从臂时默认自动连接 `virtual://preview`，遥操作、录制与
+  rollout 可继续运行。显式连接真实从臂时由真实设备接管；关闭 Arm preview 会释放
+  WebGL context 并断开虚拟 follower。腕部虚拟相机只用于观察，不进入录像或策略输入。
 - Cameras：列出本机设备，设置宽高、网络端口，开关网络流。Blender 注册表里
   `cameras[]` 公布的相机也会自动出现为远程 MJPEG 设备；远程相机的 URL、画幅
   与 FPS 由 Blender 面板控制，monitor 只负责启用、主视图和策略输入开关。

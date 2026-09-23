@@ -506,3 +506,10 @@
 - Session 写 CSV + MP4，不依赖 LeRobotDataset。
 - 实机验证：COM6 follower 已连上，idle 30 Hz 读关节；front MJPEG 29.7 fps；side 流未开所以显示 no signal。服务不依赖 record/teleop 进程。
 - 下一步：side 相机在 win_cam_server 里单独开流；可选把 session 导出为 LeRobotDataset。
+
+## 2026-09-23：Arm Preview 调度修复
+
+- 新增独立按需调度器：单一 rAF 所有者、主视角 60 Hz、姿态 30 Hz、腕部 10 Hz；独立脏标记与可见性，停止相机阻尼。
+- 姿态使用时间插值并精确收敛；Auto 滑条保留窗口结束后主动恢复来源；尺寸不变时不重建画布。
+- 模型等待子网格/纹理完成再挂载，关闭/切换后过期结果释放；释放场景共享几何/材质/纹理，腕部计算复用临时对象。
+- 调度行为测试 7/7 通过，JS 语法检查和 diff 检查通过。浏览器和外观验证将在下一里程碑完成。

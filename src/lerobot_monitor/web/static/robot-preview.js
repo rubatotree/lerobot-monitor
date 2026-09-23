@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { createPreviewScheduler, advancePose } from "./preview-scheduler.js";
 import URDFLoader from "./vendor/urdf/URDFLoader.js";
 
 const BASE = (document.documentElement.dataset.base || "/lerobot").replace(/\/$/, "");
@@ -7,12 +8,6 @@ const SOURCE_KEY = "lerobot-monitor-preview-source";
 const POWER_KEY = "lerobot-monitor-preview-power";
 const WRIST_CORNER_KEY = "lerobot-monitor-preview-wrist-corner";
 const AUTO_SLIDER_HOLD_MS = 800;
-const VIEWPORT_FPS = 30;
-const WRIST_FPS = 10;
-const JOINT_FALLBACK = [
-  "shoulder_pan", "shoulder_lift", "elbow_flex",
-  "wrist_flex", "wrist_roll", "gripper",
-];
 
 const state = {
   initialized: false,
@@ -35,15 +30,19 @@ const state = {
   focus: null,
   targetPose: {},
   displayPose: {},
-  lastFrameAt: 0,
-  lastWristAt: 0,
-  raf: 0,
+  scheduler: null,
+  sliderTimer: null,
+  viewportWidth: 0,
+  viewportHeight: 0,
+  powerGeneration: 0,
   resizeObserver: null,
   stageVisible: true,
+  wristVisible: false,
+  visibilityObserver: null,
+  visibilityHandler: null,
   pageVisible: !document.hidden,
   loadGeneration: 0,
-  loadError: "",
-  activeUntil: 0,
+
 };
 
 function $(id) {
@@ -187,22 +186,20 @@ function resolvedPose() {
   return fallbackPose(source);
 }
 
-function disposeMaterial(material) {
-  if (!material) return;
-  const materials = Array.isArray(material) ? material : [material];
-  materials.forEach((item) => {
-    Object.values(item).forEach((value) => {
-      if (value && value.isTexture) value.dispose();
-    });
-    item.dispose?.();
-  });
-}
-
 function disposeObject(object) {
+  const geometries = new Set();
+  const materials = new Set();
+  const textures = new Set();
   object?.traverse((child) => {
-    child.geometry?.dispose?.();
-    disposeMaterial(child.material);
+    if (child.geometry) geometries.add(child.geometry);
+    for (const material of [].concat(child.material || [])) materials.add(material);
   });
+  for (const material of materials) {
+    for (const value of Object.values(material)) if (value?.isTexture) textures.add(value);
+    material.dispose();
+  }
+  for (const texture of textures) texture.dispose();
+  for (const geometry of geometries) geometry.dispose();
 }
 
 function fitCameraToObject() {
@@ -219,7 +216,7 @@ function fitCameraToObject() {
   state.camera.far = Math.max(radius * 100, 20);
   state.camera.updateProjectionMatrix();
   state.controls.update();
-  renderFrame(true);
+  scheduleFrame({ main: true });
 }
 
 function setView(name) {
@@ -241,7 +238,7 @@ function setView(name) {
   state.camera.position.copy(center).addScaledVector(direction, distance);
   state.camera.updateProjectionMatrix();
   state.controls.update();
-  renderFrame(true);
+  scheduleFrame({ main: true });
 }
 
 function focusObject(object) {
@@ -255,7 +252,7 @@ function focusObject(object) {
   state.controls.target.copy(center);
   state.camera.position.copy(center).addScaledVector(direction, radius * 2.1);
   state.controls.update();
-  renderFrame(true);
+  scheduleFrame({ main: true });
 }
 
 function attachPicking(canvas) {
@@ -287,12 +284,11 @@ function initViewport() {
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(42, 1, 0.01, 100);
   const controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.08;
+  controls.enableDamping = false;
   controls.screenSpacePanning = true;
   controls.minDistance = 0.08;
   controls.maxDistance = 12;
-  controls.addEventListener("change", () => scheduleFrame(true));
+  controls.addEventListener("change", () => scheduleFrame({ main: true }));
   scene.add(new THREE.HemisphereLight(0xe7edff, 0x222637, 2.2));
   const key = new THREE.DirectionalLight(0xffffff, 2.4);
   key.position.set(2.5, 4, 3);
@@ -308,11 +304,20 @@ function initViewport() {
   state.scene = scene;
   state.camera = camera;
   state.controls = controls;
+  state.scheduler = createPreviewScheduler({
+    updatePose: (dt) => advancePose(state.displayPose, state.targetPose, dt, applyJoint),
+    renderMain: () => state.renderer.render(state.scene, state.camera),
+    renderWrist: () => {
+      updateWristCamera();
+      state.wristRenderer.render(state.scene, state.wristCamera);
+    },
+  });
+  syncVisibility();
   attachPicking(renderer.domElement);
   state.resizeObserver = new ResizeObserver(() => resize());
   state.resizeObserver.observe(host);
   resize();
-  scheduleFrame(true);
+  scheduleFrame({ main: true });
 }
 
 function initWristRenderer() {
@@ -337,10 +342,16 @@ function resize() {
   if (!host) return;
   const width = Math.max(1, host.clientWidth);
   const height = Math.max(1, host.clientHeight);
+  const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.25);
+  if (state.viewportWidth === width && state.viewportHeight === height
+      && state.renderer.getPixelRatio() === pixelRatio) return;
+  state.viewportWidth = width;
+  state.viewportHeight = height;
+  if (state.renderer.getPixelRatio() !== pixelRatio) state.renderer.setPixelRatio(pixelRatio);
   state.renderer.setSize(width, height, false);
   state.camera.aspect = width / height;
   state.camera.updateProjectionMatrix();
-  renderFrame(true);
+  scheduleFrame({ main: true });
 }
 
 function applyJoint(name, value) {
@@ -366,97 +377,89 @@ function applyPose(pose) {
   Object.entries(pose).forEach(([name, value]) => applyJoint(name, value));
 }
 
+const wristScratch = {
+  box: new THREE.Box3(),
+  mount: new THREE.Vector3(),
+  target: new THREE.Vector3(),
+  forward: new THREE.Vector3(),
+  size: new THREE.Vector3(),
+};
+
 function updateWristCamera() {
   if (!state.robot || !state.wristCamera || !state.model) return;
   const mount = state.robot.links?.[state.model.wrist_camera?.link];
   const lookAt = state.robot.links?.[state.model.wrist_camera?.look_at_link];
   if (!mount || !lookAt) return;
-  const mountBox = new THREE.Box3().setFromObject(mount);
-  const mountPosition = mountBox.isEmpty()
-    ? mount.getWorldPosition(new THREE.Vector3())
-    : mountBox.getCenter(new THREE.Vector3());
-  const targetPosition = lookAt.getWorldPosition(new THREE.Vector3());
-  const forward = mountPosition.clone().sub(targetPosition);
-  if (forward.lengthSq() < 1e-10) forward.set(0, 0, -1);
-  forward.normalize();
-  const mountSize = mountBox.isEmpty() ? new THREE.Vector3() : mountBox.getSize(new THREE.Vector3());
-  const standoff = Math.max(0.12, mountSize.length() * 1.4);
-  state.wristCamera.position.copy(mountPosition).addScaledVector(forward, standoff);
+  const scratch = wristScratch;
+  scratch.box.setFromObject(mount);
+  if (scratch.box.isEmpty()) {
+    mount.getWorldPosition(scratch.mount);
+    scratch.size.set(0, 0, 0);
+  } else {
+    scratch.box.getCenter(scratch.mount);
+    scratch.box.getSize(scratch.size);
+  }
+  lookAt.getWorldPosition(scratch.target);
+  scratch.forward.copy(scratch.mount).sub(scratch.target);
+  if (scratch.forward.lengthSq() < 1e-10) scratch.forward.set(0, 0, -1);
+  scratch.forward.normalize();
+  const standoff = Math.max(0.12, scratch.size.length() * 1.4);
+  state.wristCamera.position.copy(scratch.mount).addScaledVector(scratch.forward, standoff);
   state.wristCamera.up.set(0, 1, 0);
-  state.wristCamera.lookAt(targetPosition.clone().addScaledVector(forward, 0.08));
+  state.wristCamera.lookAt(scratch.target.addScaledVector(scratch.forward, 0.08));
 }
 
-function renderFrame(force = false) {
-  if (!state.powered || !state.renderer || !state.scene || !state.camera) return;
-  if (!state.pageVisible || !state.stageVisible) return;
-  const now = performance.now();
-  if (!force && now - state.lastFrameAt < 1000 / VIEWPORT_FPS) return;
-  state.lastFrameAt = now;
+function syncVisibility() {
+  state.scheduler?.setVisibility({
+    enabled: state.powered && state.pageVisible,
+    main: state.stageVisible,
+    wrist: state.wristVisible && Boolean(state.wristRenderer)
+      && Boolean($("preview-wrist")?.classList.contains("on")),
+  });
+}
+
+function scheduleFrame(dirty = {}) {
+  if (!state.powered || !state.scheduler) return;
   const target = resolvedPose();
-  if (target) state.targetPose = target;
-  if (Object.keys(state.targetPose).length) {
-    const alpha = force ? 1 : 0.28;
-    Object.entries(state.targetPose).forEach(([name, value]) => {
-      const previous = Number(state.displayPose[name]);
-      state.displayPose[name] = Number.isFinite(previous)
-        ? previous + (Number(value) - previous) * alpha
-        : Number(value);
-      applyJoint(name, state.displayPose[name]);
-    });
-  }
-  state.controls?.update();
-  state.renderer.render(state.scene, state.camera);
-  if (state.wristRenderer && state.wristCamera && $("preview-wrist")?.classList.contains("on")) {
-    if (force || now - state.lastWristAt >= 1000 / WRIST_FPS) {
-      state.lastWristAt = now;
-      updateWristCamera();
-      state.wristRenderer.render(state.scene, state.wristCamera);
+  let changed = false;
+  if (target && state.robot) {
+    for (const [name, value] of Object.entries(target)) {
+      if (state.targetPose[name] !== value) {
+        state.targetPose[name] = value;
+        changed = true;
+      }
     }
   }
+  state.scheduler.invalidate({ ...dirty, pose: changed });
 }
 
-function scheduleFrame(force = false) {
-  if (!state.powered) return;
-  const wristVisible = $("preview-wrist")?.classList.contains("on");
-  if (!force && !state.raf && !wristVisible) {
-    const next = resolvedPose();
-    if (next && state.targetPose && Object.keys(state.targetPose).length) {
-      const unchanged = Object.entries(next).every(
-        ([name, value]) => Math.abs(Number(value) - Number(state.targetPose[name])) < 1e-4,
-      );
-      if (unchanged) return;
-    }
-  }
-  const now = performance.now();
-  state.activeUntil = Math.max(state.activeUntil, now + (force ? 500 : 180));
-  if (state.raf) return;
-  const tick = () => {
-    state.raf = 0;
-    const now = performance.now();
-    const active = now < state.activeUntil;
-    const wristVisible = Boolean($("preview-wrist")?.classList.contains("on"));
-    renderFrame(force || active);
-    if (!state.powered) return;
-    if (active) state.raf = requestAnimationFrame(tick);
-    else if (wristVisible) state.raf = setTimeout(tick, 1000 / WRIST_FPS);
-  };
-  state.raf = requestAnimationFrame(tick);
+function clearSliderTimer() {
+  if (state.sliderTimer !== null) clearTimeout(state.sliderTimer);
+  state.sliderTimer = null;
 }
 
-function stopFrameLoop() {
-  if (state.raf) {
-    cancelAnimationFrame(state.raf);
-    clearTimeout(state.raf);
-  }
-  state.raf = 0;
+function scheduleSliderExpiry() {
+  clearSliderTimer();
+  const remaining = AUTO_SLIDER_HOLD_MS - (Date.now() - state.sliderAt);
+  if (!state.powered || !state.pageVisible || remaining < 0) return;
+  // Auto must fall back after the hold even when no status packets arrive.
+  state.sliderTimer = setTimeout(() => {
+    state.sliderTimer = null;
+    scheduleFrame();
+  }, remaining + 1);
 }
 
 function disposeViewport() {
-  stopFrameLoop();
+  ++state.loadGeneration;
+  state.scheduler?.dispose();
+  state.scheduler = null;
+  clearSliderTimer();
+  state.viewportWidth = state.viewportHeight = 0;
   state.resizeObserver?.disconnect();
   state.resizeObserver = null;
-  if (state.robot) disposeObject(state.robot);
+  disposeObject(state.scene);
   state.robot = null;
+  state.model = null;
   state.controls?.dispose();
   state.controls = null;
   if (state.renderer) {
@@ -476,6 +479,7 @@ function disposeViewport() {
 }
 
 async function loadModel(modelId) {
+  if (!state.powered || !state.scene) return;
   const model = state.models.find((row) => row.id === modelId);
   if (!model) throw new Error(`robot model '${modelId}' is not installed`);
   const generation = ++state.loadGeneration;
@@ -486,44 +490,37 @@ async function loadModel(modelId) {
     packages[name] = `${baseUrl}${String(value).replace(/^\/+/, "")}`.replace(/\/$/, "");
   });
   const manager = new THREE.LoadingManager();
-  manager.onLoad = () => {
-    if (generation !== state.loadGeneration || !state.powered) return;
-    requestAnimationFrame(() => {
-      fitCameraToObject();
-      renderFrame(true);
-    });
-  };
+  let failed = false;
+  const complete = new Promise((resolve) => { manager.onLoad = resolve; });
+  manager.onError = () => { failed = true; };
   const loader = new URDFLoader(manager);
   loader.packages = packages;
   const loaded = await loader.loadAsync(`${baseUrl}${model.urdf}`);
-  if (generation !== state.loadGeneration) {
+  // loadAsync resolves the URDF tree before its mesh and texture requests end.
+  // Keep it detached until all resources arrive, including stale requests.
+  await complete;
+  if (generation !== state.loadGeneration || !state.powered || !state.scene) {
     disposeObject(loaded);
     return;
+  }
+  if (failed) {
+    disposeObject(loaded);
+    throw new Error("Some robot model files could not be loaded");
   }
   if (state.robot) {
     state.scene.remove(state.robot);
     disposeObject(state.robot);
   }
   loaded.rotation.x = -Math.PI / 2;
-  loaded.traverse((child) => {
-    if (child.isMesh) {
-      child.castShadow = false;
-      child.receiveShadow = false;
-      if (child.material) {
-        child.material.side = THREE.DoubleSide;
-        child.material.needsUpdate = true;
-      }
-    }
-  });
   state.scene.add(loaded);
   state.robot = loaded;
   state.model = model;
-  state.displayPose = {};
   state.targetPose = finitePose(model.default_pose) || finitePose(state.status.joints) || {};
-  applyPose(state.targetPose);
-  requestAnimationFrame(() => fitCameraToObject());
+  state.displayPose = { ...state.targetPose };
+  applyPose(state.displayPose);
+  fitCameraToObject();
   setStatusText(model.missing ? "model files missing" : "");
-  renderFrame(true);
+  scheduleFrame({ main: true, wrist: true });
 }
 
 function renderModelOptions() {
@@ -582,33 +579,39 @@ async function alignToConnectedRobot() {
 async function setPower(enabled, persist = true) {
   const next = Boolean(enabled);
   if (next === state.powered) return;
+  const generation = ++state.powerGeneration;
   state.powered = next;
   if (persist) writeStorage(POWER_KEY, next ? "1" : "0");
   setPowerButton();
   if (!next) {
-    stopFrameLoop();
     disposeViewport();
     $("preview-wrist")?.classList.remove("on");
+    $("preview-wrist-toggle")?.setAttribute("aria-pressed", "false");
     await api("/api/virtual-follower/disconnect").catch(() => {});
     return;
   }
   initViewport();
   try {
     await api("/api/virtual-follower/connect", { model_id: state.activeModelId });
+    if (!state.powered || generation !== state.powerGeneration) return;
     await loadModel(state.activeModelId);
+    scheduleSliderExpiry();
   } catch (error) {
+    if (generation !== state.powerGeneration) return;
     setStatusText(error.message || String(error), true);
   }
 }
 
 function toggleWrist() {
+  if (!state.powered) return;
   const panel = $("preview-wrist");
   if (!panel) return;
   const enabled = !panel.classList.contains("on");
   panel.classList.toggle("on", enabled);
   $("preview-wrist-toggle")?.setAttribute("aria-pressed", String(enabled));
   if (enabled) initWristRenderer();
-  renderFrame(true);
+  syncVisibility();
+  if (enabled) scheduleFrame({ wrist: true });
 }
 
 function cycleWristCorner() {
@@ -628,7 +631,7 @@ function bindControls() {
   });
   $("preview-source")?.addEventListener("change", (event) => {
     writeStorage(SOURCE_KEY, event.target.value);
-    renderFrame(true);
+    scheduleFrame();
   });
   $("preview-model")?.addEventListener("change", (event) => {
     activateModel(event.target.value).catch((error) => setStatusText(error.message, true));
@@ -684,20 +687,32 @@ function bindControls() {
 }
 
 function observeVisibility() {
-  const host = $("preview-stage");
-  if (host && typeof IntersectionObserver === "function") {
-    const observer = new IntersectionObserver((entries) => {
-      state.stageVisible = Boolean(entries[0]?.isIntersecting);
-      if (state.stageVisible) scheduleFrame(true);
-      else stopFrameLoop();
+  if (typeof IntersectionObserver === "function") {
+    state.visibilityObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target.id === "preview-stage") state.stageVisible = entry.isIntersecting;
+        if (entry.target.id === "preview-wrist") state.wristVisible = entry.isIntersecting;
+      }
+      syncVisibility();
+      scheduleFrame();
     }, { threshold: 0.01 });
-    observer.observe(host);
+    for (const id of ["preview-stage", "preview-wrist"]) {
+      if ($(id)) state.visibilityObserver.observe($(id));
+    }
+  } else {
+    state.wristVisible = true;
   }
-  document.addEventListener("visibilitychange", () => {
+  state.visibilityHandler = () => {
     state.pageVisible = !document.hidden;
-    if (state.pageVisible) scheduleFrame(true);
-    else stopFrameLoop();
-  });
+    syncVisibility();
+    if (state.pageVisible) {
+      resize();
+      scheduleFrame();
+      scheduleSliderExpiry();
+    } else clearSliderTimer();
+  };
+  document.addEventListener("visibilitychange", state.visibilityHandler);
+  window.addEventListener("resize", resize);
 }
 
 export const RobotPreview = {
@@ -735,13 +750,14 @@ export const RobotPreview = {
   setSliderTargets(pose) {
     state.sliderPose = finitePose(pose);
     state.sliderAt = Date.now();
-    if (state.powered) scheduleFrame(true);
+    scheduleSliderExpiry();
+    if (state.powered) scheduleFrame();
   },
 
   setFocusContext(kind, payload = {}) {
     if (!kind) state.focus = null;
     else state.focus = { kind, ...payload };
-    if (state.powered) scheduleFrame(true);
+    if (state.powered) scheduleFrame();
   },
 
   setPower(enabled) {
@@ -752,7 +768,14 @@ export const RobotPreview = {
 
   debugInfo() {
     return {
+      ...state.scheduler?.debugInfo(),
       powered: state.powered,
+      pendingFrames: state.scheduler?.debugInfo().pendingFrames || 0,
+      pixelRatio: state.renderer?.getPixelRatio() || 0,
+      antialias: state.renderer?.getContext().getContextAttributes()?.antialias ?? false,
+      wristAntialias: state.wristRenderer?.getContext().getContextAttributes()?.antialias ?? false,
+      displayPose: { ...state.displayPose },
+      targetPose: { ...state.targetPose },
       modelId: state.activeModelId,
       joints: Object.keys(state.robot?.joints || {}).length,
       renderCalls: Number(state.renderer?.info?.render?.calls) || 0,
@@ -763,6 +786,12 @@ export const RobotPreview = {
   },
 
   destroy() {
+    ++state.powerGeneration;
+    state.powered = false;
+    setPowerButton();
+    state.visibilityObserver?.disconnect();
+    document.removeEventListener("visibilitychange", state.visibilityHandler);
+    window.removeEventListener("resize", resize);
     disposeViewport();
   },
 };

@@ -9,9 +9,13 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import re
+import shutil
+import subprocess
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -82,10 +86,9 @@ def open_video_writer(path: Path, fps: float, size: tuple[int, int], fmt: str = 
     if fmt == "avi":
         codes = ("XVID", "MJPG")
     else:
-        # mp4v is bundled by common OpenCV wheels. Trying external H.264 first
-        # can be slow and some Windows builds leak codec diagnostics into other
-        # open file handles before falling back successfully.
-        codes = ("mp4v", "avc1", "H264")
+        # Browsers can play H.264 MP4, while the common mp4v fallback is often
+        # downloadable but cannot be displayed in the monitor's video element.
+        codes = ("avc1", "H264", "mp4v")
     last_error = ""
     for code in codes:
         writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*code), float(fps), size)
@@ -94,6 +97,124 @@ def open_video_writer(path: Path, fps: float, size: tuple[int, int], fmt: str = 
         writer.release()
         last_error = code
     raise RuntimeError(f"cannot open video writer for {path} (tried {last_error})")
+
+
+class StreamingVideoWriter:
+    """Feed FFmpeg from a bounded queue without blocking the control loop."""
+
+    def __init__(self, path: Path, fps: float, size: tuple[int, int], threads: int) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError("FFmpeg is required when streaming encoding is enabled")
+        if not 1 <= threads <= 32:
+            raise ValueError("encoder_threads must be between 1 and 32")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._size = size
+        is_avi = path.suffix.lower() == ".avi"
+        codec = "libxvid" if is_avi else "libx264"
+        command = [
+            ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s:v", f"{size[0]}x{size[1]}",
+            "-r", str(fps), "-i", "pipe:0", "-an", "-c:v", codec,
+            "-threads", str(threads),
+        ]
+        if not is_avi:
+            command += [
+                "-preset", "ultrafast", "-crf", "22", "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+            ]
+        command.append(str(path))
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        if os.name == "nt":
+            flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        self._process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            creationflags=flags,
+        )
+        self._pending: deque[tuple[np.ndarray, int]] = deque()
+        self._condition = threading.Condition()
+        self._closed = False
+        self._error: Exception | None = None
+        self._worker = threading.Thread(target=self._encode, name=f"video-encoder-{path.stem}", daemon=True)
+        self._worker.start()
+
+    def write(self, frame: np.ndarray) -> None:
+        self.write_repeated(frame, 1)
+
+    def write_repeated(self, frame: np.ndarray, count: int) -> None:
+        """Queue one frame for several timeline slots; newer frames replace stale pending images."""
+        if frame.shape != (self._size[1], self._size[0], 3):
+            raise ValueError("video frame shape changed during recording")
+        if count <= 0:
+            return
+        owned_frame = np.ascontiguousarray(frame).copy()
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError("video encoder failed") from self._error
+            if self._closed:
+                raise RuntimeError("video encoder input is closed")
+            if len(self._pending) >= 2:
+                _, stale_count = self._pending.popleft()
+                next_frame, next_count = self._pending.popleft()
+                self._pending.append((next_frame, stale_count + next_count))
+            self._pending.append((owned_frame, count))
+            self._condition.notify()
+
+    def _encode(self) -> None:
+        try:
+            if self._process.stdin is None:
+                raise RuntimeError("video encoder input is closed")
+            while True:
+                with self._condition:
+                    while not self._pending and not self._closed:
+                        self._condition.wait()
+                    if not self._pending:
+                        break
+                    frame, count = self._pending.popleft()
+                raw_frame = memoryview(frame).cast("B")
+                for _ in range(count):
+                    self._process.stdin.write(raw_frame)
+        except Exception as exc:  # noqa: BLE001
+            with self._condition:
+                self._error = exc
+                self._pending.clear()
+                self._condition.notify_all()
+        finally:
+            if self._process.stdin is not None and not self._process.stdin.closed:
+                try:
+                    self._process.stdin.close()
+                except OSError as exc:
+                    with self._condition:
+                        if self._error is None:
+                            self._error = exc
+
+    def release(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        self._worker.join(timeout=120)
+        if self._worker.is_alive():
+            self._process.kill()
+            self._worker.join()
+            self._process.wait()
+            raise RuntimeError("video encoder did not finish in time")
+        try:
+            self._process.wait(timeout=120)
+        except subprocess.TimeoutExpired as exc:
+            self._process.kill()
+            self._process.wait()
+            raise RuntimeError("video encoder did not finish in time") from exc
+        error = self._process.stderr.read().decode("utf-8", errors="replace") if self._process.stderr else ""
+        if self._process.stderr is not None:
+            self._process.stderr.close()
+        if self._error is not None:
+            raise RuntimeError(f"video encoder failed: {error.strip()}") from self._error
+        if self._process.returncode:
+            raise RuntimeError(f"video encoder failed: {error.strip()}")
 
 
 class EpisodeWriter:
@@ -108,6 +229,8 @@ class EpisodeWriter:
         action_fps: int | None = None,
         video_fps: int | None = None,
         video_format: str = "mp4",
+        streaming_encoding: bool = False,
+        encoder_threads: int = 2,
         merge: bool = True,
         video: bool = True,
         kind: str = "record",
@@ -127,6 +250,8 @@ class EpisodeWriter:
             raise ValueError("action_fps and video_fps must be positive")
         self.fps = self.action_fps
         self.video_format = video_format
+        self.streaming_encoding = bool(streaming_encoding)
+        self.encoder_threads = int(encoder_threads)
         self.merge = merge
         self.video = bool(video)
         if self.video:
@@ -149,7 +274,7 @@ class EpisodeWriter:
         )
         self._writer = csv.DictWriter(self._csv_file, fieldnames=fieldnames)
         self._writer.writeheader()
-        self._videos: dict[str, cv2.VideoWriter] = {}
+        self._videos: dict[str, cv2.VideoWriter | StreamingVideoWriter] = {}
         self._video_size: dict[str, tuple[int, int]] = {}
         self._video_frames: dict[str, int] = {}
         self._video_start_frame: dict[str, int] = {}
@@ -157,13 +282,17 @@ class EpisodeWriter:
         self._t0 = time.perf_counter()
         self._lock = threading.Lock()
 
-    def _ensure_video(self, name: str, bgr: np.ndarray) -> cv2.VideoWriter:
+    def _ensure_video(self, name: str, bgr: np.ndarray) -> cv2.VideoWriter | StreamingVideoWriter:
         key = safe_cam_name(name)
         if key in self._videos:
             return self._videos[key]
         h, w = bgr.shape[:2]
         path = self.folder / "videos" / f"{key}{self._ext}"
-        writer = open_video_writer(path, self.video_fps, (w, h), self.video_format)
+        writer = (
+            StreamingVideoWriter(path, self.video_fps, (w, h), self.encoder_threads)
+            if self.streaming_encoding
+            else open_video_writer(path, self.video_fps, (w, h), self.video_format)
+        )
         self._videos[key] = writer
         self._video_size[key] = (w, h)
         self._video_frames[key] = 0
@@ -178,8 +307,11 @@ class EpisodeWriter:
             bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA)
         frame = np.ascontiguousarray(bgr)
         missing = max(0, int(target_frames) - self._video_frames[key])
-        for _ in range(missing):
-            writer.write(frame)
+        if isinstance(writer, StreamingVideoWriter):
+            writer.write_repeated(frame, missing)
+        else:
+            for _ in range(missing):
+                writer.write(frame)
         self._video_frames[key] += missing
         # Camera adapters commonly reuse their buffers, so retain an owned copy
         # for future dropout padding.

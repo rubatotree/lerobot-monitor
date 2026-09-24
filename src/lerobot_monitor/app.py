@@ -90,6 +90,7 @@ class RecordStartBody(BaseModel):
     format: str | None = None
     root: str | None = None
     streaming_encoding: bool | None = None
+    deferred_encoding: bool | None = None
     encoder_threads: int | None = None
     video: bool | None = None
     merge: bool | None = None
@@ -107,6 +108,10 @@ class RolloutStartBody(BaseModel):
     policy_fps: int | None = None
     action_fps: int | None = None
     video_fps: int | None = None
+    streaming_encoding: bool | None = None
+    deferred_encoding: bool | None = None
+    encoder_threads: int | None = None
+    video: bool | None = None
     extra: dict[str, str] | None = None
     dataset_id: str | None = None
     format: str | None = None
@@ -265,6 +270,7 @@ class CaptureStartBody(BaseModel):
     merge: bool = True
     video: bool | None = None
     streaming_encoding: bool | None = None
+    deferred_encoding: bool | None = None
     encoder_threads: int | None = None
     auto_record: bool | None = None
 
@@ -841,7 +847,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.get("/api/videos/{video_id}/episodes/{index}/video/{cam}")
     async def video_episode_file(video_id: str, index: int, cam: str) -> FileResponse:
         try:
-            path = await asyncio.to_thread(hub.videos.episode_video, video_id, index, cam)
+            path = await asyncio.to_thread(hub.videos.episode_browser_video, video_id, index, cam)
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
         except ValueError as exc:

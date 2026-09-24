@@ -73,7 +73,8 @@ class RecordingConfig(BaseModel):
     video_format: str = "mp4"
     merge: bool = True
     streaming_encoding: bool = True
-    encoder_threads: int = 2
+    deferred_encoding: bool = False
+    encoder_threads: int = Field(default=2, ge=1, le=32)
     video: bool = True
 
     @model_validator(mode="before")

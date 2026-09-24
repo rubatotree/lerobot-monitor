@@ -960,6 +960,33 @@ class CameraHub:
             out[key or device.name] = frame
         return out
 
+    def latest_main_jpeg_map(self) -> dict[str, bytes]:
+        """Return existing camera JPEG buffers without decoding full-resolution frames."""
+        out: dict[str, bytes] = {}
+        with self._lock:
+            devices = list(self.streams.values()) + list(self.remote_streams.values())
+        for device in devices:
+            if not device.enabled or not device.show_main:
+                continue
+            jpeg = device.latest_jpeg()
+            if not jpeg:
+                continue
+            key = device.label.strip() if device.label else device.name
+            out[key or device.name] = jpeg
+        return out
+
+    def latest_jpeg_map(self) -> dict[str, bytes]:
+        out: dict[str, bytes] = {}
+        with self._lock:
+            devices = list(self.streams.items()) + list(self.remote_streams.items())
+        for name, device in devices:
+            if not device.enabled or not (device.show_main or device.feed_robot):
+                continue
+            jpeg = device.latest_jpeg()
+            if jpeg:
+                out[name] = jpeg
+        return out
+
     def _image_map(self, color: str, *, robot: bool) -> dict[str, np.ndarray]:
         out: dict[str, np.ndarray] = {}
         with self._lock:

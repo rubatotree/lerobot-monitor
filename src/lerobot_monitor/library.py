@@ -8,11 +8,14 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+import cv2
 
 from .session import EpisodeWriter, mosaic_bgr, safe_cam_name
 
@@ -146,6 +149,11 @@ class DatasetRecorder:
         stored_video_format = str(meta.get("format") or "")
         self.video_format = str(video_format or stored_video_format or "mp4")
         self.merge = merge
+        self.streaming_encoding = bool((extra_meta or {}).get("streaming_encoding", meta.get("streaming_encoding", False)))
+        self.deferred_encoding = bool((extra_meta or {}).get("deferred_encoding", meta.get("deferred_encoding", False)))
+        self.encoder_threads = int((extra_meta or {}).get("encoder_threads", meta.get("encoder_threads", 2)))
+        if not 1 <= self.encoder_threads <= 32:
+            raise ValueError("encoder_threads must be between 1 and 32")
         self.dataset_id = self.root.name
         self.session_id = self.dataset_id
         self.dir = self.root
@@ -263,6 +271,8 @@ class DatasetRecorder:
             action_fps=self.action_fps,
             video_fps=self.video_fps,
             video_format=self.video_format,
+            streaming_encoding=self.streaming_encoding,
+            encoder_threads=self.encoder_threads,
             merge=self.merge,
             video=self.video,
             kind=self.kind,
@@ -445,11 +455,17 @@ class VideoLibrary:
         meta = _read_json(meta_path)
         meta["id"] = meta.get("id") or path.name
         meta["path"] = str(path)
+        encoding_path = path / "encoding.json"
+        if encoding_path.is_file():
+            meta["encoding"] = _read_json(encoding_path)
         meta["episodes"] = self._episodes(path, meta)
         duration = round(sum(float(episode.get("duration_s") or 0.0) for episode in meta["episodes"]), 4)
-        if meta.get("duration_s") != duration:
+        if meta.get("duration_s") != duration and meta.get("encoding", {}).get("state") not in {"recording", "encoding"}:
             meta["duration_s"] = duration
-            _write_json(meta_path, meta)
+            saved_meta = dict(meta)
+            saved_meta.pop("encoding", None)
+            saved_meta.pop("path", None)
+            _write_json(meta_path, saved_meta)
         return meta
 
     def _episodes(self, path: Path, meta: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -467,7 +483,11 @@ class VideoLibrary:
                 row = by_index.get(index, {"index": index})
                 row["index"] = index
                 row["dir"] = str(child)
-                videos = sorted((child / "videos").glob("*")) if (child / "videos").is_dir() else []
+                videos = (
+                    sorted(p for p in (child / "videos").glob("*") if p.is_file() and p.suffix.lower() in {".mp4", ".avi"})
+                    if (child / "videos").is_dir()
+                    else []
+                )
                 row["videos"] = [v.name for v in videos]
                 preview = child / "preview.jpg"
                 row["preview"] = preview.name if preview.is_file() else None
@@ -622,7 +642,11 @@ class VideoLibrary:
                 preview = dest / "preview.jpg"
                 if preview.is_file():
                     info["preview"] = preview.name
-                videos = sorted((dest / "videos").glob("*")) if (dest / "videos").is_dir() else []
+                videos = (
+                    sorted(p for p in (dest / "videos").glob("*") if p.is_file() and p.suffix.lower() in {".mp4", ".avi"})
+                    if (dest / "videos").is_dir()
+                    else []
+                )
                 info["videos"] = [v.name for v in videos]
                 info["duration_s"] = _episode_duration_s(dest, info, meta)
                 episodes.append(info)
@@ -666,6 +690,52 @@ class VideoLibrary:
             if candidate.is_file():
                 return candidate
         raise FileNotFoundError(cam)
+
+    def episode_browser_video(self, dataset_id: str, index: int, cam: str) -> Path:
+        """Serve a browser-compatible copy of legacy MP4V recordings when needed."""
+        source = self.episode_video(dataset_id, index, cam)
+        cache = source.parent / ".browser" / f"{source.stem}.mp4"
+        with self._lock:
+            if cache.is_file() and cache.stat().st_size > 0 and cache.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+                return cache
+
+            capture = cv2.VideoCapture(str(source))
+            try:
+                if not capture.isOpened():
+                    raise RuntimeError(f"Cannot read recorded video: {source.name}")
+                fourcc = int(capture.get(cv2.CAP_PROP_FOURCC))
+            finally:
+                capture.release()
+            codec = "".join(chr((fourcc >> (8 * offset)) & 0xFF) for offset in range(4))
+            if source.suffix.lower() == ".mp4" and codec.lower() in {"avc1", "h264", "x264"}:
+                return source
+
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg is None:
+                raise RuntimeError("FFmpeg is required to preview this recording's video codec")
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=cache.parent, suffix=".mp4", delete=False) as output:
+                temporary = Path(output.name)
+            try:
+                subprocess.run(
+                    [
+                        ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                        "-i", str(source), "-map", "0:v:0", "-an", "-c:v", "libx264",
+                        "-preset", "ultrafast", "-crf", "23", "-vf",
+                        "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
+                        "-movflags", "+faststart", str(temporary),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                temporary.replace(cache)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                raise RuntimeError(f"Cannot prepare browser video for {source.name}") from exc
+            finally:
+                temporary.unlink(missing_ok=True)
+            return cache
 
     def episode_preview(self, dataset_id: str, index: int) -> Path:
         path = episode_dir(self._dataset_dir(dataset_id), index) / "preview.jpg"

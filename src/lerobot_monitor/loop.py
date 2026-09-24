@@ -30,8 +30,10 @@ from .policy import (
     pose_from_action_tensor,
     predict_action_chunk,
 )
+from .recording_worker import RecordingWorker
 from .robot import FollowerArm
 from .store import JsonStore
+from .thread_priority import set_current_thread_priority
 from .types import JOINT_ORDER, RELAX_POSE, lerp_pose, merge_partial
 from .virtual_follower import VIRTUAL_PORT
 
@@ -199,7 +201,7 @@ class ControlLoop:
         self._live_last_t = 0.0
         self._live_control = False
 
-        self.writer: DatasetRecorder | None = None
+        self.writer: DatasetRecorder | RecordingWorker | None = None
         self.record_kind: str | None = None
         self.episode_index = 0
         self.recording_start_index = 0
@@ -768,7 +770,7 @@ class ControlLoop:
         self.writer = None
         self.record_kind = None
         path = writer.close()
-        if path is not None:
+        if path is not None and not getattr(writer, "deferred_encoding", False):
             try:
                 library = VideoLibrary(path.parent)
                 before = library.get(writer.dataset_id)
@@ -785,7 +787,7 @@ class ControlLoop:
         return path
 
     def _publish_recorder(self, recorder: DatasetRecorder, kind: str) -> None:
-        self.writer = recorder
+        self.writer = RecordingWorker(recorder, self.cameras) if isinstance(recorder, DatasetRecorder) else recorder
         self.record_kind = kind
         self.selected_dataset_id = recorder.dataset_id
         self.episode_index = recorder.episode_index
@@ -886,6 +888,13 @@ class ControlLoop:
         action_fps, video_fps = self._recording_rates(p)
         video_format = str(p.get("format") or self.config.recording.video_format)
         merge = bool(p["merge"] if p.get("merge") is not None else self.config.recording.merge)
+        encoder_threads = int(
+            p["encoder_threads"]
+            if p.get("encoder_threads") is not None
+            else self.config.recording.encoder_threads
+        )
+        if not 1 <= encoder_threads <= 32:
+            raise ValueError("encoder_threads must be between 1 and 32")
         extra = {
             "task": p.get("task") or existing.get("task") or "",
             "repo_id": p.get("repo_id") or existing.get("repo_id") or "",
@@ -896,11 +905,12 @@ class ControlLoop:
                 if p.get("streaming_encoding") is not None
                 else self.config.recording.streaming_encoding
             ),
-            "encoder_threads": int(
-                p["encoder_threads"]
-                if p.get("encoder_threads") is not None
-                else self.config.recording.encoder_threads
+            "deferred_encoding": bool(
+                p["deferred_encoding"]
+                if p.get("deferred_encoding") is not None
+                else self.config.recording.deferred_encoding
             ),
+            "encoder_threads": encoder_threads,
             "video": bool(
                 p["video"]
                 if p.get("video") is not None
@@ -946,28 +956,42 @@ class ControlLoop:
         if self.writer is None:
             return
         now = time.perf_counter()
+        elapsed = max(0.0, now - self.episode_t0)
         action_due = now >= self._next_action_t
         video_due = now >= self._next_video_t
         if not action_due and not video_due:
             return
         if action_due:
-            self.writer.add_action(
-                self.joints,
-                self.action or self.latched,
-                episode_index=self.episode_index,
-                kind=kind,
-            )
+            if isinstance(self.writer, RecordingWorker):
+                self.writer.add_action(
+                    self.joints,
+                    self.action or self.latched,
+                    episode_index=self.episode_index,
+                    kind=kind,
+                    elapsed_s=elapsed,
+                )
+            else:
+                self.writer.add_action(
+                    self.joints,
+                    self.action or self.latched,
+                    episode_index=self.episode_index,
+                    kind=kind,
+                )
             self._next_action_t = self._advance_deadline(self._next_action_t, self._action_interval, now)
         if video_due:
-            images: dict[str, Any] = {}
-            if self.writer.video:
-                images = self.cameras.latest_main_bgr_map()
-                if not images:
-                    images = self.cameras.latest_bgr_map()
-            self.writer.add_video(images, episode_index=self.episode_index)
+            if isinstance(self.writer, RecordingWorker):
+                self.writer.request_video(episode_index=self.episode_index, elapsed_s=elapsed)
+            else:
+                images: dict[str, Any] = {}
+                if self.writer.video:
+                    images = self.cameras.latest_main_bgr_map()
+                    if not images:
+                        images = self.cameras.latest_bgr_map()
+                self.writer.add_video(images, episode_index=self.episode_index)
             self._next_video_t = self._advance_deadline(self._next_video_t, self._video_interval, now)
 
     def _run(self) -> None:
+        set_current_thread_priority(1)
         if self.config.robot.auto_connect:
             self._connect_follower()
         if (

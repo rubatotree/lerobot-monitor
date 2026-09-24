@@ -536,6 +536,55 @@ def test_legacy_fps_sets_both_recording_rates(tmp_path: Path) -> None:
         recorder.close()
 
 
+def test_encoder_thread_setting_reaches_episode_writer(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    recorder = loop._open_recorder(
+        "record", {"name": "threaded", "streaming_encoding": True, "encoder_threads": 6}
+    )
+    try:
+        episode = recorder._ensure_episode(0)
+        assert episode.streaming_encoding is True
+        assert episode.encoder_threads == 6
+    finally:
+        recorder.close()
+    with pytest.raises(ValueError, match="encoder_threads"):
+        loop._open_recorder("record", {"name": "invalid", "encoder_threads": 0})
+
+
+def test_recording_camera_work_does_not_block_control_thread(tmp_path: Path) -> None:
+    from lerobot_monitor.recording_worker import RecordingWorker
+
+    loop = _loop(tmp_path)
+    camera_entered = threading.Event()
+    release_camera = threading.Event()
+    camera_threads: list[str] = []
+
+    def slow_camera() -> dict[str, object]:
+        camera_threads.append(threading.current_thread().name)
+        camera_entered.set()
+        assert release_camera.wait(timeout=5)
+        return {}
+
+    loop.cameras.latest_main_bgr_map.side_effect = slow_camera
+    loop.cameras.latest_bgr_map.return_value = {}
+    recorder = loop._open_recorder("record", {"name": "isolated", "streaming_encoding": False})
+    loop._publish_recorder(recorder, "record")
+    assert isinstance(loop.writer, RecordingWorker)
+    loop.episode_t0 = time.perf_counter()
+    loop._maybe_record("record")
+    try:
+        assert camera_entered.wait(timeout=2)
+        loop._next_action_t = 0
+        loop._next_video_t = 0
+        started = time.perf_counter()
+        loop._maybe_record("record")
+        assert time.perf_counter() - started < 0.2
+    finally:
+        release_camera.set()
+        loop._close_writer()
+    assert camera_threads == ["recording-worker", "recording-worker"]
+
+
 def test_recording_deadlines_do_not_drift_or_backfill_actions(tmp_path: Path, monkeypatch) -> None:
     loop = _loop(tmp_path)
     writer = SimpleNamespace(

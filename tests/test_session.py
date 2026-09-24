@@ -1,10 +1,118 @@
+import shutil
+import threading
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
-from lerobot_monitor.session import EpisodeWriter, SessionWriter, list_sessions, video_copies
+from lerobot_monitor.session import (
+    EpisodeWriter,
+    SessionWriter,
+    StreamingVideoWriter,
+    list_sessions,
+    video_copies,
+)
 from lerobot_monitor.types import JOINT_ORDER
+
+
+def test_streaming_encoder_keeps_control_writes_nonblocking_under_backpressure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lerobot_monitor import session as session_module
+
+    entered = threading.Event()
+    allow_write = threading.Event()
+    encoded: list[int] = []
+
+    class FakeInput:
+        closed = False
+
+        def write(self, raw: memoryview) -> int:
+            entered.set()
+            assert allow_write.wait(timeout=5)
+            encoded.append(raw[0])
+            return len(raw)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeError:
+        def read(self) -> bytes:
+            return b""
+
+        def close(self) -> None:
+            pass
+
+    class FakeProcess:
+        def __init__(self, command: list[str], **_: object) -> None:
+            self.args = command
+            self.stdin = FakeInput()
+            self.stderr = FakeError()
+            self.returncode = 0
+
+        def wait(self, timeout: int | None = None) -> int:
+            return 0
+
+    monkeypatch.setattr(session_module.shutil, "which", lambda _: "ffmpeg")
+    monkeypatch.setattr(session_module.subprocess, "Popen", FakeProcess)
+    writer = StreamingVideoWriter(tmp_path / "front.mp4", 30, (4, 4), 2)
+    try:
+        writer.write(np.zeros((4, 4, 3), dtype=np.uint8))
+        assert entered.wait(timeout=2)
+        for value in range(1, 10):
+            writer.write(np.full((4, 4, 3), value, dtype=np.uint8))
+        assert len(writer._pending) <= 2
+    finally:
+        allow_write.set()
+        writer.release()
+    assert len(encoded) == 10
+    assert encoded[0] == 0
+    assert encoded[-1] == 9
+
+
+def test_streaming_encoder_uses_configured_threads_and_writes_h264(tmp_path: Path) -> None:
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("FFmpeg is required for streaming encoding")
+    writer = EpisodeWriter(
+        tmp_path / "episode", index=0, action_fps=10, video_fps=10,
+        streaming_encoding=True, encoder_threads=3, merge=False,
+    )
+    writer.add_video({"front": np.zeros((48, 64, 3), dtype=np.uint8)}, elapsed_s=0.1)
+    process_args = writer._videos["front"]._process.args
+    assert process_args[process_args.index("-threads") + 1] == "3"
+    info = writer.close()
+    assert info["video_frames"] == 1
+    capture = cv2.VideoCapture(str(tmp_path / "episode" / "videos" / "front.mp4"))
+    try:
+        assert capture.isOpened()
+        fourcc = int(capture.get(cv2.CAP_PROP_FOURCC))
+        codec = "".join(chr((fourcc >> (8 * offset)) & 0xFF) for offset in range(4))
+        assert codec.lower() in {"avc1", "h264", "x264"}
+    finally:
+        capture.release()
+
+
+def test_streaming_encoder_closes_two_cameras_and_mosaic(tmp_path: Path) -> None:
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("FFmpeg is required for streaming encoding")
+    writer = EpisodeWriter(
+        tmp_path / "episode", index=0, action_fps=10, video_fps=10,
+        streaming_encoding=True, encoder_threads=2, merge=True,
+    )
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+    for index in range(3):
+        writer.add_video({"front": frame, "side": frame}, elapsed_s=(index + 1) / 10)
+    info = writer.close()
+    assert info["video_frames"] == 3
+    assert info["videos"] == ["front.mp4", "merged.mp4", "side.mp4"]
+    for name in ("front", "merged", "side"):
+        capture = cv2.VideoCapture(str(tmp_path / "episode" / "videos" / f"{name}.mp4"))
+        try:
+            assert capture.isOpened()
+            assert int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) == 3
+        finally:
+            capture.release()
 
 
 def test_session_writes_csv_and_video(tmp_path: Path) -> None:

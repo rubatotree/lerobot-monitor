@@ -72,6 +72,8 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert b"preset-btns" in html
         assert b'id="side-tab-record"' in html
         assert b'id="record-panel"' in html
+        assert b'id="hw-enc-threads"' in html
+        assert b'id="rec-enc-threads"' not in html
         assert b'id="side-tab-rollout"' in html
         assert b'id="rollout-panel"' in html
         assert b'id="task-mode-tabs"' not in html

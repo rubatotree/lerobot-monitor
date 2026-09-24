@@ -3134,8 +3134,10 @@ function recordFields() {
     root: ($("rec-root") && $("rec-root").value) || "",
     resume: false,
     video: !($("chk-rec-video") ) || $("chk-rec-video").checked,
-    streaming_encoding: !($("chk-rec-stream-enc")) || $("chk-rec-stream-enc").checked,
-    encoder_threads: Number($("rec-enc-threads") && $("rec-enc-threads").value) || 2,
+    streaming_encoding: !($("chk-rec-deferred-enc") && $("chk-rec-deferred-enc").checked)
+      && (!$("chk-rec-stream-enc") || $("chk-rec-stream-enc").checked),
+    deferred_encoding: !!($("chk-rec-deferred-enc") && $("chk-rec-deferred-enc").checked),
+    encoder_threads: Math.max(1, Math.min(32, Math.trunc(Number($("hw-enc-threads") && $("hw-enc-threads").value) || 2))),
     merge: true,
   };
 }
@@ -3182,7 +3184,8 @@ function applyRecordFields(p) {
   if (p.root != null && $("rec-root")) $("rec-root").value = p.root;
   if (p.video != null && $("chk-rec-video")) $("chk-rec-video").checked = !!p.video;
   if (p.streaming_encoding != null && $("chk-rec-stream-enc")) $("chk-rec-stream-enc").checked = !!p.streaming_encoding;
-  if (p.encoder_threads != null && $("rec-enc-threads")) $("rec-enc-threads").value = p.encoder_threads;
+  if (p.deferred_encoding != null && $("chk-rec-deferred-enc")) $("chk-rec-deferred-enc").checked = !!p.deferred_encoding;
+  if (p.encoder_threads != null && $("hw-enc-threads")) $("hw-enc-threads").value = p.encoder_threads;
   populateRecordDatasetSelect();
   setSelectValue($("rec-dataset-select"), recordDatasetValue());
   syncRecordDatasetSelection();
@@ -3327,7 +3330,7 @@ function hardwareFields() {
       settings,
     };
   });
-  return { schema: 1, system: false, devices, cameras };
+  return { schema: 1, system: false, devices, cameras, encoder_threads: recordFields().encoder_threads };
 }
 
 let uiTimer = null;
@@ -3348,6 +3351,7 @@ function persistUi() {
       hardware: {
         arm_port: $("arm-port") ? $("arm-port").value : "",
         leader_port: $("leader-port") ? $("leader-port").value : "",
+        encoder_threads: recordFields().encoder_threads,
       },
     }, "PUT").catch(() => {});
     updateTaskInfo();
@@ -3520,6 +3524,7 @@ function updateTaskInfo() {
   ]);
   set("info-record", [
     ...envLines,
+    rec.deferred_encoding ? "# Monitor mode: save camera JPEGs, encode after recording" : null,
     "# in-process  equivalent CLI",
     "lerobot-record",
     ...robotFlags,
@@ -3541,6 +3546,7 @@ function updateTaskInfo() {
   ]);
   set("info-roll", [
     ...envLines,
+    autoRecord && rec.deferred_encoding ? "# Monitor mode: save camera JPEGs, encode after recording" : null,
     "# direct lerobot-rollout CLI",
     "lerobot-rollout",
     flag("strategy.type", autoRecord ? "sentry" : "base"),
@@ -3559,7 +3565,7 @@ function updateTaskInfo() {
     ...extraFlags(roll.extra),
   ]);
 }
-["rec-task", "rec-dataset-select", "rec-repo", "rec-ep", "rec-reset", "rec-num", "rec-action-fps", "rec-video-fps", "rec-format", "rec-root", "chk-rec-video", "chk-rec-stream-enc", "rec-enc-threads", "pol-path", "pol-task", "pol-dur", "pol-fps", "pol-dev", "arm-port", "leader-port"].forEach((id) => {
+["rec-task", "rec-dataset-select", "rec-repo", "rec-ep", "rec-reset", "rec-num", "rec-action-fps", "rec-video-fps", "rec-format", "rec-root", "chk-rec-video", "chk-rec-stream-enc", "chk-rec-deferred-enc", "hw-enc-threads", "pol-path", "pol-task", "pol-dur", "pol-fps", "pol-dev", "arm-port", "leader-port"].forEach((id) => {
   const el = $(id);
   if (!el) return;
   el.addEventListener("change", persistUi);
@@ -3686,6 +3692,9 @@ async function loadSelectedPreset() {
         throw new Error("exit replay before loading a hardware preset");
       }
       const result = await api("/api/hardware/apply", { name });
+      if (payload.encoder_threads != null && $("hw-enc-threads")) {
+        $("hw-enc-threads").value = Math.max(1, Math.min(32, Number(payload.encoder_threads) || 2));
+      }
       const devices = payload.devices && typeof payload.devices === "object" ? payload.devices : {};
       for (const role of ["arm", "leader"]) {
         const select = $(`${role}-port`);
@@ -3932,6 +3941,10 @@ bind("btn-hdr-rollout", () => {
       const recording = recordFields();
       payload.action_fps = recording.action_fps;
       payload.video_fps = recording.video_fps;
+      payload.streaming_encoding = recording.streaming_encoding;
+      payload.deferred_encoding = recording.deferred_encoding;
+      payload.encoder_threads = recording.encoder_threads;
+      payload.video = recording.video;
     }
     return api("/api/rollout/start", payload);
   });
@@ -3974,6 +3987,7 @@ function captureFields() {
     root: rec.root,
     video: rec.video,
     streaming_encoding: rec.streaming_encoding,
+    deferred_encoding: rec.deferred_encoding,
     encoder_threads: rec.encoder_threads,
     merge: true,
   };
@@ -4960,9 +4974,46 @@ function renderVideos() {
     return;
   }
   rows.forEach((vid) => {
-    ol.appendChild(makeLibraryItem("video", vid, () => selectVideo(vid.id), libraryResourceTools("video", vid)));
+    const item = makeLibraryItem("video", vid, () => selectVideo(vid.id), libraryResourceTools("video", vid));
+    if (vid.encoding && vid.encoding.state && vid.encoding.state !== "done") {
+      const encoding = vid.encoding;
+      const bar = document.createElement("div");
+      bar.className = `lib-progress${encoding.state === "recording" ? " indeterminate" : ""}`;
+      bar.setAttribute("role", "progressbar");
+      bar.setAttribute("aria-label", "Video encoding");
+      if (encoding.state !== "recording") bar.setAttribute("aria-valuenow", String(Number(encoding.percent) || 0));
+      const track = document.createElement("div");
+      track.className = "lib-progress-track";
+      const fill = document.createElement("div");
+      fill.className = "lib-progress-fill";
+      fill.style.width = `${Math.max(0, Math.min(100, Number(encoding.percent) || 0))}%`;
+      const label = document.createElement("span");
+      label.className = "lib-progress-label";
+      label.textContent = encoding.state === "failed"
+        ? `Encoding failed: ${encoding.error || "unknown error"}`
+        : encoding.state === "recording"
+          ? "Saving JPEG frames…"
+          : `${encoding.message || "Encoding video"} · ${Number(encoding.percent) || 0}%`;
+      track.appendChild(fill);
+      bar.append(track, label);
+      item.appendChild(bar);
+    }
+    ol.appendChild(item);
   });
   populateRecordDatasetSelect();
+}
+
+async function pollVideoEncoding() {
+  if (activeLibrarySearchKind !== "videos"
+      && !videosCache.some((row) => ["recording", "encoding"].includes(row.encoding?.state))) return;
+  try {
+    const rows = await fetchJson("/api/videos");
+    if (!Array.isArray(rows)) return;
+    const wasEncoding = videosCache.some((row) => row.encoding?.state === "encoding");
+    videosCache = rows;
+    renderVideos();
+    if (wasEncoding && !rows.some((row) => row.encoding?.state === "encoding")) syncEpisodeSource("videos");
+  } catch { /* The manual refresh button reports persistent failures. */ }
 }
 
 const datasetTransfers = new Map();
@@ -6871,7 +6922,7 @@ function renderVizCams(cameras, generation) {
       if (generation !== previewRequestGeneration) return;
       const state = wrap.querySelector(".media-state");
       if (state) {
-        state.textContent = "Video could not be loaded. Check that the recorded file still exists.";
+        state.textContent = "Video could not be loaded. Check the recording codec and FFmpeg availability.";
         state.classList.add("error");
       }
       video.classList.add("media-loading");
@@ -8372,6 +8423,9 @@ fetch(BASE + "/api/meta")
     refreshPresetSelects();
     if (m.ui) {
       applyRecordFields(m.ui.record);
+      if (m.ui.hardware && m.ui.hardware.encoder_threads != null && $("hw-enc-threads")) {
+        $("hw-enc-threads").value = m.ui.hardware.encoder_threads;
+      }
       applyRolloutFields(m.ui.rollout);
       applyJointUi(m.ui.joints);
       if (m.ui.auto_record != null) autoRecord = !!m.ui.auto_record;
@@ -8392,6 +8446,9 @@ fetch(BASE + "/api/meta")
       }
       if (m.recording.root && $("rec-root") && !$("rec-root").value) $("rec-root").value = m.recording.root;
       if (m.recording.default_num_episodes && $("rec-num")) $("rec-num").value = m.recording.default_num_episodes;
+      if (m.recording.encoder_threads && !(m.ui && (m.ui.hardware && m.ui.hardware.encoder_threads || m.ui.record && m.ui.record.encoder_threads)) && $("hw-enc-threads")) {
+        $("hw-enc-threads").value = m.recording.encoder_threads;
+      }
     }
     refreshPorts();
     updateResumeTargetUi();
@@ -8404,3 +8461,4 @@ connectWs();
 refreshSessions();
 refreshLibrary();
 setInterval(refreshSessions, 8000);
+setInterval(pollVideoEncoding, 2000);

@@ -383,8 +383,9 @@
                 <input type="checkbox" id="chk-rec-stream-enc" checked/>
                 Streaming encoding
               </label>
-              <label>Encoder threads
-                <input id="rec-enc-threads" type="number" value="2" min="1" step="1"/>
+              <label class="check">
+                <input type="checkbox" id="chk-rec-deferred-enc"/>
+                Save JPEGs, encode after recording
               </label>
               <div class="row-actions">
                 <button type="button" id="btn-rec-next" class="ghost">Next ep</button>
@@ -463,6 +464,9 @@
         </details>
         <div class="task-block">
           <h3>Cameras</h3>
+          <label>Video encoder threads per stream
+            <input id="hw-enc-threads" type="number" value="2" min="1" max="32" step="1"/>
+          </label>
           <div id="cam-rows"></div>
         </div>
         </div>
@@ -602,7 +606,7 @@
     </div>
   </div>
 
-  <script src="/lerobot/static/app.js?v=20260923-transfer-progress"></script>
+  <script src="/lerobot/static/app.js?v=20260924-deferred-encoding"></script>
   <script type="module" src="/lerobot/static/robot-preview.js?v=20260923-arm-preview-2"></script>
 </body>
 </html>

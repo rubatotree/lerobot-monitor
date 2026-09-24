@@ -1,10 +1,12 @@
 import json
 import os
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -26,6 +28,35 @@ from lerobot_monitor.library import (
 from lerobot_monitor.session import mosaic_bgr
 from lerobot_monitor.store import JsonStore
 from lerobot_monitor.types import JOINT_ORDER
+
+
+def test_legacy_mp4v_video_gets_cached_browser_copy(tmp_path: Path) -> None:
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("FFmpeg is required for legacy video previews")
+    library = VideoLibrary(tmp_path)
+    folder = tmp_path / "recording" / "episodes" / "000000" / "videos"
+    folder.mkdir(parents=True)
+    source = folder / "front.mp4"
+    writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"mp4v"), 10, (64, 48))
+    assert writer.isOpened()
+    for _ in range(3):
+        writer.write(np.zeros((48, 64, 3), dtype=np.uint8))
+    writer.release()
+
+    preview = library.episode_browser_video("recording", 0, "front")
+    assert preview != source
+    assert source.is_file()
+    assert preview.is_file()
+    capture = cv2.VideoCapture(str(preview))
+    try:
+        fourcc = int(capture.get(cv2.CAP_PROP_FOURCC))
+        codec = "".join(chr((fourcc >> (8 * offset)) & 0xFF) for offset in range(4))
+        assert codec.lower() in {"avc1", "h264", "x264"}
+    finally:
+        capture.release()
+    assert library.episode_browser_video("recording", 0, "front") == preview
+    (tmp_path / "recording" / "meta.json").write_text('{"episodes": []}', encoding="utf-8")
+    assert library.get("recording")["episodes"][0]["videos"] == ["front.mp4"]
 
 
 def test_mosaic_grid() -> None:

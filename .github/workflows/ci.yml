@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv sync --extra dev
+      - run: uv run pytest -q
+      - run: node --check src/lerobot_monitor/web/static/app.js
+      - run: node scripts/verify-model-delete-id.cjs
+      - run: node scripts/verify-dataset-delete-order.cjs

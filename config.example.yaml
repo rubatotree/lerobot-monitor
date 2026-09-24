@@ -1,16 +1,16 @@
-# Default SO-101 layout matching scripts.ps1 (Windows).
+# Example settings. Copy to config.yaml and adjust for your own devices.
 # Cameras are probed locally (DirectShow / V4L). Enable a network stream in
 # the Cameras panel; only those streams appear on the main grid.
 
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8090
   base_path: "/lerobot"
 
 robot:
   type: so101_follower
-  port: COM6
-  id: my_awesome_follower_arm
+  port: ""
+  id: so101_follower
   use_degrees: true
   auto_connect: false
   disable_torque_on_disconnect: true
@@ -22,8 +22,8 @@ virtual_follower:
 
 leader:
   type: so101_leader
-  port: COM5
-  id: my_awesome_leader_arm
+  port: ""
+  id: so101_leader
   use_degrees: true
   auto_connect: false
 
@@ -54,7 +54,7 @@ recording:
 library:
   videos_root: data/videos
   dataset_roots:
-    - D:/datasets/lerobot
+    - data/datasets
   models_roots:
     - data/models
     - ../outputs
@@ -65,7 +65,7 @@ robot_models:
   max_bundle_mb: 512
 
 rollout:
-  device: cuda
+  device: cpu
   default_duration_s: 60
   default_fps: 15
   rename_map:

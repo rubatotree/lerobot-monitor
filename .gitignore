@@ -12,5 +12,15 @@ data/
 *.mp4
 *.csv
 .env
+config.yaml
+.pytest*/
+.pytest_user_*/
+_pt_run*/
+_pt_probe/
+.tmp*/
+.tmp_*
+.uv-cache*/
+dsh-tmp-*/
+docs/multi_agent.md
 .DS_Store
 Thumbs.db

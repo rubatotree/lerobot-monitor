@@ -262,7 +262,7 @@ def test_port_listing_merges_virtual_rows(registry_home: Path) -> None:
 
 
 def test_install_socket_transport_is_idempotent() -> None:
-    import scservo_sdk
+    scservo_sdk = pytest.importorskip("scservo_sdk")
 
     install_socket_transport()
     installed = scservo_sdk.PortHandler
@@ -272,7 +272,7 @@ def test_install_socket_transport_is_idempotent() -> None:
 
 def test_socket_url_dispatches_to_the_socket_handler() -> None:
     """装完之后 scservo_sdk.PortHandler 必须按名字分流，且不能碰真机串口。"""
-    import scservo_sdk
+    scservo_sdk = pytest.importorskip("scservo_sdk")
 
     install_socket_transport()
     virtual = scservo_sdk.PortHandler("socket://127.0.0.1:1")
@@ -303,6 +303,7 @@ def _load_emulator() -> Any:
 @pytest.fixture
 def emulator() -> Any:
     """起一台仿真总线。它假装自己是六颗 STS3215，监听一个本地 TCP 端口。"""
+    pytest.importorskip("scservo_sdk")
     install_socket_transport()
     module = _load_emulator()
     bus = module.SimBus()

@@ -5,11 +5,22 @@ from lerobot_monitor.config import MonitorConfig, RecordingConfig
 
 def test_default_config() -> None:
     cfg = MonitorConfig()
+    assert cfg.server.host == "127.0.0.1"
     assert cfg.server.port == 8090
     assert cfg.server.base_path == "/lerobot"
     assert cfg.robot.auto_connect is False
     assert cfg.robot.type == "so101_follower"
     assert cfg.snapshots_root() == Path("data/snapshots")
+
+
+def test_public_example_stays_local_and_does_not_select_serial_ports() -> None:
+    example = Path(__file__).resolve().parents[1] / "config.example.yaml"
+    cfg = MonitorConfig.load(example)
+    assert cfg.server.host == "127.0.0.1"
+    assert cfg.robot.port == ""
+    assert cfg.leader.port == ""
+    assert cfg.robot.auto_connect is False
+    assert cfg.leader.auto_connect is False
 
 
 def test_load_yaml(tmp_path: Path) -> None:

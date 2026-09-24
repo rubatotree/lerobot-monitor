@@ -1,52 +1,55 @@
 # LeRobot Monitor
 
-独立于 `lerobot-record` / `lerobot-teleoperate` / `lerobot-rollout` 的机械臂监控与控制网页。
+用于 SO-101 的本地监控与控制网页。它提供相机预览、关节控制、遥操作、录制、数据集与模型管理、策略 rollout，以及无硬件时的虚拟从臂和 3D 预览。
 
-空闲时不占用 COM 口。相机由本进程探测（不再依赖 `win_cam_server`）；在 Cameras 菜单里改分辨率/端口并打开网络流后，主界面才显示该路画面。
+项目默认只监听 `127.0.0.1:8090`。控制接口没有登录认证；需要从其他设备访问时，请只在可信网络中使用，并在入口处配置认证。
 
-## 运行
+## 环境
 
-不要同时再开 `robot_tools/win_cam_server.py`（同样占用 8090）。机械臂/策略需要 sibling 的 `lerobot` 环境：
+- Python 3.12 或更高版本
+- [uv](https://docs.astral.sh/uv/)（推荐）
+- 浏览器支持 WebGL；虚拟从臂不需要实体设备
+- 真正的 SO-101 控制和策略推理需要在同一 Python 环境安装兼容的 [LeRobot](https://github.com/huggingface/lerobot) 及其硬件/模型依赖
+
+## 快速开始
+
+在仓库根目录运行：
 
 ```powershell
-cd d:\repos\lerobot\lerobot-monitor
-.\run.ps1
+uv sync --extra dev
+uv run lerobot-monitor --config config.example.yaml
 ```
 
-浏览器：`http://127.0.0.1:8090/lerobot/`
+打开 [http://127.0.0.1:8090/lerobot/](http://127.0.0.1:8090/lerobot/)。示例配置默认启用虚拟从臂，串口自动连接关闭，可以先在无硬件环境中检查界面。
 
-无硬件时：`uv sync --extra dev; uv run lerobot-monitor`。
+如需使用自己的串口、数据目录或相机设置，复制 `config.example.yaml` 为 `config.yaml` 后编辑。后者已被 Git 忽略：
 
-## 界面
+```powershell
+Copy-Item config.example.yaml config.yaml
+uv run lerobot-monitor --config config.yaml
+```
 
-- Arm preview：底部左侧的 3D 机械臂预览，宽度可拖拽并持久化。支持
-  orbit / pan / zoom、双击连杆聚焦、ISO / Front / Side / Top 预设、内置 SO-101，
-  以及本地目录或 Hugging Face `robot_model.json` 型号包。动作来源可选 Joints、
-  Joint state、Commanded、Prediction 或 Auto；Auto 会按 joint 滑条、动作曲线 hover、
-  state 曲线 hover、主相机关注的优先级切换，并在 prediction 缺档时逐级回退。
-- Virtual follower：没有真实从臂时默认自动连接 `virtual://preview`，遥操作、录制与
-  rollout 可继续运行。显式连接真实从臂时由真实设备接管；关闭 Arm preview 会释放
-  WebGL context 并断开虚拟 follower。腕部虚拟相机只用于观察，不进入录像或策略输入。
-- Cameras：列出本机设备，设置宽高、网络端口，开关网络流。Blender 注册表里
-  `cameras[]` 公布的相机也会自动出现为远程 MJPEG 设备；远程相机的 URL、画幅
-  与 FPS 由 Blender 面板控制，monitor 只负责启用、主视图和策略输入开关。
-  仅启用的主视图相机出现在主网格。
-- Joints 面板：Serial control 显式连接/断开 follower；同步源可选 Follower、Leader、
-  Joint state、Command、Predict；Speed cap 统一限制 live 输出与 leader relay 的
-  `°/s` 最大变化量。Serial control 开启且无控制任务时，面板直接发送当前 command，
-  不再需要 Apply。回放 dataset/video 时，Joint state 与 Command 会跟随白色游标处的
-  `obs.*` / `act.*` 插值；Serial control 开启时会把这些 pose 直接下发到 follower。
-  关闭 Serial control 立即断开串口，Joints 面板操作不会退出 replay。同步源与
-  Speed cap 不进入 pose preset。Sync 支持 None 和全部源手动编辑；编辑或加载 pose
-  preset 会暂停对应关节的持续同步，来源接近或按下 Sync 按钮后恢复。Sync 右侧按钮
-  也可立即把当前源数值填入 command；所有关节进入 cur 容差并全绿后自动恢复同步并点亮
-  Sync。EXIT 固定在视频区域右上角。Serial control 右侧的 `send` 单次下发当前 command，`control` 灯点亮
-  后持续下发，默认熄灭；control 关闭时 preset 只更新面板，不写串口。Sync 使用 `sync`
-  单次拉取与 `auto` 持续跟随双控，所有源行为一致，None 不锁定 auto。send/sync 使用
-  上传/下载图标表示相反方向，两个持续输出灯都显示 `auto`。
-- 遥操作 / 录制 / 部署 rollout（可选把视频+关节写成 session）
-- E-STOP（Esc）释放力矩并交还串口
-- 右侧 Joints / Record / Rollout / Debug / Hardware 各自保存 preset；Hardware preset
-  按设备身份恢复串口和相机，并可在 Monitor 服务重启后自动重连。
+在 Linux/macOS 上可用 `cp config.example.yaml config.yaml`，然后执行相同的 `uv` 命令。
 
-Session 目录：`data/sessions/<timestamp>_<kind>/`。
+Windows 也可以运行 `.\run.ps1`。它优先读取本地 `config.yaml`，否则读取示例配置；若检测到相邻的 LeRobot 开发环境，会沿用该 Python。也可设置 `LEROBOT_MONITOR_PYTHON` 指向已经装有 LeRobot 的解释器，设置 `LEROBOT_SRC` 指向 LeRobot 的 `src` 目录。
+
+## 配置与数据
+
+- `server.host` 默认是 `127.0.0.1`。显式改为 `0.0.0.0` 或使用 `--host` 会开放控制接口；应用本身没有认证。
+- `robot.port` 和 `leader.port` 初始为空。连接实体设备前，填入对应端口和校准 ID。
+- `recording.root`、`library.*_roots`、`robot_models.root` 可改为你自己的目录。
+- 运行数据默认放在 `data/`，不会提交到 Git。Hugging Face 凭据请使用其标准本机认证方式，不要写入配置文件。
+
+## 开发与验证
+
+```powershell
+uv run pytest -q
+node --check src/lerobot_monitor/web/static/app.js
+node scripts/verify-model-delete-id.cjs
+```
+
+应用后端位于 `src/lerobot_monitor/`，前端资源位于 `src/lerobot_monitor/web/static/`。控制循环独占机械臂总线；HTTP 接口向循环投递命令。硬件/策略依赖按需导入，因此基础页面与虚拟从臂可独立运行。
+
+## 许可与资源
+
+项目源码采用 Apache-2.0，见 [LICENSE](LICENSE)。内置 Three.js、Chart.js、URDFLoader 和 SO-101 模型资源的来源与许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

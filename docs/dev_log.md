@@ -12,6 +12,29 @@
 - 根因是 Feetech `sync_write` 广播没有回执，`FollowerArm.send_pose()` 返回后 TCP 服务线程仍可能尚未写入目标寄存器。测试现以有界等待确认目标已进入 `MotorBank`，再调用 `tick()` 推进场景；生产控制路径不变。
 - 使用仓库根目录带 Feetech SDK 的虚拟环境，专项连续 12 次通过；完整 monitor 测试 `239 passed, 1 skipped`。monitor 自身 `.venv` 缺少 `scservo_sdk`，不适合运行该集成测试。
 
+## 2026-09-23（观看中删除与数据集上游设置）
+
+- 删除正在观看的数据集时，确认后先退出回放、卸载视频，等待媒体释放和界面绘制，再发送删除请求；Windows 临时共享/拒绝访问（WinError 32/5）的后端重试延长至约 5 秒。前端顺序脚本验证“确认 → 退出 → 绘制 → 删除”，取消确认时不退出。
+- 数据集编辑窗口把本地目录、Hugging Face upstream、revision 和新仓库 public/private 拆开。Hub 缓存快照不预填为用户指定的本地目录；更新 upstream 时保留真实本地目录，切换到新仓库时不沿用旧仓库缓存。
+- 扫描发现的本地目录不再把路径推导出的卡片 ID 当作已设置的 upstream；设置 upstream 后才启用下载，上传还需有效本地数据。新建空数据集可选择可见性，留空 Repo ID 时保持纯本地。
+- 上传任务保存点击时的 private 选项，新建 Hub 仓库时传给 `create_repo`；已存在的 Hub 仓库可见性由 Hub 保持。模拟 Hub 测试覆盖 private/public，API 回归覆盖独立路径和上游。
+- 验证：数据集相关测试 `30 passed`，后补 WinError 5/32 专项测试 `2 passed`；前端删除顺序脚本与 Chrome 元数据窗口检查通过，JS/Python 语法与 diff 检查通过。完整测试 `237 passed, 1 skipped, 1 failed`（专项测试增例前）；失败的 `test_sim.py::test_rollout_style_action_moves_the_emulated_scene` 单独复跑仍失败，未涉及本次数据集改动。
+
+## 2026-09-23（本地数据集删除后清理）
+
+- 定位扫描型本地数据集删除时的 404：文件夹已删除，`DatasetRegistry.delete()` 却再次扫描该路径，导致后续记录与界面清理中断。现改为使用删除前取得的条目完成清理。
+- 删除目标正在回放的数据集前先关闭 episode 视图，暂停视频、移除 `src` 并调用 `load()` 释放浏览器媒体请求；后端仅对 Windows 临时共享冲突做有界重试。
+- 删除成功时立即从前端缓存移除卡片并重新扫描；删除请求返回 404 时也刷新列表，以清理已不存在的旧卡片。
+- 本地扫描型数据集删除及首次 WinError 32 后成功重试的 API 回归通过。完整测试 `236 passed, 1 skipped`；`node --check`、Python compile 与 `git diff --check` 通过。当前机器上指定的 `plus80` 目录已不存在，未删除旁边的 `_old` 目录；未在仍运行的浏览器会话中复测实际视频句柄释放。
+
+## 2026-09-23（数据集、上传下载与同步故障修复）
+
+- 核对工作区已有的异步 DatasetTransferManager、进度卡片、v3 task 读取、来源保存与 Hub 缓存删除改动；保留原有未提交成果。
+- 修复 Hugging Face `/datasets/org/repo` URL 解析；显式下载强制刷新缓存。绑定普通本地目录的数据集下载后在同目录复制完整快照并替换原目录，失败时保留旧目录；上传按本地文件集合分批提交并清理云端旧文件，保留 Hub 的 `.gitattributes`。
+- 拒绝空路径上传，限制普通目录符号链接；Hub 快照可读取指向同仓库 blob 的链接。数据集来源改名时保留本地目录与描述，阻止指向已注册 repo；传输结束不再恢复已删除或改源的条目。
+- 删除数据集时先检查传输状态并删除文件，成功后才移除 Library 记录；传输最终状态在记录持久化完成后才对前端可见。前端避免旧状态回退，修复删除前丢失选中态，以及来源变化后选中 ID 未更新。
+- 回归：完整 monitor 测试 `235 passed, 1 skipped`；唯一跳过项是 Windows 缺少创建文件符号链接的权限（WinError 1314）。`node --check`、Python compile 与 `git diff --check` 通过。未执行真实账号上传或大体积 Hub 同步。
+
 ## 2026-09-23（3D 虚拟从臂预览）
 
 - 新增 `VirtualFollowerArm` 与 `virtual://preview`：无硬件时默认自动连接，真实从臂
@@ -536,3 +559,10 @@
 - 浏览器回归覆盖：静置 5 秒停绘、相机不刷新腕部、姿态收敛、主/腕部独立可见性、电源重开、延迟模型失效、模型切换、DPR 1/2、280/480px 面板和 900px 窄屏。
 - 可见 Chrome 同机测量：旧版相机交互产生超过 10k 次主/腕部绘制，新版主视角 59.8 FPS、P95 17.9ms、无重复提交，静态腕部零绘制；系统级 GPU 样本从 46–100% 降至 5–13%。GPU 样本包含其他桌面应用，仅作为同流程参考。
 - 验证：调度测试 7/7；Arm Preview 相关 Python 测试 11 passed、1 skipped；完整测试 204 passed、2 skipped，另有 2 failures / 3 errors 均因当前 venv 缺少 `scservo_sdk`。
+## 2026-09-24：公开仓库整理
+
+- 将模型搜索与传输日志修正、数据集库管理和同步改动分成独立提交；模型库删除故障已在此前提交修复。
+- 本地配置 `config.yaml` 改为忽略，提供不含本机路径与串口的 `config.example.yaml`；服务默认监听 `127.0.0.1`。
+- 补充公开 README、Apache-2.0 与第三方资源许可说明、Windows 启动脚本和 CI；确认构建产物包含静态资源及许可文件。
+- 验证：项目虚拟环境中 234 passed、9 skipped；Node 前端语法与模型/数据集删除行为脚本通过；离线构建和锁文件检查通过。
+- 剩余限制：实体机械臂和策略推理仍需额外安装兼容的 LeRobot、硬件 SDK 与模型依赖；公开服务接口无内建认证，默认仅监听本机。

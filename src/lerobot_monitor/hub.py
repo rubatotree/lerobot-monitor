@@ -115,7 +115,12 @@ class RuntimeHub:
                 data = self.loop.snapshot()
         data["runtime"] = dict(self.runtime)
         data["runtime_label"] = format_runtime(self.runtime)
+        data["dataset_transfers"] = self.dataset_transfers()
         return data
+
+    def dataset_transfers(self) -> list[dict[str, Any]]:
+        """In-flight and recently finished Hub dataset transfers."""
+        return self.dataset_registry.transfers.states()
 
     def static_meta(self) -> dict[str, Any]:
         return {

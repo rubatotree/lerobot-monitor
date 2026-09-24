@@ -1,7 +1,10 @@
 import asyncio
 import base64
 import json
+import os
 import re
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -12,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lerobot_monitor import app as app_module
-from lerobot_monitor import model_hub
+from lerobot_monitor import dataset_hub, model_hub
 from lerobot_monitor.app import create_app
 from lerobot_monitor.cameras import RemoteMjpegCamera
 from lerobot_monitor.config import (
@@ -24,6 +27,7 @@ from lerobot_monitor.config import (
     ServerConfig,
 )
 from lerobot_monitor.policy import ActionChunk
+from lerobot_monitor.store import JsonStore
 
 
 def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
@@ -315,6 +319,188 @@ def test_episode_edit_persists(tmp_path: Path, monkeypatch) -> None:
             assert reopened.get("/lerobot/api/ui").json()["selected_video"] == video_id
 
 
+def test_dataset_transfer_api_reports_progress_on_the_card(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    monkeypatch.delenv("LEROBOT_HOME", raising=False)
+    root = tmp_path / "snapshot"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text('{"fps": 15, "total_episodes": 0}\n', encoding="utf-8")
+    written = {"bytes": 0}
+    release = threading.Event()
+
+    def downloader(repo_id: str, *, revision: str = "") -> str:
+        release.wait(timeout=5)
+        return str(root)
+
+    app = create_app(_debug_config(tmp_path))
+    with TestClient(app) as client:
+        registry = app.state.hub.dataset_registry
+        registry.transfers = dataset_hub.DatasetTransferManager(
+            poll_seconds=0.05,
+            on_finish=registry._finish_transfer,
+            progress_probe=lambda repo_id: written["bytes"],
+            total_probe=lambda repo_id, revision: 100,
+            downloader=downloader,
+        )
+
+        started = client.post(
+            "/lerobot/api/datasets/download",
+            json={"remote": "user/blocks", "revision": ""},
+        )
+        assert started.status_code == 200
+        assert started.json()["repo_id"] == "user/blocks"
+        assert started.json()["direction"] == "download"
+
+        # The card exists before the bytes do, so the bar has somewhere to live.
+        staged = next(
+            row for row in client.get("/lerobot/api/datasets").json() if row["repo_id"] == "user/blocks"
+        )
+        assert staged["path"] == ""
+
+        written["bytes"] = 40
+        deadline = time.time() + 5
+        progress: list[dict] = []
+        while time.time() < deadline:
+            progress = client.get("/lerobot/api/datasets/transfers").json()
+            if progress and progress[0]["transferred_bytes"] == 40:
+                break
+            time.sleep(0.05)
+        assert progress and progress[0]["percent"] == 40.0
+        assert progress[0]["status"] == "transferring"
+        assert app.state.hub.snapshot()["dataset_transfers"][0]["active"] is True
+        blocked_delete = client.delete(
+            "/lerobot/api/library", params={"kind": "dataset", "id": "user/blocks"}
+        )
+        assert blocked_delete.status_code == 409
+        assert registry.store.dataset("user/blocks") is not None
+
+        release.set()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if registry.transfers.get("user/blocks")["status"] == "done":
+                break
+            time.sleep(0.05)
+        done = next(
+            row for row in client.get("/lerobot/api/datasets").json() if row["repo_id"] == "user/blocks"
+        )
+        assert done["path"] == str(root)
+        assert done["metadata"]["episodes"] == 0
+
+
+def test_dataset_upload_api_reports_file_progress(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    monkeypatch.delenv("LEROBOT_HOME", raising=False)
+    datasets_root = tmp_path / "datasets"
+    dataset = datasets_root / "user" / "series"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text('{"fps": 10, "total_episodes": 1}\n', encoding="utf-8")
+    (dataset / "data").mkdir()
+    for index in range(3):
+        (dataset / "data" / f"file-{index:03d}.parquet").write_bytes(b"y" * 200)
+
+    release = threading.Event()
+    finished: list[dict] = []
+
+    def uploader(repo_id, folder, *, revision="", private=False, on_progress=None):
+        assert private is True
+        if on_progress is not None:
+            on_progress(400, 2)
+        release.wait(timeout=5)
+        return str(folder)
+
+    cfg = MonitorConfig(
+        store_path=tmp_path / "store.json",
+        server=ServerConfig(port=0, base_path="/lerobot"),
+        robot=RobotConfig(auto_connect=False, port="COM_UNUSED"),
+        cameras=CamerasConfig(probe=False),
+        recording=RecordingConfig(root=tmp_path / "videos"),
+        library=LibraryConfig(videos_root=tmp_path / "videos", dataset_roots=[datasets_root]),
+    )
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        registry = app.state.hub.dataset_registry
+        registry.transfers = dataset_hub.DatasetTransferManager(
+            poll_seconds=0.05,
+            on_finish=lambda state: (finished.append(state), registry._finish_transfer(state)),
+            uploader=uploader,
+        )
+        listed = client.get("/lerobot/api/datasets").json()
+        assert [row["id"] for row in listed] == ["user/series"]
+        assert listed[0]["upstream"] is False
+        configured = client.put(
+            "/lerobot/api/library",
+            json={"kind": "dataset", "id": "user/series", "repo_id": "user/series", "private": True},
+        )
+        assert configured.status_code == 200, configured.text
+        assert configured.json()["path"] == str(dataset)
+
+        started = client.post("/lerobot/api/datasets/user%2Fseries/upload")
+        assert started.status_code == 200
+        assert started.json()["direction"] == "upload"
+        assert started.json()["private"] is True
+
+        deadline = time.time() + 5
+        progresses: list[dict] = []
+        while time.time() < deadline:
+            progresses = client.get("/lerobot/api/datasets/transfers").json()
+            if progresses and progresses[0]["files_done"] == 2:
+                break
+            time.sleep(0.05)
+        assert progresses and progresses[0]["files_done"] == 2
+        assert progresses[0]["files_total"] == 4
+        assert 0 < progresses[0]["percent"] < 100
+
+        release.set()
+        deadline = time.time() + 5
+        while not finished and time.time() < deadline:
+            time.sleep(0.05)
+        assert finished and finished[0]["status"] == "done"
+        assert finished[0]["direction"] == "upload"
+
+
+def test_library_delete_removes_hub_cache_folder_and_mismatched_ids(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    monkeypatch.delenv("LEROBOT_HOME", raising=False)
+    repo_dir = tmp_path / "hf" / "hub" / "datasets--user--blocks"
+    snapshot = repo_dir / "snapshots" / "rev1"
+    (snapshot / "meta").mkdir(parents=True)
+    (snapshot / "meta" / "info.json").write_text('{"fps": 15, "total_episodes": 2}\n', encoding="utf-8")
+    (snapshot / "data").mkdir()
+    read_only = snapshot / "data" / "file-000.parquet"
+    read_only.write_bytes(b"payload")
+    os.chmod(read_only, 0o444)
+    (repo_dir / "blobs").mkdir(parents=True)
+    (repo_dir / "blobs" / "abc").write_bytes(b"blob")
+    store = JsonStore(tmp_path / "store.json")
+    # Legacy entry: local id, upstream repo_id (the case the UI deletes by repo_id).
+    store.put_dataset(
+        {
+            "id": "blocks_plus80",
+            "repo_id": "user/blocks",
+            "remote": "user/blocks",
+            "source": "hub",
+            "path": str(snapshot),
+        }
+    )
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        listed = client.get("/lerobot/api/datasets").json()
+        assert [row["id"] for row in listed] == ["user/blocks"]
+
+        deleted = client.delete("/lerobot/api/library", params={"kind": "dataset", "id": "user/blocks"})
+        assert deleted.status_code == 200, deleted.text
+        assert client.get("/lerobot/api/datasets").json() == []
+        assert not repo_dir.exists()
+        assert app.state.hub.store.dataset("blocks_plus80") is None
+
+
 def test_library_delete_model_uses_registered_id_and_removes_whole_hub_cache(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
@@ -376,6 +562,113 @@ def test_library_delete_model_keeps_registration_if_cache_removal_fails(tmp_path
     assert app.state.hub.store.model("registered-policy") is not None
 
 
+@pytest.mark.parametrize("winerror", [5, 32])
+def test_library_delete_retries_released_local_dataset_and_clears_scan(
+    tmp_path: Path, monkeypatch, winerror: int
+) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    monkeypatch.delenv("LEROBOT_HOME", raising=False)
+    dataset = tmp_path / "datasets" / "user" / "blocks_plus80"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text('{"fps": 15, "total_episodes": 1}\n', encoding="utf-8")
+    (dataset / "video.mp4").write_bytes(b"video")
+    config = MonitorConfig(
+        store_path=tmp_path / "store.json",
+        server=ServerConfig(port=0, base_path="/lerobot"),
+        robot=RobotConfig(auto_connect=False, port="COM_UNUSED"),
+        cameras=CamerasConfig(probe=False),
+        recording=RecordingConfig(root=tmp_path / "videos"),
+        library=LibraryConfig(videos_root=tmp_path / "videos", dataset_roots=[tmp_path / "datasets"]),
+    )
+    real_rmtree = app_module.shutil.rmtree
+    attempts = 0
+
+    def briefly_locked(path: str | Path, *args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        if Path(path) == dataset:
+            attempts += 1
+            if attempts == 1:
+                error = PermissionError("dataset video is still open")
+                error.winerror = winerror
+                raise error
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.shutil, "rmtree", briefly_locked)
+    with TestClient(create_app(config)) as client:
+        assert [row["id"] for row in client.get("/lerobot/api/datasets").json()] == ["user/blocks_plus80"]
+        deleted = client.delete(
+            "/lerobot/api/library", params={"kind": "dataset", "id": "user/blocks_plus80"}
+        )
+        assert deleted.status_code == 200, deleted.text
+        assert attempts == 2
+        assert not dataset.exists()
+        assert client.get("/lerobot/api/datasets").json() == []
+
+
+def test_library_edit_dataset_saves_without_syncing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    monkeypatch.delenv("LEROBOT_HOME", raising=False)
+    datasets_root = tmp_path / "datasets"
+    dataset = datasets_root / "user" / "series"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text('{"fps": 10, "total_episodes": 1}\n', encoding="utf-8")
+
+    def explode(*args, **kwargs):
+        raise AssertionError("editing dataset details must not sync")
+
+    monkeypatch.setattr(dataset_hub, "download_hf_dataset", explode)
+    cfg = MonitorConfig(
+        store_path=tmp_path / "store.json",
+        server=ServerConfig(port=0, base_path="/lerobot"),
+        robot=RobotConfig(auto_connect=False, port="COM_UNUSED"),
+        cameras=CamerasConfig(probe=False),
+        recording=RecordingConfig(root=tmp_path / "videos"),
+        library=LibraryConfig(videos_root=tmp_path / "videos", dataset_roots=[datasets_root]),
+    )
+    app = create_app(cfg)
+
+    with TestClient(app) as client:
+        saved = client.put(
+            "/lerobot/api/library",
+            json={
+                "kind": "dataset",
+                "id": "user/series",
+                "name": "Renamed Series",
+                "description": "Monitor description",
+                "repo_id": "user/series",
+                "path": str(dataset),
+                "private": True,
+                "revision": "main",
+            },
+        )
+        assert saved.status_code == 200
+        row = saved.json()
+        assert row["display_name"] == "Renamed Series"
+        assert row["description"] == "Monitor description"
+        assert row["revision"] == "main"
+        assert row["path"] == str(dataset)
+        assert row["repo_id"] == "user/series"
+        assert row["private"] is True
+        assert row["metadata"]["visibility"] == "private"
+        assert row["path"] == str(dataset)
+
+        moved = client.put(
+            "/lerobot/api/library",
+            json={
+                "kind": "dataset", "id": "user/series", "remote": "user/renamed",
+                "description": "Monitor description",
+            },
+        )
+        assert moved.status_code == 200, moved.text
+        assert moved.json()["id"] == "user/renamed"
+        assert moved.json()["description"] == "Monitor description"
+        assert moved.json()["path"] == str(dataset)
+        assert [entry["id"] for entry in client.get("/lerobot/api/datasets").json()] == ["user/renamed"]
+
+
 def test_library_notes_and_descriptions_merge_into_lists(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
@@ -430,8 +723,10 @@ def test_library_notes_and_descriptions_merge_into_lists(tmp_path: Path, monkeyp
         )
         assert saved_dataset.status_code == 200
         listed_dataset = next(
-            row for row in client.get("/lerobot/api/datasets").json() if row["repo_id"] == "user/series"
+            row for row in client.get("/lerobot/api/datasets").json() if row["id"] == "user/series"
         )
+        assert listed_dataset["repo_id"] == ""
+        assert listed_dataset["upstream"] is False
         assert listed_dataset["display_name"] == "Renamed Series"
         assert listed_dataset["description"] == "Monitor description"
         assert listed_dataset["metadata"]["episodes"] == 1
@@ -465,6 +760,7 @@ def test_empty_dataset_api_creates_readable_lerobot_skeleton(tmp_path: Path, mon
             json={
                 "name": "Empty demo",
                 "repo_id": "user/empty_demo",
+                "private": True,
                 "fps": 20,
                 "robot_type": "so101_follower",
                 "cameras": [{"key": "front", "width": 320, "height": 240}],
@@ -473,6 +769,7 @@ def test_empty_dataset_api_creates_readable_lerobot_skeleton(tmp_path: Path, mon
         assert created.status_code == 200
         row = created.json()
         assert row["repo_id"] == "user/empty_demo"
+        assert row["private"] is True
         assert row["metadata"]["episodes"] == 0
         assert row["metadata"]["fps"] == 20
 
@@ -484,6 +781,14 @@ def test_empty_dataset_api_creates_readable_lerobot_skeleton(tmp_path: Path, mon
 
         listed = client.get("/lerobot/api/datasets")
         assert any(item["repo_id"] == "user/empty_demo" for item in listed.json())
+
+        local_only = client.post(
+            "/lerobot/api/datasets/empty", json={"name": "Local only", "fps": 20}
+        )
+        assert local_only.status_code == 200, local_only.text
+        assert local_only.json()["repo_id"] == ""
+        assert local_only.json()["upstream"] is False
+        assert client.post(f"/lerobot/api/datasets/{local_only.json()['id']}/upload").status_code == 400
 
 
 def _lifecycle_config(tmp_path: Path) -> MonitorConfig:
@@ -1210,6 +1515,10 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert ".ep-meta-summary" in css.text
     assert ".lib-meta" in css.text
     assert ".lib-description" in css.text
+    assert ".lib-progress" in css.text
+    assert ".lib-progress-track" in css.text
+    assert ".lib-progress-fill" in css.text
+    assert ".lib-progress.indeterminate" in css.text
     assert ".library-menu" in css.text
     assert ".side-tools" in css.text
     assert ".preset-name-popover" in css.text
@@ -1241,6 +1550,14 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert "LIBRARY_META_FIELDS_KEY" in script.text
     assert "function makeLibraryItem" in script.text
     assert "function renderLibraryMetadata" in script.text
+    assert "function syncDatasetTransfers" in script.text
+    assert "function makeDatasetTransferBar" in script.text
+    assert "function datasetTransferLabel" in script.text
+    assert 'state.direction === "upload"' in script.text
+    assert "dataset_transfers" in script.text
+    episode_rule = re.search(r"#ep-list\s*\{(?P<body>.*?)\}", css.text, re.DOTALL)
+    assert episode_rule is not None
+    assert "overflow-y: auto" in episode_rule.group("body")
     assert "Object.keys(metadata)" in script.text
     assert "function renderMetadataMenu" in script.text
     assert "function duplicateLibraryResource" in script.text

@@ -148,6 +148,7 @@ class LibraryEditBody(BaseModel):
     description: str | None = None
     task: str | None = None
     repo_id: str | None = None
+    private: bool | None = None
     remote: str | None = None
     revision: str | None = None
     path: str | None = None
@@ -238,6 +239,7 @@ class DatasetDownloadBody(BaseModel):
 class DatasetEmptyBody(BaseModel):
     name: str
     repo_id: str = ""
+    private: bool = False
     fps: int = 15
     robot_type: str = ""
     cameras: list[dict[str, Any]] = Field(default_factory=list)
@@ -874,20 +876,22 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         except DatasetHubError as exc:
             raise HTTPException(502, str(exc)) from exc
 
+    @router.get("/api/datasets/transfers")
+    async def list_dataset_transfers() -> list[dict[str, Any]]:
+        return await asyncio.to_thread(hub.dataset_transfers)
+
     @router.post("/api/datasets/download")
     async def download_dataset(body: DatasetDownloadBody) -> dict[str, Any]:
         async with library_mutation_lock:
             try:
-                row = await asyncio.to_thread(
-                    hub.dataset_registry.register,
+                return await asyncio.to_thread(
+                    hub.dataset_registry.start_download,
                     remote=body.remote,
                     name=body.name,
                     revision=body.revision,
                 )
             except DatasetHubError as exc:
                 raise HTTPException(400, str(exc)) from exc
-        source_id = str(row.get("repo_id") or row.get("id") or body.remote)
-        return _merge_library_override("dataset", source_id, row)
 
     @router.post("/api/datasets/empty")
     async def create_empty_dataset_route(body: DatasetEmptyBody) -> dict[str, Any]:
@@ -919,29 +923,32 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 remote=str(created["path"]),
                 name=str(created.get("title") or body.name),
                 revision="",
-                repo_id=str(created.get("repo_id") or ""),
+                repo_id=body.repo_id.strip(),
+                private=body.private,
             )
         return _merge_library_override("dataset", str(row.get("id") or row.get("repo_id")), row)
 
-    @router.post("/api/datasets/{dataset_id}/download")
+    # Dataset ids are Hub repo ids, so they contain a slash: the path
+    # converter is required or every card action would 404.
+    @router.post("/api/datasets/{dataset_id:path}/download")
     async def download_dataset_local(dataset_id: str) -> dict[str, Any]:
-        try:
-            row = await asyncio.to_thread(hub.dataset_registry.update, dataset_id)
-            return _merge_library_override("dataset", dataset_id, row)
-        except FileNotFoundError as exc:
-            raise HTTPException(404, str(exc)) from exc
-        except DatasetHubError as exc:
-            raise HTTPException(400, str(exc)) from exc
+        async with library_mutation_lock:
+            try:
+                return await asyncio.to_thread(hub.dataset_registry.start_download, dataset_id=dataset_id)
+            except FileNotFoundError as exc:
+                raise HTTPException(404, str(exc)) from exc
+            except DatasetHubError as exc:
+                raise HTTPException(400, str(exc)) from exc
 
-    @router.post("/api/datasets/{dataset_id}/upload")
+    @router.post("/api/datasets/{dataset_id:path}/upload")
     async def upload_dataset(dataset_id: str) -> dict[str, Any]:
-        try:
-            row = await asyncio.to_thread(hub.dataset_registry.upload, dataset_id)
-            return _merge_library_override("dataset", dataset_id, row)
-        except FileNotFoundError as exc:
-            raise HTTPException(404, str(exc)) from exc
-        except DatasetHubError as exc:
-            raise HTTPException(400, str(exc)) from exc
+        async with library_mutation_lock:
+            try:
+                return await asyncio.to_thread(hub.dataset_registry.start_upload, dataset_id)
+            except FileNotFoundError as exc:
+                raise HTTPException(404, str(exc)) from exc
+            except DatasetHubError as exc:
+                raise HTTPException(400, str(exc)) from exc
 
     @router.put("/api/library")
     async def edit_library(body: LibraryEditBody) -> dict[str, Any]:
@@ -951,6 +958,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             ("description", body.description),
             ("task", body.task),
             ("repo_id", body.repo_id),
+            ("private", body.private),
             ("remote", body.remote),
             ("revision", body.revision),
             ("path", body.path),
@@ -962,24 +970,35 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             payload["description"] = body.note.strip()
         if body.notes is not None:
             payload["description"] = "\n".join(str(note).strip() for note in body.notes if str(note).strip())
+        response_id = body.id
         try:
             if body.kind == "snapshot":
                 await asyncio.to_thread(hub.snapshots.update, body.id, payload)
             elif body.kind == "dataset":
-                source_payload = {
-                    key: value
-                    for key, value in payload.items()
-                    if key in {"name", "repo_id", "remote", "revision", "path"}
-                }
-                if source_payload:
-                    await asyncio.to_thread(hub.dataset_registry.save, body.id, source_payload)
-                metadata_payload = {
-                    key: value
-                    for key, value in payload.items()
-                    if key in {"description", "task", "metadata"}
-                }
-                if metadata_payload:
-                    await asyncio.to_thread(hub.store.save_library_override, "dataset", body.id, metadata_payload)
+                # Saving dataset details must never sync: an address edit is
+                # stored as-is and only the download action touches the Hub.
+                async with library_mutation_lock:
+                    source_payload = {
+                        key: value
+                        for key, value in payload.items()
+                        if key in {"name", "repo_id", "remote", "revision", "path", "private"}
+                    }
+                    if source_payload:
+                        saved = await asyncio.to_thread(hub.dataset_registry.save, body.id, source_payload)
+                        response_id = str(saved.get("id") or body.id)
+                        if response_id != body.id:
+                            await asyncio.to_thread(
+                                hub.store.move_library_override, "dataset", body.id, response_id
+                            )
+                    metadata_payload = {
+                        key: value
+                        for key, value in payload.items()
+                        if key in {"description", "task", "metadata"}
+                    }
+                    if metadata_payload:
+                        await asyncio.to_thread(
+                            hub.store.save_library_override, "dataset", response_id, metadata_payload
+                        )
             elif body.kind == "model":
                 source_payload = {
                     key: value
@@ -999,10 +1018,12 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 await asyncio.to_thread(hub.store.save_library_override, body.kind, body.id, payload)
             else:
                 raise ValueError(f"unknown library kind '{body.kind}'")
-            return await asyncio.to_thread(_resolve_library_row, body.kind, body.id)
+            return await asyncio.to_thread(_resolve_library_row, body.kind, response_id)
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from exc
         except (KeyError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except DatasetHubError as exc:
             raise HTTPException(400, str(exc)) from exc
 
     @router.delete("/api/library")
@@ -1037,12 +1058,21 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 await asyncio.to_thread(hub.model_registry.delete, id)
                 await asyncio.to_thread(hub.store.delete_library_override, "model", id)
             elif kind == "dataset":
-                row = await asyncio.to_thread(hub.resolve_dataset, id)
-                await asyncio.to_thread(hub.dataset_registry.delete, id)
-                await asyncio.to_thread(hub.store.delete_library_override, "dataset", id)
-                await asyncio.to_thread(hub.store.delete_episode_overrides, "dataset", id)
-                await asyncio.to_thread(hub.store.delete_episode_view, "dataset", id)
-                await asyncio.to_thread(_delete_resource_path, row.get("path"))
+                async with library_mutation_lock:
+                    row = await asyncio.to_thread(hub.resolve_dataset, id)
+                    await asyncio.to_thread(hub.dataset_registry.assert_not_transferring, id)
+                    # Delete bytes first. A failed filesystem operation must not
+                    # orphan them by removing the Library record prematurely.
+                    target = hub_cache_repo_dir(row.get("path"), str(row.get("repo_id") or "")) or row.get("path")
+                    try:
+                        await _delete_library_path(target)
+                    except OSError as exc:
+                        raise HTTPException(400, f"could not delete {target}: {exc}") from exc
+                    removed = await asyncio.to_thread(hub.dataset_registry.delete, id, current=row)
+                    for source_id in {id, str(removed.get("id") or id)}:
+                        await asyncio.to_thread(hub.store.delete_library_override, "dataset", source_id)
+                        await asyncio.to_thread(hub.store.delete_episode_overrides, "dataset", source_id)
+                        await asyncio.to_thread(hub.store.delete_episode_view, "dataset", source_id)
             else:
                 raise ValueError(f"unknown library kind '{kind}'")
             return {"ok": True, "kind": kind, "id": id}
@@ -1050,6 +1080,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             raise HTTPException(404, str(exc)) from exc
         except (KeyError, ValueError) as exc:
             raise HTTPException(400, str(exc)) from exc
+        except DatasetHubError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     def _episode_source(kind: str, source_id: str) -> tuple[dict[str, Any], int, bool]:
         """Resolve a library entry to (row, episode count, playable)."""

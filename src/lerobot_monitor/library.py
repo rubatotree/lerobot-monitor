@@ -867,6 +867,9 @@ def library_metadata(kind: str, row: dict[str, Any]) -> dict[str, Any]:
     elif kind == "dataset":
         metadata.update(
             {
+                "visibility": (
+                    "private" if row.get("private") else "public"
+                ) if row.get("upstream") else "",
                 "episodes": row.get("episodes"),
                 "fps": row.get("fps"),
                 "task": str(row.get("task") or ""),
@@ -990,34 +993,98 @@ def _hub_repo_id(dirname: str) -> str:
     return rest.replace("--", "/", 1)
 
 
+def _task_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[:500]
+
+
+def _tasks_from_parquet(path: Path) -> list[str]:
+    """Read `meta/tasks.parquet` in task-index order.
+
+    LeRobot v3 stores task descriptions as the parquet index named `task` with a
+    `task_index` column; that index is what `task_index` in the data files refers
+    to. Row order is not guaranteed to match `task_index`, so sort by it.
+    """
+    try:
+        import pyarrow.parquet as pq  # noqa: PLC0415 - optional dependency
+    except ImportError:
+        return []
+    try:
+        table = pq.read_table(path)
+        index_column = "task" if "task" in table.column_names else None
+        if index_column is None:
+            # A pandas round-trip materializes the index under its own name; fall
+            # back to the only non-index column so the reader still works when the
+            # index is named differently.
+            index_column = next(
+                (name for name in table.column_names if name != "task_index"),
+                None,
+            )
+        if index_column is None:
+            return []
+        names = [_task_text(value) for value in table[index_column].to_pylist()]
+        indices = (
+            [int(value) for value in table["task_index"].to_pylist()]
+            if "task_index" in table.column_names
+            else list(range(len(names)))
+        )
+    except Exception:  # noqa: BLE001 - a broken parquet file must not break the Library
+        return []
+    ordered: dict[int, str] = {}
+    for position, name in enumerate(names):
+        if not name:
+            continue
+        index = indices[position] if position < len(indices) else position
+        ordered.setdefault(index, name)
+    return [ordered[key] for key in sorted(ordered)][:100]
+
+
+def _tasks_from_jsonl(path: Path) -> list[str]:
+    """Read the legacy `meta/tasks.jsonl` format."""
+    tasks: list[str] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle):
+                if line_number >= 100:
+                    break
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                value = _task_text(row.get("task") or row.get("name") or row.get("description"))
+                if value:
+                    tasks.append(value)
+    except OSError:
+        pass
+    return tasks
+
+
+def _lerobot_tasks(path: Path) -> list[str]:
+    """Task definitions of a LeRobot dataset, newest format first."""
+    for candidate in (path / "meta" / "tasks.parquet", path / "meta" / "tasks.jsonl"):
+        if not candidate.is_file():
+            continue
+        tasks = _tasks_from_parquet(candidate) if candidate.suffix == ".parquet" else _tasks_from_jsonl(candidate)
+        if tasks:
+            return tasks
+    return []
+
+
 def _lerobot_info(path: Path) -> dict[str, Any]:
     info = _read_json(path / "meta" / "info.json")
     if not info:
         return {}
-    tasks: list[str] = []
-    tasks_path = path / "meta" / "tasks.jsonl"
-    if tasks_path.is_file():
-        try:
-            with tasks_path.open(encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle):
-                    if line_number >= 100:
-                        break
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(row, dict):
-                        continue
-                    value = row.get("task") or row.get("name") or row.get("description")
-                    if isinstance(value, str) and value.strip():
-                        tasks.append(value.strip()[:500])
-        except OSError:
-            pass
+    tasks = _lerobot_tasks(path)
 
     def text(key: str) -> str:
         value = info.get(key)
         return value.strip()[:2000] if isinstance(value, str) else ""
 
+    # `info.json` carries no task field in LeRobot v3; the first entry of the
+    # tasks file is the dataset's headline task.
     task = text("task") or (tasks[0] if tasks else "")
     episodes = info.get("total_episodes")
     if episodes is None:

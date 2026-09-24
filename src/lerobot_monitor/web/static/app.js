@@ -249,7 +249,9 @@ async function api(path, body, method = "POST") {
     const message = typeof detail === "string"
       ? detail
       : (detail && typeof detail.message === "string" ? detail.message : "");
-    throw new Error(message || res.statusText || "request failed");
+    const error = new Error(message || res.statusText || "request failed");
+    error.status = res.status;
+    throw error;
   }
   return data;
 }
@@ -2722,6 +2724,7 @@ function applyStatus(d) {
     clearRolloutPredictions();
   }
   if (!replayActive) syncLiveChartChrome(liveNowS);
+  syncDatasetTransfers(d.dataset_transfers || []);
   if (armReplay && (!robot.connected || mode === "estop")) {
     armReplay = false;
     syncArmToggle();
@@ -4235,6 +4238,7 @@ const LIBRARY_META_LABELS = {
   source: "Source",
   path: "Path",
   repo_id: "Upstream",
+  visibility: "New repo visibility",
   policy_type: "Policy",
   revision: "Revision",
   weights: "Weights",
@@ -4313,6 +4317,18 @@ function clearLibrarySelection(kind = "") {
 
 async function saveLibraryMetadata(kind, sourceId, payload) {
   const saved = await api("/api/library", { kind, id: sourceId, ...payload }, "PUT");
+  const nextSourceId = librarySourceId(kind, saved);
+  const sourceChanged = kind === "dataset" && nextSourceId && nextSourceId !== sourceId;
+  if (sourceChanged) {
+    if (episodeSource && episodeSource.kind === "dataset" && episodeSource.id === sourceId) {
+      closeEpisodeSelection();
+    }
+    if (selectedLibraryId("dataset") === sourceId || selectedDatasetId === sourceId) {
+      selectLibraryItem("dataset", nextSourceId);
+      selectedDatasetId = nextSourceId;
+      persistUi();
+    }
+  }
   const cache = libraryCache(kind);
   const row = cache.find((item) => librarySourceId(kind, item) === sourceId);
   if (row) Object.assign(row, saved);
@@ -4333,6 +4349,7 @@ async function saveLibraryMetadata(kind, sourceId, payload) {
   renderDatasets();
   renderSnapshots();
   renderEpisodes();
+  if (sourceChanged) await refreshLibrarySection("datasets");
   return saved;
 }
 
@@ -4626,22 +4643,68 @@ if ($("library")) {
   });
 }
 
+async function waitForReplayMediaRelease(videos) {
+  await Promise.all(videos.map((video) => new Promise((resolve) => {
+    if (video.readyState === 0 && video.networkState === video.NETWORK_EMPTY) {
+      resolve();
+      return;
+    }
+    let timeout;
+    const done = () => {
+      clearTimeout(timeout);
+      video.removeEventListener("emptied", done);
+      resolve();
+    };
+    video.addEventListener("emptied", done, { once: true });
+    timeout = setTimeout(done, 500);
+  })));
+  // Let the closed replay paint and its cancelled media requests reach the server.
+  await new Promise((resolve) => {
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeout);
+      resolve();
+    };
+    const timeout = setTimeout(done, 250);
+    requestAnimationFrame(() => setTimeout(done, 0));
+  });
+}
+
 async function deleteLibraryResource(kind, row) {
   const sourceId = librarySourceId(kind, row);
   const label = libraryDisplayName(kind, row) || sourceId;
   if (!window.confirm(`Delete ${kind} ${label}?`)) return;
+  const wasSelected = isLibrarySelected(kind, sourceId);
+  const aliases = new Set([sourceId, String(row.id || ""), String(row.repo_id || "")]);
+  const showingSource = (kind === "dataset" || kind === "video") && (
+    (episodeSource?.kind === kind && aliases.has(episodeSource.id))
+    || (vizState.kind === kind && aliases.has(vizState.id))
+  );
   try {
+    if (showingSource) {
+      const videos = vizVideos();
+      closeEpisodeSelection();
+      await waitForReplayMediaRelease(videos);
+    }
     await api(`/api/library?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(sourceId)}`, undefined, "DELETE");
     clearLibrarySelection(kind);
-    if (isLibrarySelected(kind, sourceId)) {
+    if (wasSelected) {
       if (kind === "snapshot") closeEpisodeSelection();
       else if (kind === "video") closeEpisodeSelection();
       else if (kind === "model") selectedModelId = "";
-      else if (kind === "dataset") closeEpisodeSelection();
+      else if (kind === "dataset" && !showingSource) closeEpisodeSelection();
+    }
+    if (kind === "dataset") {
+      datasetsCache = datasetsCache.filter((item) => librarySourceId("dataset", item) !== sourceId);
+      renderDatasets();
     }
     await refreshLibrarySection(`${kind}s`);
   } catch (err) {
-    toastError(err);
+    if (kind === "dataset") await refreshLibrarySection("datasets");
+    if (err.status !== 404 || kind !== "dataset"
+      || datasetsCache.some((item) => librarySourceId("dataset", item) === sourceId)) toastError(err);
   }
 }
 
@@ -4659,8 +4722,6 @@ async function syncLibraryResource(kind, row, direction) {
 
 function editLibrarySource(kind, row) {
   const sourceId = librarySourceId(kind, row);
-  const currentSource = row.remote || row.path || row.repo_id || "";
-  const supportsSource = kind === "model" || kind === "dataset";
   openLibraryModal(`Edit ${kind} details`, (body) => {
     const grid = document.createElement("div");
     grid.className = "library-modal-grid";
@@ -4670,23 +4731,53 @@ function editLibrarySource(kind, row) {
     name.setAttribute("aria-label", "Display name");
     grid.appendChild(modalField("Name", name));
     let source = null;
+    let upstream = null;
+    let localPath = null;
+    let visibility = null;
     let revision = null;
     let task = null;
-    if (supportsSource) {
+    if (kind === "model") {
       source = document.createElement("input");
       source.type = "text";
-      source.value = currentSource;
-      source.placeholder = kind === "model" ? "org/name or local model path" : "org/name or local dataset path";
+      source.value = row.remote || row.path || row.repo_id || "";
+      source.placeholder = "org/name or local model path";
       source.setAttribute("aria-label", "Upstream repo_id or local path");
+    } else if (kind === "dataset") {
+      upstream = document.createElement("input");
+      upstream.type = "text";
+      upstream.value = row.upstream ? String(row.repo_id || "") : "";
+      upstream.placeholder = "org/dataset";
+      upstream.setAttribute("aria-label", "Dataset upstream repo ID");
+      localPath = document.createElement("input");
+      localPath.type = "text";
+      const initialLocalPath = row.path_is_cache ? "" : String(row.path || "");
+      localPath.value = initialLocalPath;
+      localPath.dataset.initialPath = initialLocalPath;
+      localPath.placeholder = "local dataset directory";
+      localPath.setAttribute("aria-label", "Local dataset directory");
+      visibility = document.createElement("select");
+      visibility.setAttribute("aria-label", "New upstream visibility");
+      for (const value of ["public", "private"]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = value === "private" ? "Private" : "Public";
+        visibility.appendChild(option);
+      }
+      visibility.value = row.private ? "private" : "public";
+      grid.append(
+        modalField("Upstream repo ID", upstream),
+        modalField("Local directory", localPath),
+        modalField("New repository visibility", visibility),
+      );
+    }
+    if (kind === "model" || kind === "dataset") {
       revision = document.createElement("input");
       revision.type = "text";
       revision.value = String(row.revision || "");
       revision.placeholder = "revision (optional)";
       revision.setAttribute("aria-label", "Revision");
-      grid.append(
-        modalField("Upstream repo_id / local path", source),
-        modalField("Revision", revision),
-      );
+      if (source) grid.appendChild(modalField("Upstream repo ID / local path", source));
+      grid.appendChild(modalField("Revision", revision));
     } else {
       task = document.createElement("input");
       task.type = "text";
@@ -4707,13 +4798,19 @@ function editLibrarySource(kind, row) {
     actions.className = "library-modal-actions";
     const save = document.createElement("button");
     save.type = "button";
-    save.textContent = "Save & sync";
+    // Dataset details are stored as-is; fetching the address stays on the
+    // card's download action instead of happening on every save.
+    save.textContent = kind === "dataset" ? "Save" : "Save & sync";
     actions.appendChild(save);
     body.append(grid, descriptionField, actions);
     save.addEventListener("click", async () => {
       const nextSource = source ? source.value.trim() : "";
-      if (supportsSource && !nextSource) {
+      if (source && !nextSource) {
         libraryModalStatus(body, "Upstream repo_id or local path is required", true);
+        return;
+      }
+      if (kind === "dataset" && !upstream.value.trim() && !localPath.value.trim()) {
+        libraryModalStatus(body, "Set an upstream or a local directory", true);
         return;
       }
       save.disabled = true;
@@ -4722,7 +4819,14 @@ function editLibrarySource(kind, row) {
           name: name.value.trim(),
           description: description.value.trim(),
         };
-        if (supportsSource) {
+        if (kind === "dataset") {
+          payload.repo_id = upstream.value.trim();
+          if (localPath.value.trim() !== localPath.dataset.initialPath) {
+            payload.path = localPath.value.trim();
+          }
+          payload.private = visibility.value === "private";
+          payload.revision = revision.value.trim();
+        } else if (source) {
           payload.remote = nextSource;
           payload.revision = revision.value.trim();
         } else {
@@ -4762,16 +4866,19 @@ function libraryResourceTools(kind, row) {
     tools.push(copy, remove);
     return tools;
   }
-  const hasUpstream = Boolean(row.repo_id);
+  const hasUpstream = kind === "dataset" ? Boolean(row.upstream && row.repo_id) : Boolean(row.repo_id);
   const hasPath = Boolean(row.path);
+  const running = kind === "dataset" ? activeDatasetTransfer(sourceId) : null;
   const upload = makeLibraryIconButton("lib-upload", `Upload ${sourceId} to Hugging Face`, LIBRARY_UPLOAD_ICON);
-  upload.disabled = !hasUpstream || !hasPath;
+  upload.disabled = !hasUpstream || !hasPath || Boolean(running);
+  if (running && running.direction === "upload") upload.title = `Uploading ${sourceId}…`;
   upload.addEventListener("click", (event) => {
     event.stopPropagation();
     if (!upload.disabled) syncLibraryResource(kind, row, "upload");
   });
   const download = makeLibraryIconButton("lib-download", `Download ${sourceId} from Hugging Face`, LIBRARY_DOWNLOAD_ICON);
-  download.disabled = !hasUpstream;
+  download.disabled = !hasUpstream || Boolean(running);
+  if (running && running.direction === "download") download.title = `Downloading ${sourceId}…`;
   download.addEventListener("click", (event) => {
     event.stopPropagation();
     if (!download.disabled) syncLibraryResource(kind, row, "download");
@@ -4819,6 +4926,135 @@ function renderVideos() {
   populateRecordDatasetSelect();
 }
 
+const datasetTransfers = new Map();
+let datasetTransferSignature = "";
+
+function fmtBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = bytes / 1024;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size >= 10 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`;
+}
+
+function datasetTransferPercent(state) {
+  const percent = Number(state && state.percent);
+  return Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+}
+
+function datasetTransferVerb(state) {
+  return state && state.direction === "upload" ? "uploading" : "downloading";
+}
+
+function datasetTransferLabel(state) {
+  const verb = datasetTransferVerb(state);
+  const done = fmtBytes(state.transferred_bytes);
+  if (state.indeterminate) return `${verb} · ${done}`;
+  return `${verb} ${datasetTransferPercent(state).toFixed(0)}% · ${done} / ${fmtBytes(state.total_bytes)}`;
+}
+
+function datasetTransferTitle(state) {
+  const parts = [datasetTransferLabel(state), state.repo_id || ""];
+  if (state.direction === "upload" && state.files_total) {
+    parts.push(`${state.files_done}/${state.files_total} files`);
+  }
+  return parts.filter(Boolean).join(" · ");
+}
+
+function activeDatasetTransfer(sourceId) {
+  const state = datasetTransfers.get(String(sourceId));
+  return state && state.active ? state : null;
+}
+
+function applyDatasetTransferBar(bar, state) {
+  bar.dataset.transferStatus = String(state.status || "");
+  bar.dataset.transferDirection = String(state.direction || "download");
+  bar.classList.toggle("indeterminate", Boolean(state.indeterminate));
+  const fill = bar.querySelector(".lib-progress-fill");
+  if (fill) fill.style.width = `${datasetTransferPercent(state)}%`;
+  const label = bar.querySelector(".lib-progress-label");
+  if (label) label.textContent = datasetTransferLabel(state);
+  bar.title = datasetTransferTitle(state);
+}
+
+function makeDatasetTransferBar(state) {
+  const bar = document.createElement("div");
+  bar.className = "lib-progress";
+  bar.dataset.transferFor = String(state.repo_id || "");
+  const track = document.createElement("div");
+  track.className = "lib-progress-track";
+  const fill = document.createElement("div");
+  fill.className = "lib-progress-fill";
+  track.appendChild(fill);
+  const label = document.createElement("span");
+  label.className = "lib-progress-label";
+  bar.append(track, label);
+  applyDatasetTransferBar(bar, state);
+  return bar;
+}
+
+function updateDatasetTransferBars() {
+  document.querySelectorAll("#ds-list .lib-progress[data-transfer-for]").forEach((bar) => {
+    const state = activeDatasetTransfer(bar.dataset.transferFor);
+    if (state) applyDatasetTransferBar(bar, state);
+  });
+}
+
+async function refreshDatasetTransfers() {
+  try {
+    syncDatasetTransfers(await fetchJson("/api/datasets/transfers"));
+  } catch { /* the status stream keeps the bars current */ }
+}
+
+function syncDatasetTransfers(states) {
+  const next = new Map();
+  (states || []).forEach((state) => {
+    const id = String((state && state.repo_id) || "");
+    if (!id) return;
+    const previous = datasetTransfers.get(id);
+    // An older status response can arrive after the terminal update when the
+    // HTTP refresh and status stream overlap. Keep the finished state for the
+    // same transfer, while allowing a newly started transfer to replace it.
+    if (previous && previous.started_utc === state.started_utc && !previous.active && state.active) {
+      next.set(id, previous);
+    } else {
+      next.set(id, state);
+    }
+  });
+  const finished = [];
+  next.forEach((state, id) => {
+    const previous = datasetTransfers.get(id);
+    // Only announce a transition this page actually watched: a finished
+    // transfer from an earlier session must not re-notify on every reload.
+    if (!previous || previous.status === state.status) return;
+    if (state.status === "done" || state.status === "error") finished.push(state);
+  });
+  const signature = [...next.values()]
+    .map((state) => `${state.repo_id}:${state.direction}:${state.status}`)
+    .sort()
+    .join("|");
+  const changed = signature !== datasetTransferSignature;
+  datasetTransferSignature = signature;
+  datasetTransfers.clear();
+  next.forEach((state, id) => datasetTransfers.set(id, state));
+  if (changed) renderDatasets();
+  else updateDatasetTransferBars();
+  finished.forEach((state) => {
+    const verb = datasetTransferVerb(state);
+    if (state.status === "error") {
+      toastError(new Error(state.error || `dataset ${state.direction} failed: ${state.repo_id}`));
+    } else {
+      localLog(`dataset ${verb.replace("ing", "ed")}: ${state.repo_id}`);
+    }
+    refreshLibrarySection("datasets");
+  });
+}
+
 function renderDatasets() {
   const ol = $("ds-list");
   if (!ol) return;
@@ -4837,7 +5073,10 @@ function renderDatasets() {
   }
   rows.forEach((ds) => {
     const id = ds.repo_id || ds.id;
-    ol.appendChild(makeLibraryItem("dataset", ds, () => selectHfDataset(ds), libraryResourceTools("dataset", ds)));
+    const li = makeLibraryItem("dataset", ds, () => selectHfDataset(ds), libraryResourceTools("dataset", ds));
+    const transfer = activeDatasetTransfer(id);
+    if (transfer) li.appendChild(makeDatasetTransferBar(transfer));
+    ol.appendChild(li);
   });
   populateRecordDatasetSelect();
 }
@@ -6097,7 +6336,11 @@ function leaveReplay() {
   snapshotActive = false;
   activeSnapshot = null;
   vizState.snapshot = null;
-  vizVideos().forEach((video) => video.pause());
+  vizVideos().forEach((video) => {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  });
   const host = $("viz-cams");
   if (host) {
     host.innerHTML = "";
@@ -7638,6 +7881,14 @@ function openEmptyDatasetModal() {
     repo.type = "text";
     repo.placeholder = "repo id (optional)";
     repo.setAttribute("aria-label", "Dataset repo id");
+    const visibility = document.createElement("select");
+    visibility.setAttribute("aria-label", "New upstream visibility");
+    for (const value of ["public", "private"]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value === "private" ? "Private" : "Public";
+      visibility.appendChild(option);
+    }
     const fps = document.createElement("input");
     fps.type = "number";
     fps.min = "1";
@@ -7651,6 +7902,7 @@ function openEmptyDatasetModal() {
     grid.append(
       modalField("Name", name),
       modalField("Repo ID", repo),
+      modalField("New repository visibility", visibility),
       modalField("FPS", fps),
       modalField("Robot type", robotType),
     );
@@ -7693,6 +7945,7 @@ function openEmptyDatasetModal() {
         await api("/api/datasets/empty", {
           name: datasetName,
           repo_id: repo.value.trim(),
+          private: visibility.value === "private",
           fps: Number(fps.value) || 15,
           robot_type: robotType.value.trim(),
           cameras: selectedCameras,
@@ -7916,7 +8169,10 @@ async function refreshLibrarySection(kind) {
 }
 
 async function refreshLibrary() {
-  await Promise.all(Object.keys(LIBRARY_CONFIG).map(refreshLibrarySection));
+  await Promise.all([
+    ...Object.keys(LIBRARY_CONFIG).map(refreshLibrarySection),
+    refreshDatasetTransfers(),
+  ]);
 }
 
 function syncEpisodeSource(refreshedKind = "") {

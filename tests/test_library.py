@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -8,7 +10,9 @@ import pytest
 
 from lerobot_monitor import dataset_hub
 from lerobot_monitor.dataset_hub import (
+    DatasetHubError,
     DatasetRegistry,
+    DatasetTransferManager,
     create_empty_dataset,
     download_hf_dataset,
     search_hf_datasets,
@@ -423,7 +427,10 @@ def test_dataset_hub_search_and_download_validation(tmp_path: Path, monkeypatch)
         tags = ["lerobot"]
 
     class Api:
-        def list_datasets(self, **kwargs):
+        def list_datasets(self, *, search, filter, limit, sort):
+            # Mirrors huggingface_hub 1.x, which has no `direction` argument:
+            # passing one raises TypeError exactly like the real client did.
+            assert (search, filter, limit, sort) == ("blocks", "lerobot", 20, "downloads")
             return [Row()]
 
     class Hub:
@@ -432,6 +439,7 @@ def test_dataset_hub_search_and_download_validation(tmp_path: Path, monkeypatch)
         @staticmethod
         def snapshot_download(**kwargs):
             assert kwargs["repo_type"] == "dataset"
+            assert kwargs["force_download"] is True
             return str(dataset_root)
 
     monkeypatch.setattr(dataset_hub, "_hub_module", lambda: Hub)
@@ -446,9 +454,10 @@ def test_dataset_hub_search_and_download_validation(tmp_path: Path, monkeypatch)
         }
     ]
     assert download_hf_dataset("user/blocks") == str(dataset_root)
+    assert download_hf_dataset("https://huggingface.co/datasets/user/blocks/tree/main") == str(dataset_root)
 
 
-def test_dataset_registry_edits_source_and_uploads(tmp_path: Path, monkeypatch) -> None:
+def test_dataset_registry_edits_source_and_starts_upload(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot"))
     created = create_empty_dataset(name="Demo", repo_id="user/demo", fps=15)
     store = JsonStore(tmp_path / "store.json")
@@ -461,18 +470,591 @@ def test_dataset_registry_edits_source_and_uploads(tmp_path: Path, monkeypatch) 
     assert row["repo_id"] == "user/demo"
     assert row["episodes"] == 0
 
-    calls: list[tuple[str, str]] = []
+    started: list[tuple[str, str, str]] = []
+
+    class StubTransfers:
+        def start_upload(self, repo_id, folder, *, revision="", name="", private=False):
+            started.append((repo_id, str(folder), revision, private))
+            return {"repo_id": repo_id, "direction": "upload", "status": "pending", "active": True}
+
+    registry.transfers = StubTransfers()
+    state = registry.start_upload(row["id"])
+    assert state["direction"] == "upload"
+    assert started == [("user/demo", str(created["path"]), "", False)]
+
+    with pytest.raises(FileNotFoundError):
+        registry.start_upload("user/unknown")
+
+
+def test_upload_dataset_folder_reports_batched_progress(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
+    (root / "data").mkdir()
+    for index in range(4):
+        (root / "data" / f"file-{index:03d}.parquet").write_bytes(b"x" * (index + 1))
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("ignored\n", encoding="utf-8")
+    (root / "obsolete-local.txt").write_text("local", encoding="utf-8")
+
+    committed: list[list[str]] = []
+    steps: list[tuple[int, int]] = []
 
     class Hub:
-        @staticmethod
-        def create_repo(repo_id, repo_type="dataset", exist_ok=True):
-            calls.append(("create", repo_id))
+        class CommitOperationAdd:
+            def __init__(self, path_in_repo, path_or_fileobj):
+                self.path_in_repo = path_in_repo
+                self.path_or_fileobj = path_or_fileobj
+
+        class CommitOperationDelete:
+            def __init__(self, path_in_repo):
+                self.path_in_repo = path_in_repo
 
         @staticmethod
-        def upload_folder(**kwargs):
-            calls.append(("upload", kwargs["repo_id"]))
+        def list_repo_files(repo_id, *, repo_type="dataset", revision=None):
+            assert (repo_id, repo_type, revision) == ("user/demo", "dataset", None)
+            return ["old.parquet", ".gitattributes"]
+
+        @staticmethod
+        def create_repo(repo_id, repo_type="dataset", private=False, exist_ok=True):
+            assert private is False
+            committed.append(["create_repo"])
+
+        @staticmethod
+        def create_commit(*, operations, commit_message, **kwargs):
+            committed.append([op.path_in_repo for op in operations])
 
     monkeypatch.setattr(dataset_hub, "_hub_module", lambda: Hub)
-    uploaded = registry.upload(row["id"])
-    assert uploaded["repo_id"] == "user/demo"
-    assert calls == [("create", "user/demo"), ("upload", "user/demo")]
+    dataset_hub.upload_dataset_folder(
+        "user/demo",
+        root,
+        on_progress=lambda done_bytes, done_files: steps.append((done_bytes, done_files)),
+    )
+
+    uploaded = [path for batch in committed[1:] for path in batch]
+    assert ".git/config" not in uploaded
+    assert sorted(uploaded) == ["data/file-000.parquet", "data/file-001.parquet", "data/file-002.parquet", "data/file-003.parquet", "meta/info.json", "obsolete-local.txt", "old.parquet"]
+    assert committed[-1] == ["old.parquet"]
+    assert ".gitattributes" not in uploaded
+    expected_bytes = sum(
+        path.stat().st_size
+        for path in root.rglob("*")
+        if path.is_file() and ".git" not in path.parts
+    )
+    assert steps and steps[-1] == (expected_bytes, 6)
+    assert steps == sorted(steps)
+
+
+def test_upload_dataset_folder_creates_private_repo(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
+    created: list[dict] = []
+
+    class Hub:
+        class CommitOperationAdd:
+            def __init__(self, path_in_repo, path_or_fileobj):
+                self.path_in_repo = path_in_repo
+
+        class CommitOperationDelete:
+            def __init__(self, path_in_repo):
+                self.path_in_repo = path_in_repo
+
+        @staticmethod
+        def create_repo(repo_id, *, repo_type, private, exist_ok):
+            created.append({"repo_id": repo_id, "repo_type": repo_type, "private": private, "exist_ok": exist_ok})
+
+        @staticmethod
+        def list_repo_files(repo_id, *, repo_type, revision=None):
+            return []
+
+        @staticmethod
+        def create_commit(**kwargs):
+            return None
+
+    monkeypatch.setattr(dataset_hub, "_hub_module", lambda: Hub)
+    dataset_hub.upload_dataset_folder("user/new-private", root, private=True)
+    assert created == [{
+        "repo_id": "user/new-private", "repo_type": "dataset", "private": True, "exist_ok": True,
+    }]
+
+
+def test_upload_accepts_hub_blob_links_but_skips_external_links(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    repo = tmp_path / "hf" / "hub" / "datasets--user--demo"
+    snapshot = repo / "snapshots" / "revision"
+    (snapshot / "meta").mkdir(parents=True)
+    (snapshot / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
+    (snapshot / "data").mkdir()
+    (repo / "blobs").mkdir()
+    blob = repo / "blobs" / "payload"
+    blob.write_bytes(b"parquet")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("private", encoding="utf-8")
+    try:
+        (snapshot / "data" / "file.parquet").symlink_to(blob)
+        (snapshot / "external.txt").symlink_to(secret)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    paths = {name for name, _size in dataset_hub.upload_folder_files(snapshot)}
+    assert "data/file.parquet" in paths
+    assert "external.txt" not in paths
+
+
+def test_dataset_registry_orders_by_arrival_not_source(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    store = JsonStore(tmp_path / "store.json")
+    # A hub dataset added later must not jump ahead of an earlier local one, even
+    # when its own timestamps would sort it first.
+    store.put_dataset(
+        {
+            "id": "user/local",
+            "name": "local",
+            "repo_id": "user/local",
+            "source": "hub",
+            "path": "",
+            "created_utc": "2026-09-23T11:00:00+00:00",
+        }
+    )
+    store.put_dataset(
+        {
+            "id": "user/hub",
+            "name": "hub",
+            "repo_id": "user/hub",
+            "source": "hub",
+            "path": "",
+            "created_utc": "2026-09-23T12:00:00+00:00",
+        }
+    )
+    scanned = tmp_path / "scanned"
+    dataset = scanned / "user" / "folder"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
+    os.utime(dataset, (1_800_000_000, 1_800_000_000))  # newer than both entries
+
+    registry = DatasetRegistry(store, [scanned])
+    # Registered datasets keep the order the user added them in; scanned folders
+    # trail them instead of leading the list.
+    assert [row["id"] for row in registry.list()] == ["user/local", "user/hub", "user/folder"]
+
+
+def test_dataset_registry_keeps_store_order_after_hub_download(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    store = JsonStore(tmp_path / "store.json")
+    store.put_dataset({"id": "user/first", "name": "first", "source": "hub", "path": ""})
+    store.put_dataset({"id": "user/second", "name": "second", "source": "hub", "path": ""})
+    registry = DatasetRegistry(store, [])
+
+    assert [row["id"] for row in registry.list()] == ["user/first", "user/second"]
+    # A dataset added afterwards is appended, never inserted ahead of older ones.
+    registry.stage(remote="user/third")
+    assert [row["id"] for row in registry.list()] == ["user/first", "user/second", "user/third"]
+
+
+def test_list_hf_datasets_reads_v3_tasks_parquet(tmp_path: Path, monkeypatch) -> None:
+    pytest.importorskip("pandas")
+    import pandas as pd
+
+    hf = tmp_path / "hf"
+    monkeypatch.setenv("HF_HOME", str(hf))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    extra = tmp_path / "extra" / "picked"
+    (extra / "meta").mkdir(parents=True)
+    (extra / "meta" / "info.json").write_text(
+        '{"fps": 15, "total_episodes": 2, "total_tasks": 2}\n',
+        encoding="utf-8",
+    )
+    # LeRobot v3 layout: the task text is the index, `task_index` is the column
+    # that the data files reference. Rows are intentionally out of index order.
+    pd.DataFrame(
+        {"task_index": [1, 0]},
+        index=pd.Index(["Sort blocks", "Pick cube"], name="task"),
+    ).to_parquet(extra / "meta" / "tasks.parquet")
+
+    rows = list_hf_datasets([tmp_path / "extra"])
+    row = next(item for item in rows if item["repo_id"] == "picked")
+    assert row["task"] == "Pick cube"
+    assert row["tasks"] == ["Pick cube", "Sort blocks"]
+    assert row["subtitle"] == "Pick cube"
+
+
+def test_list_hf_datasets_keeps_legacy_tasks_jsonl(tmp_path: Path, monkeypatch) -> None:
+    hf = tmp_path / "hf"
+    monkeypatch.setenv("HF_HOME", str(hf))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    extra = tmp_path / "extra" / "legacy"
+    (extra / "meta").mkdir(parents=True)
+    (extra / "meta" / "info.json").write_text('{"fps": 15, "total_episodes": 1}\n', encoding="utf-8")
+    (extra / "meta" / "tasks.jsonl").write_text(
+        'not-json\n{"task_index": 0, "task": "Legacy pick"}\n',
+        encoding="utf-8",
+    )
+
+    rows = list_hf_datasets([tmp_path / "extra"])
+    row = next(item for item in rows if item["repo_id"] == "legacy")
+    assert row["task"] == "Legacy pick"
+    assert row["tasks"] == ["Legacy pick"]
+
+
+def test_dataset_registry_resolves_stored_id_and_repo_id(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot"))
+    snapshot = tmp_path / "hub" / "datasets--user--demo" / "snapshots" / "rev"
+    (snapshot / "meta").mkdir(parents=True)
+    (snapshot / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
+    store = JsonStore(tmp_path / "store.json")
+    # Legacy entries can carry a local id while pointing at an upstream repo.
+    store.put_dataset(
+        {
+            "id": "demo_plus80",
+            "repo_id": "user/demo",
+            "remote": "user/demo",
+            "source": "hub",
+            "path": str(snapshot),
+        }
+    )
+    registry = DatasetRegistry(store, [])
+
+    row = registry.get("user/demo")
+    assert row["repo_id"] == "user/demo"
+    assert row["id"] == "user/demo"
+    assert registry.get("demo_plus80")["repo_id"] == "user/demo"
+    assert registry.delete("user/demo")["id"] == "demo_plus80"
+    assert store.dataset("demo_plus80") is None
+
+
+def test_dataset_registry_save_never_downloads(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    snapshot = tmp_path / "hf" / "hub" / "datasets--user--demo" / "snapshots" / "rev"
+    (snapshot / "meta").mkdir(parents=True)
+    (snapshot / "meta" / "info.json").write_text('{"fps": 15, "total_episodes": 3}\n', encoding="utf-8")
+    store = JsonStore(tmp_path / "store.json")
+    store.put_dataset(
+        {
+            "id": "user/demo",
+            "name": "Demo",
+            "source": "hub",
+            "remote": "user/demo",
+            "repo_id": "user/demo",
+            "revision": "",
+            "path": str(snapshot),
+        }
+    )
+    registry = DatasetRegistry(store, [])
+
+    def explode(*args, **kwargs):
+        raise AssertionError("saving dataset details must not sync")
+
+    monkeypatch.setattr(dataset_hub, "download_hf_dataset", explode)
+
+    # Same address: the downloaded snapshot stays on the entry.
+    saved = registry.save("user/demo", {"name": "Renamed", "remote": "user/demo", "revision": "v1"})
+    assert saved["repo_id"] == "user/demo"
+    assert saved["name"] == "Renamed"
+    assert saved["revision"] == "v1"
+    assert saved["path"] == str(snapshot)
+
+    # New address: the stale snapshot is dropped until an explicit download.
+    moved = registry.save("user/demo", {"remote": "user/other"})
+    assert moved["repo_id"] == "user/other"
+    assert moved["path"] == ""
+
+    store.put_dataset({"id": "user/taken", "repo_id": "user/taken", "path": ""})
+    with pytest.raises(DatasetHubError, match="already in the Library"):
+        registry.save("user/other", {"remote": "user/taken"})
+
+
+def test_dataset_registry_keeps_local_path_separate_from_upstream(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    dataset = tmp_path / "datasets" / "user" / "local"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
+    store = JsonStore(tmp_path / "store.json")
+    registry = DatasetRegistry(store, [tmp_path / "datasets"])
+    scanned = registry.get("user/local")
+    assert scanned["upstream"] is False
+    with pytest.raises(DatasetHubError, match="no upstream"):
+        registry.start_upload("user/local")
+
+    saved = registry.save("user/local", {"repo_id": "user/remote", "path": str(dataset), "private": True})
+    assert saved["id"] == "user/remote"
+    assert saved["path"] == str(dataset)
+    assert saved["upstream"] is True
+    assert saved["private"] is True
+
+    moved = registry.save("user/remote", {"repo_id": "user/new"})
+    assert moved["repo_id"] == "user/new"
+    assert moved["path"] == str(dataset)
+    assert moved["private"] is True
+
+    unbound = registry.save("user/new", {"repo_id": ""})
+    assert unbound["repo_id"] == ""
+    assert unbound["path"] == str(dataset)
+    assert unbound["upstream"] is False
+    with pytest.raises(DatasetHubError, match="missing meta/info.json"):
+        registry.save(unbound["id"], {"path": str(tmp_path / "missing")})
+    assert registry.get(unbound["id"])["path"] == str(dataset)
+
+
+def test_dataset_registry_start_download_stages_a_card(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot"))
+    store = JsonStore(tmp_path / "store.json")
+    registry = DatasetRegistry(store, [])
+    started: list[tuple[str, str, str]] = []
+
+    class StubTransfers:
+        def start(self, remote: str, *, revision: str = "", name: str = "") -> dict:
+            started.append((remote, revision, name))
+            return {"repo_id": remote, "revision": revision, "status": "pending", "active": True}
+
+    registry.transfers = StubTransfers()
+    state = registry.start_download(remote="user/blocks", revision="main")
+
+    assert state["active"] is True
+    assert started == [("user/blocks", "main", "user/blocks")]
+    row = next(item for item in registry.list() if item["id"] == "user/blocks")
+    assert row["repo_id"] == "user/blocks"
+    assert row["revision"] == "main"
+    assert row["path"] == ""
+
+
+def test_dataset_upload_rejects_empty_local_path(tmp_path: Path) -> None:
+    store = JsonStore(tmp_path / "store.json")
+    store.put_dataset({"id": "user/empty", "repo_id": "user/empty", "source": "hub", "path": ""})
+    registry = DatasetRegistry(store, [])
+    with pytest.raises(DatasetHubError, match="no local path"):
+        registry.start_upload("user/empty")
+
+
+def test_finished_download_does_not_restore_edited_or_deleted_source(tmp_path: Path) -> None:
+    store = JsonStore(tmp_path / "store.json")
+    store.put_dataset(
+        {"id": "user/old", "repo_id": "user/old", "source": "hub", "revision": "main", "path": ""}
+    )
+    registry = DatasetRegistry(store, [])
+    finished = {
+        "repo_id": "user/old", "revision": "main", "direction": "download",
+        "remote": "user/old", "status": "done", "path": str(tmp_path / "snapshot"),
+    }
+    registry.save("user/old", {"remote": "user/new"})
+    registry._finish_transfer(finished)
+    assert store.dataset("user/old")["repo_id"] == "user/new"
+    assert store.dataset("user/old")["path"] == ""
+
+    store.delete_dataset("user/old")
+    registry._finish_transfer(finished)
+    assert store.datasets() == []
+
+
+def test_active_transfer_prevents_dataset_delete(tmp_path: Path) -> None:
+    store = JsonStore(tmp_path / "store.json")
+    store.put_dataset({"id": "user/demo", "repo_id": "user/demo", "path": str(tmp_path / "dataset")})
+    registry = DatasetRegistry(store, [])
+
+    class BusyTransfers:
+        def get(self, repo_id: str) -> dict:
+            return {"active": True, "direction": "download"}
+
+    registry.transfers = BusyTransfers()
+    with pytest.raises(DatasetHubError, match="still download"):
+        registry.delete("user/demo")
+    assert store.dataset("user/demo") is not None
+
+
+def test_dataset_transfer_manager_reports_progress(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot"))
+    root = tmp_path / "snapshot"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
+    written = {"bytes": 0}
+    release = threading.Event()
+    events: list[dict] = []
+
+    def downloader(repo_id: str, *, revision: str = "") -> str:
+        release.wait(timeout=5)
+        return str(root)
+
+    manager = DatasetTransferManager(
+        poll_seconds=0.05,
+        on_finish=events.append,
+        progress_probe=lambda repo_id: written["bytes"],
+        total_probe=lambda repo_id, revision: 100,
+        downloader=downloader,
+    )
+    started = manager.start("user/blocks")
+    assert started["direction"] == "download"
+    assert started["status"] in {"pending", "transferring"}
+
+    written["bytes"] = 40
+    deadline = time.time() + 5
+    mid: dict = {}
+    while time.time() < deadline:
+        current = manager.get("user/blocks") or {}
+        if current.get("transferred_bytes") == 40:
+            mid = current
+            break
+        time.sleep(0.05)
+    assert mid, "the watcher never published download progress"
+    assert mid["percent"] == 40.0
+    assert mid["active"] is True
+
+    release.set()
+    deadline = time.time() + 5
+    while not events and time.time() < deadline:
+        time.sleep(0.05)
+    assert events and events[0]["status"] == "done"
+    assert events[0]["percent"] == 100.0
+    assert events[0]["path"] == str(root)
+
+    with pytest.raises(DatasetHubError):
+        manager.start("")
+
+
+def test_dataset_transfer_manager_uploads_with_file_progress(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
+    (root / "data").mkdir()
+    for index in range(4):
+        (root / "data" / f"file-{index:03d}.parquet").write_bytes(b"x" * 100)
+    release = threading.Event()
+    events: list[dict] = []
+
+    def uploader(repo_id, folder, *, revision="", private=False, on_progress=None):
+        assert private is True
+        if on_progress is not None:
+            on_progress(200, 2)
+        release.wait(timeout=5)
+        return str(folder)
+
+    manager = DatasetTransferManager(poll_seconds=0.05, on_finish=events.append, uploader=uploader)
+    started = manager.start_upload("user/demo", root, private=True)
+    assert started["direction"] == "upload"
+    assert started["active"] is True
+    assert started["private"] is True
+
+    deadline = time.time() + 5
+    mid: dict = {}
+    while time.time() < deadline:
+        current = manager.get("user/demo") or {}
+        if current.get("files_done") == 2:
+            mid = current
+            break
+        time.sleep(0.05)
+    assert mid.get("files_done") == 2, "upload progress was never published"
+    assert mid["percent"] == pytest.approx(200 / mid["total_bytes"] * 100, abs=0.1)
+
+    release.set()
+    deadline = time.time() + 5
+    while not events and time.time() < deadline:
+        time.sleep(0.05)
+    assert events and events[0]["status"] == "done"
+    assert events[0]["files_total"] == 5
+
+    with pytest.raises(DatasetHubError):
+        manager.start_upload("", root)
+
+
+def test_download_replaces_local_dataset_and_removes_stale_files(tmp_path: Path) -> None:
+    destination = tmp_path / "local"
+    (destination / "meta").mkdir(parents=True)
+    (destination / "meta" / "info.json").write_text('{"fps": 10}\n', encoding="utf-8")
+    (destination / "stale.parquet").write_bytes(b"old")
+    snapshot = tmp_path / "snapshot"
+    (snapshot / "meta").mkdir(parents=True)
+    (snapshot / "meta" / "info.json").write_text('{"fps": 20}\n', encoding="utf-8")
+    (snapshot / "new.parquet").write_bytes(b"new")
+    manager = DatasetTransferManager(
+        progress_probe=lambda repo_id: 0,
+        total_probe=lambda repo_id, revision: 0,
+        downloader=lambda repo_id, revision="": str(snapshot),
+    )
+    manager.start("user/demo", target_path=str(destination))
+    deadline = time.time() + 5
+    while time.time() < deadline and (manager.get("user/demo") or {}).get("status") != "done":
+        time.sleep(0.02)
+    state = manager.get("user/demo")
+    assert state and state["status"] == "done"
+    assert state["path"] == str(destination)
+    assert (destination / "new.parquet").read_bytes() == b"new"
+    assert not (destination / "stale.parquet").exists()
+
+
+def test_download_copy_failure_preserves_local_dataset(tmp_path: Path, monkeypatch) -> None:
+    destination = tmp_path / "local"
+    (destination / "meta").mkdir(parents=True)
+    (destination / "meta" / "info.json").write_text('{"fps": 10}\n', encoding="utf-8")
+    original = destination / "data.parquet"
+    original.write_bytes(b"original")
+    snapshot = tmp_path / "snapshot"
+    (snapshot / "meta").mkdir(parents=True)
+    (snapshot / "meta" / "info.json").write_text('{"fps": 20}\n', encoding="utf-8")
+
+    def broken_copy(source: Path, target: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dataset_hub.shutil, "copytree", broken_copy)
+    manager = DatasetTransferManager(
+        progress_probe=lambda repo_id: 0,
+        total_probe=lambda repo_id, revision: 0,
+        downloader=lambda repo_id, revision="": str(snapshot),
+    )
+    manager.start("user/demo", target_path=str(destination))
+    deadline = time.time() + 5
+    while time.time() < deadline and (manager.get("user/demo") or {}).get("status") != "error":
+        time.sleep(0.02)
+    state = manager.get("user/demo")
+    assert state and state["status"] == "error"
+    assert "disk full" in state["error"]
+    assert original.read_bytes() == b"original"
+
+
+def test_dataset_transfer_manager_blocks_duplicates_and_surfaces_errors(tmp_path: Path) -> None:
+    release = threading.Event()
+    events: list[dict] = []
+
+    def downloader(repo_id: str, *, revision: str = "") -> str:
+        release.wait(timeout=5)
+        raise DatasetHubError("could not download user/blocks: 404")
+
+    manager = DatasetTransferManager(
+        poll_seconds=0.05,
+        on_finish=events.append,
+        progress_probe=lambda repo_id: 0,
+        total_probe=lambda repo_id, revision: 0,
+        downloader=downloader,
+    )
+    first = manager.start("user/blocks")
+    assert first["indeterminate"] is True
+    with pytest.raises(DatasetHubError):
+        manager.start("user/blocks")
+
+    release.set()
+    deadline = time.time() + 5
+    while not events and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert events and events[0]["status"] == "error"
+    assert "404" in events[0]["error"]
+    assert events[0]["active"] is False
+
+
+def test_quiet_progress_bar_renders_nothing(capsys) -> None:
+    quiet = dataset_hub._quiet_progress()
+    with quiet(total=8) as bar:
+        bar.update(3)
+        bar.set_description("downloading")
+    assert bar.disable is True
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""

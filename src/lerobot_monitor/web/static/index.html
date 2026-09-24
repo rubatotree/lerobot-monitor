@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
-  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260923-arm-preview-2"/>
+  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260923-transfer-progress"/>
   <script src="/lerobot/static/vendor/chart/chart.umd.min.js"></script>
   <script type="importmap">
     {
@@ -495,9 +495,10 @@
           <p class="kv-lbl">Camera inputs</p>
           <div id="dbg-cam-map" class="kv-table"></div>
           <p id="dbg-source" class="bus-hint">source: open an episode or snapshot</p>
-          <div class="row-actions">
-            <button type="button" id="btn-dbg-run">Run inference</button>
-            <button type="button" id="btn-dbg-send" class="ghost" disabled>Send first step</button>
+            <div class="row-actions">
+              <button type="button" id="btn-dbg-run">Run inference</button>
+              <button type="button" id="btn-dbg-send" class="ghost" disabled>Send first step</button>
+              <button type="button" id="btn-dbg-clear" class="ghost" disabled>Clear prediction</button>
           </div>
           <div id="dbg-eval" class="debug-eval hidden" aria-live="polite"></div>
           <p id="dbg-status" class="hw-status" role="status" aria-live="polite">idle</p>
@@ -601,7 +602,7 @@
     </div>
   </div>
 
-  <script src="/lerobot/static/app.js?v=20260923-episode-details-2"></script>
+  <script src="/lerobot/static/app.js?v=20260923-transfer-progress"></script>
   <script type="module" src="/lerobot/static/robot-preview.js?v=20260923-arm-preview-2"></script>
 </body>
 </html>

@@ -344,6 +344,20 @@ class JsonStore:
             self._data["library_overrides"][kind].pop(str(source_id), None)
             self._write()
 
+    def move_library_override(self, kind: str, old_id: str, new_id: str) -> None:
+        """Follow a source-address edit while keeping its display metadata."""
+        if kind not in LIBRARY_KINDS:
+            raise KeyError(kind)
+        old_key, new_key = str(old_id), str(new_id)
+        if old_key == new_key:
+            return
+        with self._lock:
+            group = self._data["library_overrides"][kind]
+            previous = group.pop(old_key, None)
+            if isinstance(previous, dict):
+                group[new_key] = {**previous, **group.get(new_key, {})}
+                self._write()
+
     @staticmethod
     def _normalize_notes(value: Any) -> list[str]:
         if isinstance(value, str):

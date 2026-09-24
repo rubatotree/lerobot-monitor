@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -392,6 +393,16 @@ def test_rollout_style_action_moves_the_emulated_scene(
         target = {"shoulder_pan": 30.0, "elbow_flex": -25.0, "gripper": 80.0}
         sent = follower.send_pose({name: 0.0 for name in follower.snapshot()["joints"]} | target)
         assert set(sent) == set(follower.snapshot()["joints"])
+
+        # sync_write does not acknowledge a broadcast packet. Wait until the
+        # transport thread has applied the goals before advancing the scene.
+        deadline = time.monotonic() + 2.0
+        while any(
+            abs(bus.bank.goal_lerobot_position(name) - value) >= 0.5
+            for name, value in target.items()
+        ):
+            assert time.monotonic() < deadline, "仿真总线未在超时前收到目标关节位置"
+            time.sleep(0.005)
 
         for _ in range(5):
             bus.tick()

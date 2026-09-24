@@ -1,5 +1,11 @@
 # Dev log
 
+## 2026-09-24（仿真 rollout 偶发失败）
+
+- 复现 `test_sim.py::test_rollout_style_action_moves_the_emulated_scene` 的偶发旧姿态断言：修复前连续运行第 5 次读到 `shoulder_pan ≈ 0.04°`，目标为 `30°`。
+- 根因是 Feetech `sync_write` 广播没有回执，`FollowerArm.send_pose()` 返回后 TCP 服务线程仍可能尚未写入目标寄存器。测试现以有界等待确认目标已进入 `MotorBank`，再调用 `tick()` 推进场景；生产控制路径不变。
+- 使用仓库根目录带 Feetech SDK 的虚拟环境，专项连续 12 次通过；完整 monitor 测试 `239 passed, 1 skipped`。monitor 自身 `.venv` 缺少 `scservo_sdk`，不适合运行该集成测试。
+
 ## 2026-09-23（3D 虚拟从臂预览）
 
 - 新增 `VirtualFollowerArm` 与 `virtual://preview`：无硬件时默认自动连接，真实从臂

@@ -4207,7 +4207,7 @@ const LIBRARY_UPLOAD_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d
 const LIBRARY_DOWNLOAD_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>`;
 
 function librarySourceId(kind, row) {
-  if (kind === "video" || kind === "snapshot") return String(row.id || "");
+  if (kind === "video" || kind === "snapshot" || kind === "model") return String(row.id || "");
   return String(row.repo_id || row.id || "");
 }
 

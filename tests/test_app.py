@@ -315,6 +315,67 @@ def test_episode_edit_persists(tmp_path: Path, monkeypatch) -> None:
             assert reopened.get("/lerobot/api/ui").json()["selected_video"] == video_id
 
 
+def test_library_delete_model_uses_registered_id_and_removes_whole_hub_cache(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_LEROBOT_HOME", raising=False)
+    monkeypatch.delenv("LEROBOT_HOME", raising=False)
+    repo_dir = tmp_path / "hf" / "hub" / "models--rubatotree--classify-blocks-2-smolvla"
+    snapshot = repo_dir / "snapshots" / "rev1"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text('{"type": "smolvla"}', encoding="utf-8")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    (repo_dir / "blobs").mkdir()
+    (repo_dir / "blobs" / "abc").write_bytes(b"weights")
+    model_id = "rubatotree-classify-blocks-2-smolvla"
+    store = JsonStore(tmp_path / "store.json")
+    store.put_model({
+        "id": model_id,
+        "repo_id": "rubatotree/classify-blocks-2-smolvla",
+        "source": "huggingface",
+        "path": str(snapshot),
+        "name": "rubatotree/classify-blocks-2-smolvla",
+    })
+    store.save_library_override("model", model_id, {"description": "test note"})
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        listed = client.get("/lerobot/api/models").json()
+        assert len(listed) == 1
+        assert listed[0]["id"] == model_id
+
+        deleted = client.delete("/lerobot/api/library", params={"kind": "model", "id": model_id})
+        assert deleted.status_code == 200, deleted.text
+        assert client.get("/lerobot/api/models").json() == []
+
+    assert not repo_dir.exists()
+    assert app.state.hub.store.model(model_id) is None
+    assert app.state.hub.store.library_override("model", model_id) == {}
+
+
+def test_library_delete_model_keeps_registration_if_cache_removal_fails(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    snapshot = tmp_path / "hf" / "hub" / "models--user--policy" / "snapshots" / "rev1"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text('{"type": "act"}', encoding="utf-8")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    store = JsonStore(tmp_path / "store.json")
+    store.put_model({"id": "registered-policy", "repo_id": "user/policy", "path": str(snapshot)})
+    app = create_app(_debug_config(tmp_path))
+
+    def deny_remove(path: str | Path, *args: object, **kwargs: object) -> None:
+        raise PermissionError("cache is in use")
+
+    monkeypatch.setattr(app_module.shutil, "rmtree", deny_remove)
+    with TestClient(app) as client:
+        deleted = client.delete("/lerobot/api/library", params={"kind": "model", "id": "registered-policy"})
+        assert deleted.status_code == 400
+        assert client.get("/lerobot/api/models").json()[0]["id"] == "registered-policy"
+
+    assert app.state.hub.store.model("registered-policy") is not None
+
+
 def test_library_notes_and_descriptions_merge_into_lists(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)

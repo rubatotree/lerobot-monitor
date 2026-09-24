@@ -1,5 +1,11 @@
 # Dev log
 
+## 2026-09-24（模型删除）
+
+- 已登记的 `rubatotree/classify-blocks-2-smolvla` 在 Library 的实际 ID 是 `rubatotree-classify-blocks-2-smolvla`。前端此前优先发送 `repo_id`，后端返回 404，日志只显示仓库名。
+- 模型卡片改用实际 ID。删除 Hugging Face 模型时删除整个缓存仓库目录（含 snapshots、blobs、refs）；磁盘删除成功后才清理登记与描述，短暂 Windows 占用做有界重试。
+- API 回归覆盖登记 ID 与 repo_id 不同、完整缓存清理、删除失败保留登记；前端脚本验证请求 ID。`tests/test_app.py` 为 `33 passed, 1 skipped`，前端脚本、JS 语法与 diff 检查通过。当前机器的原缓存路径已不存在，未在运行中的服务中执行真实模型删除。
+
 ## 2026-09-24（仿真 rollout 偶发失败）
 
 - 复现 `test_sim.py::test_rollout_style_action_moves_the_emulated_scene` 的偶发旧姿态断言：修复前连续运行第 5 次读到 `shoulder_pan ≈ 0.04°`，目标为 `30°`。

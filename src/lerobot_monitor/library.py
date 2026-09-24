@@ -930,6 +930,32 @@ def huggingface_hub_cache() -> Path:
     return huggingface_home() / "hub"
 
 
+def hub_cache_repo_dir(path: str | Path | None, repo_id: str = "", *, kind: str = "dataset") -> Path | None:
+    """Hub cache folder that owns one dataset or model snapshot path.
+
+    Deleting only a Hub snapshot leaves its blobs and refs
+    behind, so library deletion removes the owning cache folder instead.
+    """
+    if not path:
+        return None
+    if kind not in {"dataset", "model"}:
+        raise ValueError(f"unsupported Hub cache kind: {kind}")
+    try:
+        target = Path(path).expanduser().resolve()
+    except OSError:
+        return None
+    cache = huggingface_hub_cache().resolve()
+    for candidate in (target, *target.parents):
+        if candidate.parent != cache:
+            continue
+        prefix = f"{kind}s--"
+        if candidate.name.startswith(prefix) and (
+            not repo_id or candidate.name == f"{prefix}{repo_id.replace('/', '--')}"
+        ):
+            return candidate
+    return None
+
+
 def cached_hub_snapshot(repo_id: str, revision: str = "") -> str | None:
     """Return a local HF snapshot path without calling the Hub."""
     repo_id = str(repo_id or "").strip()

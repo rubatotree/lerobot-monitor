@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import shutil
+import stat
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,7 +27,7 @@ from .dataset_hub import (
     search_hf_datasets,
 )
 from .hub import RuntimeHub
-from .library import library_metadata
+from .library import hub_cache_repo_dir, library_metadata
 from .metrics import evaluate_action_chunk
 from .model_hub import ModelHubError, search_hf_models
 from .robot_models import RobotModelError, search_hf_robot_models
@@ -324,6 +326,20 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _force_remove(function: Any, path: str, excinfo: Any) -> None:
+    """Retry a failed unlink/rmdir after clearing a read-only attribute.
+
+    Windows refuses to delete read-only files, which is how some Hub cache
+    payloads arrive; retrying once makes library deletion reliable.
+    """
+    del excinfo
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except OSError:
+        pass
+    function(path)
 
 
 def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
@@ -695,13 +711,27 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     def _delete_resource_path(path: str | Path | None) -> None:
         if not path:
             return
-        target = Path(path).expanduser().resolve()
+        try:
+            target = Path(path).expanduser().resolve()
+        except OSError:
+            return
         if not target.exists() or target == Path(target.anchor):
             return
         if target.is_dir():
-            shutil.rmtree(target)
+            shutil.rmtree(target, onexc=_force_remove)
         else:
-            target.unlink()
+            _force_remove(os.unlink, str(target), None)
+
+    async def _delete_library_path(path: str | Path | None) -> None:
+        # Retry transient Windows access conflicts while file handles close.
+        for delay in (0.1, 0.2, 0.4, 0.8, 1.6, 2.0, None):
+            try:
+                await asyncio.to_thread(_delete_resource_path, path)
+                return
+            except OSError as exc:
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or delay is None:
+                    raise
+                await asyncio.sleep(delay)
 
     @router.get("/api/videos")
     async def list_videos() -> list[dict[str, Any]]:
@@ -999,9 +1029,13 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 )
                 if row is None:
                     raise FileNotFoundError(id)
+                target = hub_cache_repo_dir(row.get("path"), str(row.get("repo_id") or ""), kind="model") or row.get("path")
+                try:
+                    await _delete_library_path(target)
+                except OSError as exc:
+                    raise HTTPException(400, f"could not delete {target}: {exc}") from exc
                 await asyncio.to_thread(hub.model_registry.delete, id)
                 await asyncio.to_thread(hub.store.delete_library_override, "model", id)
-                await asyncio.to_thread(_delete_resource_path, row.get("path"))
             elif kind == "dataset":
                 row = await asyncio.to_thread(hub.resolve_dataset, id)
                 await asyncio.to_thread(hub.dataset_registry.delete, id)

@@ -26,8 +26,11 @@ def test_search_hf_models_prefers_lerobot_filter(monkeypatch) -> None:
     calls: list[str | None] = []
 
     class FakeApi:
-        def list_models(self, **kwargs):
-            calls.append(kwargs.get("filter"))
+        def list_models(self, *, search, filter, limit, sort):
+            # Mirrors huggingface_hub 1.x, which has no `direction` argument:
+            # passing one raises TypeError exactly like the real client did.
+            assert (search, filter, limit, sort) == ("act", "lerobot", 5, "downloads")
+            calls.append(filter)
             return [
                 SimpleNamespace(
                     id="lerobot/act_aloha",

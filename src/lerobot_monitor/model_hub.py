@@ -102,7 +102,9 @@ def search_hf_models(query: str, *, limit: int = 20) -> list[dict[str, Any]]:
     api = _hub_module().HfApi()
 
     def fetch(tag: str | None) -> list[Any]:
-        return list(api.list_models(search=text, filter=tag, limit=limit, sort="downloads", direction=-1))
+        # huggingface_hub 1.x dropped the `direction` argument; the Hub API
+        # already returns `sort="downloads"` in descending order.
+        return list(api.list_models(search=text, filter=tag, limit=limit, sort="downloads"))
 
     try:
         models = fetch("lerobot")

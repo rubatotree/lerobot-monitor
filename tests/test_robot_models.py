@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from lerobot_monitor import robot_models
 from lerobot_monitor.robot_models import (
     MANIFEST_NAME,
     SCHEMA,
     RobotModelError,
     RobotModelRegistry,
+    search_hf_robot_models,
 )
 from lerobot_monitor.store import JsonStore
 
@@ -66,3 +69,37 @@ def test_builtin_model_cannot_be_deleted(tmp_path: Path) -> None:
     registry = RobotModelRegistry(JsonStore(tmp_path / "store.json"), tmp_path / "models")
     with pytest.raises(RobotModelError):
         registry.delete("so101")
+
+
+def test_search_hf_robot_models_uses_robotics_filter(monkeypatch) -> None:
+    calls: list[str | None] = []
+
+    class FakeApi:
+        def list_models(self, *, search, filter, limit, sort):
+            # Mirrors huggingface_hub 1.x, which has no `direction` argument:
+            # passing one raises TypeError exactly like the real client did.
+            assert (search, limit, sort) == ("so101", 20, "downloads")
+            calls.append(filter)
+            return [
+                SimpleNamespace(
+                    id="lerobot/so101_grasp",
+                    downloads=11,
+                    likes=1,
+                    last_modified="2026-09-20",
+                    tags=["robotics", "license:apache-2.0"],
+                )
+            ]
+
+    monkeypatch.setattr(robot_models, "_hub_module", lambda: SimpleNamespace(HfApi=FakeApi))
+    rows = search_hf_robot_models("so101")
+
+    assert calls == ["robotics"]
+    assert rows == [
+        {
+            "repo_id": "lerobot/so101_grasp",
+            "downloads": 11,
+            "likes": 1,
+            "last_modified": "2026-09-20",
+            "tags": ["robotics"],
+        }
+    ]

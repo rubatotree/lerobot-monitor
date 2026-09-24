@@ -104,17 +104,18 @@ def search_hf_robot_models(query: str, *, limit: int = 20) -> list[dict[str, Any
         raise RobotModelError("search query is empty")
     api = _hub_module().HfApi()
     try:
+        # huggingface_hub 1.x dropped the `direction` argument; the Hub API
+        # already returns `sort="downloads"` in descending order.
         rows = list(
             api.list_models(
                 search=text,
                 filter="robotics",
                 limit=limit,
                 sort="downloads",
-                direction=-1,
             )
         )
         if not rows:
-            rows = list(api.list_models(search=text, limit=limit, sort="downloads", direction=-1))
+            rows = list(api.list_models(search=text, limit=limit, sort="downloads"))
     except Exception as exc:  # noqa: BLE001 - Hub errors are user-facing
         raise RobotModelError(f"Hugging Face search failed: {exc}") from exc
     return [

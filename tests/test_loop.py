@@ -1,3 +1,4 @@
+import io
 import logging
 import queue
 import threading
@@ -745,6 +746,40 @@ def test_ui_log_handler_keeps_traceback_and_is_removed_on_stop(tmp_path: Path, m
 
     assert handler not in logging.getLogger().handlers
     assert loop._ui_log_handler is None
+
+
+def test_ui_log_handler_quiets_third_party_transfer_loggers(tmp_path: Path, monkeypatch) -> None:
+    loop = _loop(tmp_path)
+    monkeypatch.setattr(loop, "_run", lambda: None)
+
+    loop.start()
+    try:
+        logging.getLogger("httpx").info("HTTP Request: HEAD https://huggingface.co/api/datasets/x 200 OK")
+        logging.getLogger("huggingface_hub.file_download").info("Downloading bytes: 42%")
+        logging.getLogger("httpx").warning("connection reset by peer")
+        logging.getLogger("external.tool").info("real app message")
+        rendered = "\n".join(str(entry["message"]) for entry in loop.logs)
+        assert "HTTP Request: HEAD" not in rendered
+        assert "Downloading bytes" not in rendered
+        assert "connection reset by peer" in rendered
+        assert "real app message" in rendered
+    finally:
+        loop.stop()
+
+
+def test_stdio_log_capture_keeps_only_the_last_progress_redraw(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    stream = io.StringIO()
+    capture = loop_module._StdioToLog(loop, stream)
+
+    capture.write("Downloading 10%\r")
+    capture.write("Downloading 60%\r")
+    capture.write("Downloading 100%\n")
+    rendered = "\n".join(str(entry["message"]) for entry in loop.logs)
+    assert rendered.count("Downloading") == 1
+    assert "Downloading 100%" in rendered
+    # The real stream still receives every redraw untouched.
+    assert stream.getvalue() == "Downloading 10%\rDownloading 60%\rDownloading 100%\n"
 
 
 def test_ui_log_handlers_share_and_cautiously_restore_root_level(tmp_path: Path, monkeypatch) -> None:

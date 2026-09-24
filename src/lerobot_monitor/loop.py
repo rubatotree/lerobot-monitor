@@ -37,6 +37,19 @@ from .virtual_follower import VIRTUAL_PORT
 
 logger = logging.getLogger(__name__)
 _LOG_SKIP_PREFIXES = ("uvicorn.access", "lerobot_monitor")
+# Third-party transfer libraries log every request and progress tick at INFO
+# ("HTTP Request: HEAD https://huggingface.co/..."). Only warnings and errors
+# from these loggers belong in the monitor log.
+_LOG_QUIET_PREFIXES = (
+    "httpcore",
+    "httpx",
+    "urllib3",
+    "filelock",
+    "fsspec",
+    "huggingface_hub",
+    "hf_xet",
+    "datasets",
+)
 # Policy construction mutates process-global stdout, environment, and HF/torch
 # caches. Serializing only output capture still lets two loaders corrupt those
 # globals, including when separate ControlLoop instances exist in one process.
@@ -77,7 +90,12 @@ class _UiLogHandler(logging.Handler):
         self.loop = loop
 
     def emit(self, record: logging.LogRecord) -> None:
-        if any(record.name.startswith(prefix) for prefix in _LOG_SKIP_PREFIXES):
+        name = record.name
+        if any(name.startswith(prefix) for prefix in _LOG_SKIP_PREFIXES):
+            return
+        if record.levelno < logging.WARNING and any(
+            name.startswith(prefix) for prefix in _LOG_QUIET_PREFIXES
+        ):
             return
         try:
             # Formatter.format() appends exc_info/stack_info; getMessage() loses
@@ -100,7 +118,9 @@ class _StdioToLog:
 
     def write(self, text: str) -> int:
         self.stream.write(text)
-        self._buf += text
+        # Progress bars redraw with a bare carriage return; buffering the text
+        # before the last CR would glue every redraw into one huge log line.
+        self._buf += text.rsplit("\r", 1)[-1]
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
             line = line.strip()

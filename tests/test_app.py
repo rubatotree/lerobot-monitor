@@ -535,6 +535,38 @@ def test_dataset_upload_api_reports_file_progress(tmp_path: Path, monkeypatch) -
         assert finished[0]["direction"] == "upload"
 
 
+def test_open_library_folder_resolves_registered_local_resources(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+    launched = MagicMock()
+    monkeypatch.setattr(app_module.subprocess, "Popen", launched)
+
+    with TestClient(app) as client:
+        hub = app.state.hub
+        video = hub.videos.create("open folder")
+        snapshot = hub.snapshots.create(name="open folder")
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        dataset_dir = tmp_path / "dataset"
+        dataset_dir.mkdir()
+        monkeypatch.setattr(hub, "models", lambda: [{"id": "local-model", "path": str(model_dir)}])
+        monkeypatch.setattr(hub, "resolve_dataset", lambda _id: {"path": str(dataset_dir)})
+
+        for kind, resource_id, expected in (
+            ("video", video["id"], Path(video["path"])),
+            ("snapshot", snapshot["id"], Path(snapshot["path"])),
+            ("model", "local-model", model_dir),
+            ("dataset", "local-dataset", dataset_dir),
+        ):
+            response = client.post("/lerobot/api/library/open-folder", params={"kind": kind, "id": resource_id})
+            assert response.status_code == 200, response.text
+            assert launched.call_args.args[0][-1] == str(expected.resolve())
+
+        assert client.post("/lerobot/api/library/open-folder", params={"kind": "video", "id": "missing"}).status_code == 404
+        assert client.post("/lerobot/api/library/open-folder", params={"kind": "other", "id": "x"}).status_code == 400
+    assert launched.call_count == 4
+
+
 def test_library_delete_removes_hub_cache_folder_and_mismatched_ids(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
@@ -1450,6 +1482,9 @@ def test_index_page_exposes_snapshot_and_debug_dom(tmp_path: Path, monkeypatch) 
         'id="btn-leader-toggle"',
         'id="btn-hdr-arm-power"',
         'id="btn-hdr-leader-power"',
+        'class="header-safety"',
+        'id="btn-log-clear"',
+        'id="btn-log-copy"',
         'aria-label="Arm device"',
         'aria-label="Leader device"',
     ):
@@ -1634,6 +1669,8 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert "Object.keys(metadata)" in script.text
     assert "function renderMetadataMenu" in script.text
     assert "function duplicateLibraryResource" in script.text
+    assert "LIBRARY_FOLDER_ICON" in script.text
+    assert "clearedLogSequence" in script.text
     assert "function clearLibrarySelection" in script.text
     assert "function populateRecordDatasetSelect" in script.text
     assert "function syncRecordDatasetSelection" in script.text

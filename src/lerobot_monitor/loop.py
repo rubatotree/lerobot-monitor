@@ -191,7 +191,8 @@ class ControlLoop:
         self.action: dict[str, float] = {}
         self.loop_fps = 0.0
         self.last_error: str | None = None
-        self.logs: list[dict[str, str]] = []
+        self.logs: list[dict[str, str | int]] = []
+        self._log_sequence = 0
 
         self._slew_start: dict[str, float] | None = None
         self._slew_goal: dict[str, float] | None = None
@@ -528,8 +529,9 @@ class ControlLoop:
         }.get(self.mode, self.mode)
 
     def log(self, level: str, message: str, *, echo: bool = True) -> None:
-        entry = {"level": level, "message": message, "t": time.strftime("%H:%M:%S")}
         with self._log_lock:
+            self._log_sequence += 1
+            entry = {"seq": self._log_sequence, "level": level, "message": message, "t": time.strftime("%H:%M:%S")}
             self.logs.append(entry)
             self.logs = self.logs[-400:]
             writer = self.writer

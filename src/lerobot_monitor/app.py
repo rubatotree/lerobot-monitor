@@ -8,6 +8,8 @@ import math
 import os
 import shutil
 import stat
+import subprocess
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -823,6 +825,34 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             return _merge_snapshot_metadata(hub.snapshots.get(source_id))
         raise ValueError(f"unknown library kind '{kind}'")
 
+    def _open_library_folder(kind: str, source_id: str) -> None:
+        # Resolve the ID on the server; a browser-supplied path must never launch a local process.
+        if kind == "video":
+            row = hub.videos.get(source_id)
+        elif kind == "snapshot":
+            row = hub.snapshots.get(source_id)
+        elif kind == "dataset":
+            row = hub.resolve_dataset(source_id)
+        elif kind == "model":
+            row = next((item for item in hub.models() if str(item.get("id") or "") == source_id), None)
+            if row is None:
+                raise KeyError(source_id)
+        else:
+            raise ValueError(f"unknown library kind '{kind}'")
+        raw_path = row.get("path")
+        if not raw_path:
+            raise FileNotFoundError(f"{kind} '{source_id}' has no local folder")
+        folder = Path(raw_path).expanduser().resolve(strict=True)
+        if not folder.is_dir():
+            raise FileNotFoundError(f"{kind} '{source_id}' has no local folder")
+        if sys.platform == "win32":
+            command = ["explorer.exe", str(folder)]
+        elif sys.platform == "darwin":
+            command = ["open", str(folder)]
+        else:
+            command = ["xdg-open", str(folder)]
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     def _delete_resource_path(path: str | Path | None) -> None:
         if not path:
             return
@@ -1068,6 +1098,18 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 raise HTTPException(404, str(exc)) from exc
             except DatasetHubError as exc:
                 raise HTTPException(400, str(exc)) from exc
+
+    @router.post("/api/library/open-folder")
+    async def open_library_folder(kind: str, id: str) -> dict[str, bool]:
+        try:
+            await asyncio.to_thread(_open_library_folder, kind, id)
+        except (FileNotFoundError, KeyError) as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(503, f"could not open file manager: {exc}") from exc
+        return {"ok": True}
 
     @router.put("/api/library")
     async def edit_library(body: LibraryEditBody) -> dict[str, Any]:

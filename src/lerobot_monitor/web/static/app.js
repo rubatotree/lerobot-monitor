@@ -2714,6 +2714,25 @@ $("cam-rows").addEventListener("input", (ev) => {
 });
 
 let lastLogKey = "";
+let latestLogSequence = 0;
+let clearedLogSequence = 0;
+let latestLogEntries = [];
+let clearedLogEntries = null;
+function logEntryKey(entry) {
+  return `${entry.t}|${entry.level}|${entry.message}`;
+}
+function visibleLegacyLogs(entries) {
+  if (!clearedLogEntries) return entries;
+  // The older server has no sequence numbers. Match the cleared tail against
+  // the current head so a rolling log can still show entries added afterward.
+  for (let overlap = Math.min(clearedLogEntries.length, entries.length); overlap > 0; overlap--) {
+    const previous = clearedLogEntries.slice(-overlap);
+    if (previous.every((entry, index) => logEntryKey(entry) === logEntryKey(entries[index]))) {
+      return entries.slice(overlap);
+    }
+  }
+  return entries;
+}
 function logIsBeingSelected() {
   const ol = $("log");
   const sel = window.getSelection();
@@ -2723,12 +2742,20 @@ function logIsBeingSelected() {
 function renderLogs(logs) {
   const ol = $("log");
   if (!ol) return;
-  const key = (logs || []).map((e) => `${e.t}|${e.level}|${e.message}`).join("\n");
+  const entries = logs || [];
+  latestLogEntries = entries;
+  const newestSequence = entries.length ? Number(entries[entries.length - 1].seq) || 0 : 0;
+  if (newestSequence && newestSequence < latestLogSequence) clearedLogSequence = 0;
+  latestLogSequence = newestSequence;
+  const visible = newestSequence
+    ? entries.filter((entry) => Number(entry.seq) > clearedLogSequence)
+    : visibleLegacyLogs(entries);
+  const key = visible.map((entry) => `${entry.seq || ""}|${logEntryKey(entry)}`).join("\n");
   if (key === lastLogKey) return;
   if (logIsBeingSelected()) return;
   lastLogKey = key;
   ol.innerHTML = "";
-  (logs || []).slice().reverse().forEach((entry) => {
+  visible.slice().reverse().forEach((entry) => {
     const li = document.createElement("li");
     if (entry.level === "error") li.className = "error";
     li.textContent = `${entry.t || ""}  ${entry.message}`;
@@ -4133,6 +4160,12 @@ bind("btn-log-copy", async () => {
     ta.remove();
   }
 });
+bind("btn-log-clear", () => {
+  clearedLogSequence = latestLogSequence;
+  clearedLogEntries = latestLogEntries.slice();
+  lastLogKey = "";
+  $("log").replaceChildren();
+});
 
 const PANEL_KEY = "lerobot-monitor-panels";
 function loadPanelState() {
@@ -4141,7 +4174,7 @@ function loadPanelState() {
 function initPanels() {
   const state = loadPanelState();
   document.querySelectorAll("[data-panel]").forEach((panel) => {
-    const btn = [...panel.children].find((child) => child.classList.contains("panel-toggle"));
+    const btn = panel.querySelector(":scope > .panel-toggle, :scope > .log-heading > .panel-toggle");
     if (!btn) return;
     const id = panel.dataset.panel;
     const collapsed = !!state[id];
@@ -4379,6 +4412,7 @@ const LIBRARY_DUPLICATE_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><rec
 const LIBRARY_REFRESH_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>`;
 const LIBRARY_UPLOAD_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M5 20h14"/></svg>`;
 const LIBRARY_DOWNLOAD_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>`;
+const LIBRARY_FOLDER_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h6l2 2h10v11H3z"/><path d="M3 8V5h6"/></svg>`;
 
 function librarySourceId(kind, row) {
   if (kind === "video" || kind === "snapshot" || kind === "model") return String(row.id || "");
@@ -5017,6 +5051,21 @@ function editLibrarySource(kind, row) {
 function libraryResourceTools(kind, row) {
   const sourceId = librarySourceId(kind, row);
   const tools = [];
+  if (row.path) {
+    const folder = makeLibraryIconButton("lib-folder", `Open ${sourceId} folder in file manager on this computer`, LIBRARY_FOLDER_ICON);
+    folder.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      folder.disabled = true;
+      try {
+        await api(`/api/library/open-folder?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(sourceId)}`);
+      } catch (err) {
+        toastError(err);
+      } finally {
+        folder.disabled = false;
+      }
+    });
+    tools.push(folder);
+  }
   const edit = makeLibraryIconButton("lib-source-edit", `Edit details for ${sourceId}`, LIBRARY_EDIT_ICON);
   edit.addEventListener("click", (event) => {
     event.stopPropagation();

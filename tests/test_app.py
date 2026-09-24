@@ -28,6 +28,68 @@ from lerobot_monitor.config import (
 )
 from lerobot_monitor.policy import ActionChunk
 from lerobot_monitor.store import JsonStore
+from lerobot_monitor.types import JOINT_ORDER
+
+
+def test_virtual_record_api_publishes_to_library_dataset(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(dataset_hub, "lerobot_home", lambda: tmp_path / "lerobot")
+    config = MonitorConfig(
+        store_path=tmp_path / "store.json",
+        server=ServerConfig(port=0, base_path="/lerobot"),
+        robot=RobotConfig(auto_connect=False),
+        cameras=CamerasConfig(probe=False),
+        recording=RecordingConfig(root=tmp_path / "videos"),
+        library=LibraryConfig(videos_root=tmp_path / "videos"),
+    )
+    app = create_app(config)
+    with TestClient(app) as client:
+        hub = app.state.hub
+        leader = MagicMock()
+        leader.connected = True
+        leader.get_action_pose.return_value = {joint: 5.0 for joint in JOINT_ORDER}
+        leader.snapshot.return_value = {"connected": True}
+        hub.leader = leader
+        hub.loop.leader = leader
+        created = client.post(
+            "/lerobot/api/datasets/empty",
+            json={"name": "virtual record", "fps": 5, "cameras": []},
+        )
+        assert created.status_code == 200, created.text
+        row = created.json()
+        started = client.post(
+            "/lerobot/api/record/start",
+            json={"dataset_id": row["id"], "task": "pick", "num_episodes": 1, "episode_time_s": 2},
+        )
+        assert started.status_code == 200, started.text
+        deadline = time.monotonic() + 10
+        record = None
+        while time.monotonic() < deadline:
+            record = client.get("/lerobot/api/status").json()["task"]["record"]
+            if record and record["phase"] == "resetting":
+                break
+            time.sleep(0.03)
+        assert record and record["phase"] == "resetting"
+        control = {"session_id": record["session_id"], "version": record["version"], "operation_id": "start-1"}
+        begun = client.post("/lerobot/api/record/next", json=control)
+        assert begun.status_code == 200, begun.text
+        assert client.post("/lerobot/api/cameras/rescan").status_code == 409
+        time.sleep(0.5)
+        control.update(version=begun.json()["record"]["version"], operation_id="finish-1")
+        finished = client.post("/lerobot/api/record/next", json=control)
+        assert finished.status_code == 200, finished.text
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            record = client.get("/lerobot/api/status").json()["task"]["record"]
+            if record["phase"] in {"completed", "error"}:
+                break
+            time.sleep(0.05)
+        assert record["phase"] == "completed", record
+        assert record["saved"] == 1
+        assert record["episode_number"] == 1
+        episodes = client.get("/lerobot/api/episodes", params={"kind": "dataset", "id": row["id"]})
+        assert episodes.status_code == 200, episodes.text
+        assert len(episodes.json()["episodes"]) == 1
+
 
 
 def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
@@ -326,7 +388,7 @@ def test_episode_edit_persists(tmp_path: Path, monkeypatch) -> None:
         reopened = TestClient(create_app(cfg))
         with reopened:
             listed = reopened.get("/lerobot/api/episodes", params={"kind": "video", "id": video_id})
-            assert [row["name"] for row in listed.json()["episodes"]] == ["episode-2"]
+            assert [row["name"] for row in listed.json()["episodes"]] == ["episode-2", "episode-1"]
             assert reopened.get("/lerobot/api/ui").json()["selected_video"] == video_id
 
 

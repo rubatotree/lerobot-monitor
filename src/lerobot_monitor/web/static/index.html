@@ -193,6 +193,24 @@
     </aside>
     <div id="split-ep" class="split col hidden" role="separator" aria-orientation="vertical"></div>
     <section id="cameras" aria-label="cameras">
+      <div id="record-transport" class="record-transport hidden" role="region" aria-label="Record controls">
+        <div class="record-head">
+          <strong class="replay-tag record-tag">REC</strong>
+          <span id="record-title" class="record-title">—</span>
+          <span id="record-phase" class="record-phase" role="status" aria-live="polite">Preparing</span>
+          <button type="button" id="btn-record-view" class="ghost hidden">View dataset</button>
+        </div>
+        <div class="record-progress" role="progressbar" aria-label="Episode progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="record-progress-fill"></span></div>
+        <div class="record-controls" role="group" aria-label="Record transport">
+          <button type="button" id="btn-record-pause" class="ghost" aria-label="Pause recording">Pause</button>
+          <button type="button" id="btn-record-back" class="ghost" aria-label="Discard and re-record episode">Re-record</button>
+          <button type="button" id="btn-record-next" class="ghost" aria-label="Advance record stage">Start episode</button>
+          <button type="button" id="btn-record-stop" class="ghost stop" aria-label="Stop recording">Stop · discard current</button>
+          <button type="button" id="btn-record-retry" class="ghost hidden">Retry save</button>
+          <output id="record-time">0:00 / 0:00</output>
+        </div>
+        <p id="record-save-status" class="record-save-status" role="status" aria-live="polite"></p>
+      </div>
       <div id="preview-wrist" class="preview-wrist" data-corner="bottom-right">
         <canvas id="preview-wrist-canvas" width="320" height="180" aria-label="Virtual wrist camera"></canvas>
         <button type="button" id="preview-wrist-corner" class="preview-wrist-corner" title="Move wrist camera" aria-label="Move wrist camera">
@@ -349,6 +367,10 @@
               <label>Episodes
                 <input id="rec-num" type="number" value="50" min="1" step="1"/>
               </label>
+              <label class="check">
+                <input id="chk-rec-auto-next" type="checkbox"/>
+                Auto-start next episode after Reset s
+              </label>
               <div class="pair">
                 <label>Episode s
                   <input id="rec-ep" type="number" value="20" min="1" step="1"/>
@@ -357,39 +379,21 @@
                   <input id="rec-reset" type="number" value="5" min="0" step="1"/>
                 </label>
               </div>
-              <div class="pair">
-                <label>Action FPS
-                  <input id="rec-action-fps" type="number" value="15" min="1" step="1"/>
-                </label>
-                <label>Video FPS
-                  <input id="rec-video-fps" type="number" value="30" min="1" step="1"/>
-                </label>
-              </div>
-              <label>Format
-                  <select id="rec-format">
-                    <option value="mp4">mp4</option>
-                    <option value="avi">avi</option>
-                  </select>
+              <label>Dataset FPS
+                <input id="rec-action-fps" type="number" value="15" min="1" step="1"/>
               </label>
+              <input id="rec-video-fps" type="hidden" value="15"/>
+              <input id="rec-format" type="hidden" value="mp4"/>
               <input id="rec-root" type="hidden"/>
               <div id="record-destination" class="record-destination" role="status" aria-live="polite">
                 Destination: data/datasets/&lt;session&gt;
               </div>
-              <label class="check">
-                <input type="checkbox" id="chk-rec-video" checked/>
-                Video
-              </label>
-              <label class="check">
-                <input type="checkbox" id="chk-rec-stream-enc" checked/>
-                Streaming encoding
-              </label>
+              <input type="checkbox" id="chk-rec-video" checked hidden/>
+              <input type="checkbox" id="chk-rec-stream-enc" checked hidden/>
               <label class="check">
                 <input type="checkbox" id="chk-rec-deferred-enc"/>
-                Save JPEGs, encode after recording
+                Save to Dataset after recording ends
               </label>
-              <div class="row-actions">
-                <button type="button" id="btn-rec-next" class="ghost">Next ep</button>
-              </div>
               <details class="task-info">
                 <summary>Command preview</summary>
                 <pre id="info-record"></pre>

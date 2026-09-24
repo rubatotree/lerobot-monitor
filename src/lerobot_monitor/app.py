@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import shutil
 import stat
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -28,7 +30,10 @@ from .dataset_hub import (
     search_hf_datasets,
 )
 from .hub import RuntimeHub
-from .library import hub_cache_repo_dir, library_metadata
+from .library import hub_cache_repo_dir, lerobot_home, library_metadata
+from .record_dataset import RecordDatasetSession, recover_record_publish
+from .pathutil import ensure_lerobot_on_path
+from .session import safe_cam_name
 from .metrics import evaluate_action_chunk
 from .model_hub import ModelHubError, search_hf_models
 from .robot_models import RobotModelError, search_hf_robot_models
@@ -95,6 +100,15 @@ class RecordStartBody(BaseModel):
     video: bool | None = None
     merge: bool | None = None
     auto_record: bool | None = None
+    auto_next: bool = False
+    resume_speed: float = 30.0
+
+
+class RecordControlBody(BaseModel):
+    session_id: str
+    operation_id: str
+    version: int
+    resume_speed: float | None = None
 
 
 class RolloutStartBody(BaseModel):
@@ -574,20 +588,112 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.post("/api/record/start")
     async def record_start(body: RecordStartBody) -> dict[str, Any]:
-        return await _submit_logged(
-            "record_start",
-            "record requested — opening video session",
-            _recording_payload(body),
-            timeout=15.0,
-        )
+        if not body.dataset_id:
+            raise HTTPException(400, "choose a Dataset before recording")
+        if not body.task.strip():
+            raise HTTPException(400, "enter a task before recording")
+        if not math.isfinite(body.resume_speed) or not 0 <= body.resume_speed <= 720:
+            raise HTTPException(400, "resume speed must be between 0 and 720 degrees per second")
+        token = hub.loop.note_pending("record_start", "preparing selected dataset")
+        hub.loop.update_record_preparation(body.dataset_id, "Checking Dataset")
+        try:
+            def prepare() -> dict[str, Any]:
+                ensure_lerobot_on_path()
+                from lerobot.configs.video import RGBEncoderConfig
+                from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: F401 - validate availability
+
+                RGBEncoderConfig(vcodec="h264", preset="ultrafast", crf=22)
+                row = hub.resolve_dataset(body.dataset_id or "")
+                hub.dataset_registry.assert_not_transferring(body.dataset_id or "")
+                root = Path(str(row.get("path") or "")).expanduser().resolve()
+                if not root.is_dir():
+                    raise ValueError("selected Dataset has no local files; download it first")
+                if hub.loop.recording_mutation_lock.locked():
+                    raise ValueError("another dataset write is still active")
+                if hub_cache_repo_dir(root, str(row.get("repo_id") or "")) is None:
+                    recover_record_publish(root)
+                info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))
+                fps = int(info.get("fps") or 0)
+                snapshots = hub.cameras.snapshots()
+                selected_cameras = [cam for cam in snapshots if cam.get("enabled") and cam.get("show_main")]
+                cameras = {
+                    str(cam.get("label") or cam.get("name")): f"observation.images.{safe_cam_name(str(cam.get('label') or cam.get('name')))}"
+                    for cam in selected_cameras
+                }
+                camera_shapes = {
+                    str(cam.get("label") or cam.get("name")): [int(cam["height"]), int(cam["width"]), 3]
+                    for cam in selected_cameras
+                }
+                if len(cameras) != len(selected_cameras) or len(set(cameras.values())) != len(cameras):
+                    raise ValueError("Record cameras need unique labels and Dataset keys")
+                if fps <= 0 or fps > hub.config.control.fps:
+                    raise ValueError("Dataset FPS exceeds the robot control rate")
+                RecordDatasetSession.validate(root, cameras, fps, camera_shapes)
+                if hub_cache_repo_dir(root, str(row.get("repo_id") or "")) is not None:
+                    total = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+                    copied = 0
+                    hub.loop.update_record_preparation(body.dataset_id or "", "Copying Hub cache to writable Dataset", 0, total)
+                    destination = lerobot_home() / str(row.get("repo_id") or row.get("id") or "record")
+                    if destination.exists():
+                        destination = destination.parent / f"{destination.name}-record-{uuid.uuid4().hex[:8]}"
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
+                    def copy_with_progress(source: str, target: str) -> str:
+                        nonlocal copied
+                        result = shutil.copy2(source, target)
+                        copied += Path(source).stat().st_size
+                        hub.loop.update_record_preparation(
+                            body.dataset_id or "", "Copying Hub cache to writable Dataset", copied, total,
+                        )
+                        return result
+
+                    try:
+                        shutil.copytree(root, temporary, copy_function=copy_with_progress)
+                        temporary.rename(destination)
+                    except BaseException:
+                        shutil.rmtree(temporary, ignore_errors=True)
+                        raise
+                    row = hub.dataset_registry.save(body.dataset_id or "", {"path": str(destination)})
+                    root = destination
+                hub.loop.update_record_preparation(body.dataset_id or "", "Opening Dataset")
+                return {
+                    "dataset_id": str(row.get("id") or body.dataset_id),
+                    "dataset_repo_id": str(row.get("repo_id") or row.get("id") or body.dataset_id),
+                    "dataset_path": str(root),
+                    "dataset_fps": fps,
+                    "dataset_episodes": int(info.get("total_episodes") or 0),
+                    "camera_keys": cameras,
+                }
+
+            prepared = await asyncio.to_thread(prepare)
+            payload = body.model_dump(exclude_none=True)
+            payload.update(prepared)
+            payload["_start_generation"] = token
+            return await _submit("record_start", payload, timeout=15.0)
+        except (OSError, ValueError, DatasetHubError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        finally:
+            hub.loop.clear_pending(token)
 
     @router.post("/api/record/stop")
-    async def record_stop() -> dict[str, Any]:
-        return await _submit("record_stop")
+    async def record_stop(body: RecordControlBody) -> dict[str, Any]:
+        return await _submit("record_stop", body.model_dump())
 
     @router.post("/api/record/next")
-    async def record_next() -> dict[str, Any]:
-        return await _submit("record_next")
+    async def record_next(body: RecordControlBody) -> dict[str, Any]:
+        return await _submit("record_next", body.model_dump())
+
+    @router.post("/api/record/pause")
+    async def record_pause(body: RecordControlBody) -> dict[str, Any]:
+        return await _submit("record_pause", body.model_dump())
+
+    @router.post("/api/record/back")
+    async def record_back(body: RecordControlBody) -> dict[str, Any]:
+        return await _submit("record_back", body.model_dump())
+
+    @router.post("/api/record/retry")
+    async def record_retry(body: RecordControlBody) -> dict[str, Any]:
+        return await _submit("record_retry", body.model_dump())
 
     @router.post("/api/rollout/start")
     async def rollout_start(body: RolloutStartBody) -> dict[str, Any]:
@@ -890,6 +996,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.post("/api/datasets/download")
     async def download_dataset(body: DatasetDownloadBody) -> dict[str, Any]:
         async with library_mutation_lock:
+            if hub.loop.recording_mutation_lock.locked():
+                raise HTTPException(409, "cannot download a Dataset while recording is active")
             try:
                 return await asyncio.to_thread(
                     hub.dataset_registry.start_download,
@@ -940,6 +1048,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.post("/api/datasets/{dataset_id:path}/download")
     async def download_dataset_local(dataset_id: str) -> dict[str, Any]:
         async with library_mutation_lock:
+            if hub.loop.recording_mutation_lock.locked():
+                raise HTTPException(409, "cannot replace a Dataset while recording is active")
             try:
                 return await asyncio.to_thread(hub.dataset_registry.start_download, dataset_id=dataset_id)
             except FileNotFoundError as exc:
@@ -950,6 +1060,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.post("/api/datasets/{dataset_id:path}/upload")
     async def upload_dataset(dataset_id: str) -> dict[str, Any]:
         async with library_mutation_lock:
+            if hub.loop.recording_mutation_lock.locked():
+                raise HTTPException(409, "cannot upload a Dataset while recording is active")
             try:
                 return await asyncio.to_thread(hub.dataset_registry.start_upload, dataset_id)
             except FileNotFoundError as exc:
@@ -985,6 +1097,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 # Saving dataset details must never sync: an address edit is
                 # stored as-is and only the download action touches the Hub.
                 async with library_mutation_lock:
+                    if hub.loop.recording_mutation_lock.locked():
+                        raise HTTPException(409, "cannot edit a Dataset while recording is active")
                     source_payload = {
                         key: value
                         for key, value in payload.items()
@@ -1066,6 +1180,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 await asyncio.to_thread(hub.store.delete_library_override, "model", id)
             elif kind == "dataset":
                 async with library_mutation_lock:
+                    if hub.loop.recording_mutation_lock.locked():
+                        raise HTTPException(409, "cannot delete a Dataset while recording is active")
                     row = await asyncio.to_thread(hub.resolve_dataset, id)
                     await asyncio.to_thread(hub.dataset_registry.assert_not_transferring, id)
                     # Delete bytes first. A failed filesystem operation must not
@@ -1628,8 +1744,13 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     async def list_cameras() -> list[dict[str, Any]]:
         return hub.cameras.snapshots()
 
+    def require_record_camera_stable() -> None:
+        if hub.loop.mode == "record" or hub.loop.pending == "record_start" or hub.loop.recording_mutation_lock.locked():
+            raise HTTPException(409, "camera mapping and resolution are frozen while Record is active")
+
     @router.post("/api/cameras/rescan")
     async def rescan_cameras() -> list[dict[str, Any]]:
+        require_record_camera_stable()
         hub.cameras.sync_remote_cameras()
         return hub.cameras.rescan()
 
@@ -1655,6 +1776,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.post("/api/cameras/{name}/resolution")
     async def set_camera_resolution(name: str, body: CameraResolutionBody) -> dict[str, Any]:
+        require_record_camera_stable()
         try:
             return hub.cameras.set_resolution(name, body.width, body.height)
         except KeyError:
@@ -1664,6 +1786,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.post("/api/cameras/{name}/label")
     async def set_camera_label(name: str, body: CameraLabelBody) -> dict[str, Any]:
+        require_record_camera_stable()
         try:
             return hub.cameras.set_label(name, body.label)
         except KeyError:
@@ -1671,6 +1794,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.post("/api/cameras/{name}/flags")
     async def set_camera_flags(name: str, body: CameraFlagsBody) -> dict[str, Any]:
+        require_record_camera_stable()
         try:
             return hub.cameras.set_flags(
                 name,
@@ -1715,6 +1839,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.post("/api/hardware/apply")
     async def apply_hardware(body: HardwareApplyBody) -> dict[str, Any]:
+        require_record_camera_stable()
         name = body.name.strip()
         presets = hub.store.presets("hardware")
         preset = presets.get(name)
@@ -1757,6 +1882,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     @router.post("/api/cameras/{name}/stream")
     async def set_camera_stream(name: str, body: CameraStreamBody) -> dict[str, Any]:
+        require_record_camera_stable()
         try:
             return hub.cameras.set_stream(name, body.enable, body.port)
         except KeyError:

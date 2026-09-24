@@ -31,6 +31,7 @@ from .policy import (
     predict_action_chunk,
 )
 from .recording_worker import RecordingWorker
+from .record_dataset import RecordDatasetSession, RecordSample, recover_record_publish
 from .robot import FollowerArm
 from .store import JsonStore
 from .thread_priority import set_current_thread_priority
@@ -210,6 +211,25 @@ class ControlLoop:
         self.reset_time_s = config.recording.default_reset_time_s
         self.num_episodes = config.recording.default_num_episodes
         self._resetting = False
+        self.record_session: RecordDatasetSession | None = None
+        self.record_phase: str | None = None
+        self.record_paused = False
+        self.record_auto_next = False
+        self.record_attempt: str | None = None
+        self.record_pending_attempt: str | None = None
+        self.record_completed = 0
+        self.record_base_index = 0
+        self.record_elapsed = 0.0
+        self.record_phase_t0 = 0.0
+        self.record_version = 0
+        self.record_speed = 30.0
+        self.record_instant_fallback = False
+        self.record_aligning = False
+        self.record_fault: str | None = None
+        self.record_motion_t = 0.0
+        self.record_operations: set[str] = set()
+        self.record_preparation: dict[str, Any] | None = None
+        self._record_prepare_last_push = 0.0
         ui = store.ui() if store is not None else {}
         self.auto_record = bool(ui.get("auto_record"))
         self.selected_dataset_id: str | None = None
@@ -451,6 +471,8 @@ class ControlLoop:
 
     def _apply_estop(self) -> None:
         first = self.mode != "estop"
+        if self.mode == "record" and self.record_session is not None:
+            self._stop_record(preserve_current=True)
         self.mode = "estop"
         self._clear_debug_lease()
         self._clear_live_control()
@@ -709,7 +731,20 @@ class ControlLoop:
             if token is not None and token != self._start_generation:
                 return
             self.pending = None
+            self.record_preparation = None
         if self.on_snapshot is not None:
+            self.on_snapshot(self.snapshot())
+
+    def update_record_preparation(self, dataset_id: str, step: str, done: int = 0, total: int = 0) -> None:
+        self.record_preparation = {
+            "dataset_id": dataset_id,
+            "step": step,
+            "done": done,
+            "total": total,
+        }
+        now = time.perf_counter()
+        if self.on_snapshot is not None and (now - self._record_prepare_last_push >= 0.25 or done == total):
+            self._record_prepare_last_push = now
             self.on_snapshot(self.snapshot())
 
     def snapshot(self) -> dict[str, Any]:
@@ -755,34 +790,162 @@ class ControlLoop:
                 "effective_policy_fps": self.effective_policy_fps if self.loaded_policy is not None else None,
                 "task": self.rollout_task,
                 "message": self.last_error,
+                "record": self._record_snapshot(),
             },
             "logs": self.logs[-200:],
         }
+
+    def _record_snapshot(self) -> dict[str, Any] | None:
+        if self.pending == "record_start" and self.mode != "record" and self.record_preparation:
+            return {"phase": "preparing", **self.record_preparation}
+        session = self.record_session
+        if session is None:
+            return None
+        progress = session.progress()
+        now = time.perf_counter()
+        elapsed = self.record_elapsed
+        if self.mode == "record" and not self.record_paused:
+            elapsed += max(0.0, now - self.record_phase_t0)
+        phase = self.record_phase
+        if phase == "finalizing" and progress["status"] in {"completed", "error"}:
+            phase = progress["status"]
+            self.record_phase = phase
+        show_last = self.record_pending_attempt is not None or phase in {"finalizing", "completed", "error"}
+        episode_number = max(1, self.record_completed) if show_last else self.record_completed + 1
+        return {
+            "session_id": session.session_id,
+            "dataset_id": session.dataset_id,
+            "phase": phase,
+            "paused": self.record_paused,
+            "version": self.record_version,
+            "episode_index": self.record_base_index + episode_number - 1,
+            "episode_number": episode_number,
+            "completed": self.record_completed,
+            "target": self.num_episodes,
+            "elapsed_s": round(elapsed, 2),
+            "duration_s": self.episode_time_s if phase == "recording" else self.reset_time_s,
+            "auto_next": self.record_auto_next,
+            "instant_fallback": self.record_instant_fallback,
+            "pending": progress["queued"] - progress["saved"],
+            "saved": progress["saved"],
+            "save_status": progress["status"],
+            "error": self.record_fault or progress["error"],
+            "staging_path": progress.get("staging_path"),
+            "needs_rerecord": self.record_fault is not None,
+            "can_retry": progress.get("can_retry", False),
+            "can_back": bool(self.record_attempt or self.record_pending_attempt),
+        }
+
+    def _record_control(self, payload: dict[str, Any]) -> bool:
+        session = self.record_session
+        if session is None:
+            raise RuntimeError("not recording")
+        operation = str(payload.get("operation_id") or "")
+        if not operation or not payload.get("session_id") or payload.get("version") is None:
+            raise ValueError("record control requires session_id, operation_id and version")
+        if payload["session_id"] != session.session_id:
+            raise ValueError("record session has changed")
+        if operation in self.record_operations:
+            return False
+        if self.mode != "record":
+            raise RuntimeError("not recording")
+        if int(payload["version"]) != self.record_version:
+            raise ValueError("record state changed; refresh before retrying")
+        self.record_operations.add(operation)
+        if len(self.record_operations) > 128:
+            self.record_operations = {operation}
+        self.record_version += 1
+        return True
+
+    def _set_record_phase(self, phase: str, *, paused: bool = False) -> None:
+        self.record_phase = phase
+        self.record_fault = None
+        self.record_version += 1
+        self.record_paused = paused
+        self.record_elapsed = 0.0
+        self.record_phase_t0 = time.perf_counter()
+        self._reset_recording_deadlines(self.record_phase_t0)
+
+    def _set_record_resume_speed(self, payload: dict[str, Any]) -> None:
+        if payload.get("resume_speed") is None:
+            return
+        requested = float(payload["resume_speed"])
+        if not math.isfinite(requested) or requested < 0 or requested > 720:
+            raise ValueError("resume speed must be between 0 and 720 degrees per second")
+        self.record_instant_fallback = requested == 0.0
+        self.record_speed = 30.0 if self.record_instant_fallback else requested
+
+    def _start_record_episode(self) -> None:
+        if self.record_session is None:
+            raise RuntimeError("record session is missing")
+        if self.record_pending_attempt is not None:
+            self.record_session.accept(self.record_pending_attempt)
+            self.record_pending_attempt = None
+        self.record_attempt = self.record_session.new_attempt()
+        self.episode_index = self.record_base_index + self.record_completed
+        self._set_record_phase("recording")
+        self.record_aligning = True
+        self.record_motion_t = time.perf_counter()
+
+    def _finish_record_episode(self) -> None:
+        if self.record_session is None or self.record_attempt is None:
+            raise RuntimeError("no active episode")
+        if self.record_fault:
+            raise RuntimeError("this episode needs re-recording")
+        if not self.record_session.has_samples(self.record_attempt):
+            raise RuntimeError("wait for the first recorded frame before finishing this episode")
+        self.record_session.seal(self.record_attempt)
+        self.record_pending_attempt = self.record_attempt
+        self.record_attempt = None
+        self.record_completed += 1
+        if self.record_completed >= self.num_episodes:
+            self.record_session.accept(self.record_pending_attempt)
+            self.record_pending_attempt = None
+            self._stop_record()
+        else:
+            self._set_record_phase("resetting")
+
+    def _stop_record(self, *, preserve_current: bool = False) -> None:
+        if self.record_session is None:
+            return
+        if self.record_attempt is not None:
+            self.record_session.seal(self.record_attempt, discard=not preserve_current)
+            self.record_attempt = None
+        if self.record_pending_attempt is not None:
+            self.record_session.accept(self.record_pending_attempt)
+            self.record_pending_attempt = None
+        self.record_session.stop(retain_unpublished=preserve_current)
+        self.record_phase = "finalizing"
+        self.record_version += 1
+        self.record_paused = False
+        self.mode = "idle" if self.follower.connected else "offline"
+        if self.joints:
+            self.latched = dict(self.joints)
+        self._touch_bus()
+
+    def _pause_record_for_fault(self, message: str, now: float) -> None:
+        if not self.record_paused:
+            self.record_elapsed += max(0.0, now - self.record_phase_t0)
+        self.record_paused = True
+        self.record_fault = message
+        self.last_error = message
+        self.latched = dict(self.joints)
+        self.record_version += 1
 
     def _reply(self, cmd: Command, **kwargs: Any) -> None:
         if cmd.reply is not None:
             cmd.reply.put(kwargs)
 
     def _close_writer(self) -> Path | None:
+        if self.mode == "record" and self.record_session is not None:
+            self._stop_record()
+            return self.record_session.root
         if self.writer is None:
             return None
         writer = self.writer
         self.writer = None
         self.record_kind = None
         path = writer.close()
-        if path is not None and not getattr(writer, "deferred_encoding", False):
-            try:
-                library = VideoLibrary(path.parent)
-                before = library.get(writer.dataset_id)
-                indices = sorted(int(episode.get("index", 0)) for episode in before.get("episodes") or [])
-                if len(indices) > 1:
-                    keep = indices[0]
-                    library.trim_to_first_episode(writer.dataset_id)
-                    if self.store is not None:
-                        self.store.remap_episode_overrides("video", writer.dataset_id, {str(keep): 0})
-                        self.store.delete_episode_view("video", writer.dataset_id)
-            except Exception as exc:  # noqa: BLE001 - cleanup must not break recording stop
-                self.log("error", f"video trim failed: {exc}")
         self.log("info", f"dataset saved: {path}")
         return path
 
@@ -1436,8 +1599,8 @@ class ControlLoop:
                 self.log("info", "teleop stopped")
                 self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
             elif stopped == "record":
-                path = self._close_writer()
-                self.mode = "idle" if self.follower.connected else "offline"
+                path = self.record_session.root if self.record_session is not None else self._close_writer()
+                self._stop_record()
                 self._touch_bus()
                 self.log("info", "record stopped")
                 self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
@@ -1542,46 +1705,133 @@ class ControlLoop:
             self._require_leader_connected("start recording")
             if self._aborted(cmd, "record", start_token):
                 return
+            if self.record_session is not None and self.record_session.progress()["status"] not in {"completed", "error"}:
+                raise RuntimeError("previous dataset is still saving")
             self._close_writer()
             self.episode_time_s = float(p.get("episode_time_s") or self.config.recording.default_episode_time_s)
             self.reset_time_s = float(
                 p["reset_time_s"] if p.get("reset_time_s") is not None else self.config.recording.default_reset_time_s
             )
             self.num_episodes = int(p.get("num_episodes") or self.config.recording.default_num_episodes)
-            self._resetting = False
-            recorder = self._open_recorder("record", p)
+            if self.episode_time_s <= 0 or self.reset_time_s < 0 or self.num_episodes <= 0:
+                raise ValueError("episode and reset durations or count are invalid")
+            dataset_path = Path(str(p.get("dataset_path") or "")).expanduser().resolve()
+            dataset_id = str(p.get("dataset_id") or "").strip()
+            if not dataset_id or not (dataset_path / "meta" / "info.json").is_file():
+                raise ValueError("choose a writable Dataset before recording")
+            camera_keys = dict(p.get("camera_keys") or {})
+            dataset_fps = int(p.get("dataset_fps") or 0)
+            RecordDatasetSession.validate(dataset_path, camera_keys, dataset_fps)
+            if not self.recording_mutation_lock.acquire(blocking=False):
+                raise RuntimeError("dataset is busy")
+            try:
+                recover_record_publish(dataset_path)
+                recorder = RecordDatasetSession(
+                    dataset_path,
+                    dataset_id,
+                    str(p.get("dataset_repo_id") or dataset_id),
+                    str(p.get("task") or "").strip(),
+                    camera_keys,
+                    dataset_fps,
+                    int(p.get("encoder_threads") or self.config.recording.encoder_threads),
+                    bool(p.get("deferred_encoding", False)),
+                    self.recording_mutation_lock.release,
+                )
+            except BaseException:
+                self.recording_mutation_lock.release()
+                raise
             task_t0 = time.perf_counter()
             with self._start_lock:
                 cancelled = self._start_cancelled(start_token)
                 if not cancelled:
-                    self._publish_recorder(recorder, "record")
+                    self.record_session = recorder
+                    self.record_base_index = int(p.get("dataset_episodes") or 0)
+                    self.record_completed = 0
+                    self.record_pending_attempt = None
+                    self.record_attempt = None
+                    self.record_auto_next = bool(p.get("auto_next", False))
+                    requested_speed = float(p.get("resume_speed") or 0.0)
+                    self.record_instant_fallback = requested_speed == 0.0
+                    self.record_speed = 30.0 if self.record_instant_fallback else requested_speed
+                    self.record_version = 0
+                    self.record_operations.clear()
                     self.mode = "record"
                     self.task_t0 = task_t0
-                    self.episode_t0 = task_t0
+                    self._set_record_phase("resetting")
             if cancelled:
-                recorder.close()
+                recorder.stop()
                 self.pending = None
                 self.log("info", "record cancelled")
                 self._reply(cmd, ok=True, cancelled=True)
                 return
             self._touch_bus()
-            self.log("info", f"recording {self.writer.session_id} ep {self.episode_index}")
-            self._reply(cmd, ok=True, session_id=self.writer.session_id, dataset_id=self.selected_dataset_id)
+            self.log("info", f"record ready: {dataset_id}")
+            self._reply(cmd, ok=True, session_id=recorder.session_id, dataset_id=dataset_id)
         elif kind == "record_stop":
-            path = self._close_writer()
-            self.mode = "idle" if self.follower.connected else "offline"
-            self._touch_bus()
-            self._reply(cmd, ok=True, path=None if path is None else str(path))
+            if self._record_control(p):
+                self._stop_record()
+            self._reply(cmd, ok=True, record=self._record_snapshot())
         elif kind == "record_next":
-            if self.writer is None:
-                raise RuntimeError("not recording")
-            self.writer.finish_episode(self.episode_index)
-            self._resetting = False
-            self.episode_index += 1
-            self.episode_t0 = time.perf_counter()
-            self._reset_recording_deadlines(self.episode_t0)
-            self.log("info", f"episode {self.episode_index}")
-            self._reply(cmd, ok=True, episode_index=self.episode_index)
+            if self._record_control(p):
+                if self.record_phase == "resetting":
+                    self._set_record_resume_speed(p)
+                    self._start_record_episode()
+                elif self.record_phase == "recording":
+                    self._finish_record_episode()
+                else:
+                    raise RuntimeError("record cannot advance in this phase")
+            self._reply(cmd, ok=True, record=self._record_snapshot())
+        elif kind == "record_pause":
+            if self._record_control(p):
+                if self.record_phase not in {"recording", "resetting"}:
+                    raise RuntimeError("record cannot pause in this phase")
+                if self.record_fault:
+                    raise RuntimeError("this episode needs re-recording")
+                now = time.perf_counter()
+                if not self.record_paused:
+                    self.record_elapsed += max(0.0, now - self.record_phase_t0)
+                    self.record_paused = True
+                    if self.record_phase == "recording":
+                        self.latched = dict(self.joints)
+                else:
+                    self._set_record_resume_speed(p)
+                    self.record_phase_t0 = now
+                    self.record_paused = False
+                    self.record_aligning = True
+                    self.record_motion_t = now
+                    self._reset_recording_deadlines(now)
+            self._reply(cmd, ok=True, record=self._record_snapshot())
+        elif kind == "record_back":
+            if self._record_control(p):
+                if self.record_phase == "recording" and self.record_attempt and self.record_session:
+                    self.record_session.seal(self.record_attempt, discard=True)
+                    self.record_session.clear_capture_error()
+                    self.record_attempt = None
+                    self.last_error = None
+                    self._set_record_phase("resetting")
+                elif self.record_phase == "resetting" and self.record_pending_attempt and self.record_session:
+                    self.record_session.discard(self.record_pending_attempt)
+                    self.record_pending_attempt = None
+                    self.record_completed -= 1
+                    self._set_record_phase("resetting")
+                else:
+                    raise RuntimeError("no episode to re-record")
+            self._reply(cmd, ok=True, record=self._record_snapshot())
+        elif kind == "record_retry":
+            session = self.record_session
+            if session is None or session.session_id != p.get("session_id"):
+                raise RuntimeError("record session has changed")
+            if not p.get("operation_id"):
+                raise ValueError("record retry requires operation_id")
+            if p["operation_id"] in self.record_operations:
+                self._reply(cmd, ok=True, record=self._record_snapshot())
+                return
+            if int(p.get("version", -1)) != self.record_version:
+                raise ValueError("record state changed; refresh before retrying")
+            session.retry()
+            self.record_operations.add(str(p["operation_id"]))
+            self.record_version += 1
+            self._reply(cmd, ok=True, record=self._record_snapshot())
         elif kind == "rollout_start":
             self._require_no_debug_lease("start rollout")
             if self.mode in {"teleop", "record", "rollout"}:
@@ -1829,35 +2079,59 @@ class ControlLoop:
             self._maybe_record(self.record_kind or "teleop")
 
     def _tick_record(self) -> None:
-        self._tick_teleop()
-        now = time.perf_counter()
-        if getattr(self, "_resetting", False):
-            if now - self.episode_t0 >= getattr(self, "reset_time_s", 0.0):
-                self._resetting = False
-                self.episode_index += 1
-                self.episode_t0 = now
-                self._reset_recording_deadlines(now)
-                self.log("info", f"episode {self.episode_index}")
+        session = self.record_session
+        if session is None:
             return
-        self._maybe_record("record")
-        if now - self.episode_t0 >= self.episode_time_s:
-            finished = self.episode_index - self.recording_start_index + 1
-            if self.writer is not None:
-                self.writer.finish_episode(self.episode_index)
-            if finished >= self.num_episodes:
-                self.log("info", f"reached {self.num_episodes} episodes")
-                self._close_writer()
-                self.mode = "idle"
-                self._touch_bus()
-            elif getattr(self, "reset_time_s", 0.0) > 0:
-                self._resetting = True
-                self.episode_t0 = now
-                self.log("info", "reset")
-            else:
-                self.episode_index += 1
-                self.episode_t0 = now
-                self._reset_recording_deadlines(now)
-                self.log("info", f"episode {self.episode_index}")
+        progress = session.progress()
+        if progress["error"]:
+            if self.record_phase == "recording" and self.record_fault is None:
+                self._pause_record_for_fault(progress["error"], time.perf_counter())
+            return
+        now = time.perf_counter()
+        if self.record_phase == "recording" and self.record_paused:
+            if self.latched:
+                self.follower.send_pose(self.latched)
+            return
+        pose = self.leader.get_action_pose()
+        self.leader_joints = dict(pose)
+        if self.record_aligning:
+            delta_t = min(2.0 / max(1.0, self.config.control.fps), max(0.0, now - self.record_motion_t))
+            limited = _step_pose_toward(self.joints, pose, self.record_speed * delta_t)
+            self.record_aligning = any(abs(limited.get(j, 0.0) - pose.get(j, 0.0)) > 1e-5 for j in pose)
+            pose = limited
+        self.record_motion_t = now
+        self.follower.send_pose(pose)
+        self.action = dict(pose)
+        self.latched = dict(pose)
+        if self.record_phase == "resetting":
+            if self.record_auto_next and not self.record_paused and self.record_elapsed + now - self.record_phase_t0 >= self.reset_time_s:
+                self._start_record_episode()
+            return
+        if self.record_phase != "recording":
+            return
+        elapsed = self.record_elapsed + now - self.record_phase_t0
+        if now >= self._next_action_t and self.record_attempt is not None:
+            if session.camera_keys:
+                connected = {
+                    str(cam.get("label") or cam.get("name"))
+                    for cam in self.cameras.snapshots()
+                    if cam.get("enabled") and cam.get("show_main") and cam.get("connected")
+                }
+                if connected != set(session.camera_keys):
+                    self._pause_record_for_fault("record camera disconnected; re-record this episode", now)
+                    return
+            images = self.cameras.latest_main_jpeg_map() if session.camera_keys else {}
+            if session.camera_keys and set(images) != set(session.camera_keys):
+                self._pause_record_for_fault("record camera unavailable; re-record this episode", now)
+                return
+            try:
+                session.add_sample(RecordSample(self.record_attempt, dict(self.joints), dict(pose), images))
+            except RuntimeError as exc:
+                self._pause_record_for_fault(str(exc), now)
+                return
+            self._next_action_t = self._advance_deadline(self._next_action_t, 1.0 / session.fps, now)
+        if elapsed >= self.episode_time_s:
+            self._finish_record_episode()
 
     def _tick_rollout(self) -> None:
         if self._cancel.is_set() or self.loaded_policy is None:

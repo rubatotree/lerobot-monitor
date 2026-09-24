@@ -487,13 +487,12 @@ def test_rollout_aborts_when_follower_disconnects(tmp_path: Path) -> None:
     engine.stop.assert_called_once_with()
 
 
-@pytest.mark.parametrize("kind,payload", [("record_start", {}), ("teleop_start", {"auto_record": True})])
 def test_stop_during_recorder_open_discards_unpublished_writer(
     tmp_path: Path,
     monkeypatch,
-    kind: str,
-    payload: dict[str, object],
 ) -> None:
+    kind = "teleop_start"
+    payload = {"auto_record": True}
     loop = _loop(tmp_path)
     loop.leader.connected = True
     entered = threading.Event()
@@ -617,53 +616,103 @@ def test_recording_deadlines_do_not_drift_or_backfill_actions(tmp_path: Path, mo
 def test_record_reset_finishes_episode_and_does_not_record_reset_frames(tmp_path: Path, monkeypatch) -> None:
     loop = _loop(tmp_path)
     loop.mode = "record"
-    loop.writer = MagicMock()
-    loop.episode_index = 0
-    loop.episode_t0 = 0.0
+    session = MagicMock()
+    session.camera_keys = {}
+    session.fps = 5
+    session.progress.return_value = {"error": None}
+    loop.record_session = session
+    loop.record_phase = "recording"
+    loop.record_attempt = "attempt-0"
+    loop.record_phase_t0 = 0.0
     loop.episode_time_s = 1.0
     loop.reset_time_s = 0.5
     loop.num_episodes = 2
-    monkeypatch.setattr(loop, "_tick_teleop", MagicMock())
-    maybe_record = MagicMock()
-    monkeypatch.setattr(loop, "_maybe_record", maybe_record)
-    samples = iter((1.1, 1.3, 1.7))
-    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(samples))
+    loop.leader.get_action_pose.return_value = {joint: 0.0 for joint in JOINT_ORDER}
+    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: 1.1)
 
     loop._tick_record()
     loop._tick_record()
-    loop._tick_record()
 
-    loop.writer.finish_episode.assert_called_once_with(0)
-    assert maybe_record.call_count == 1
-    assert loop.episode_index == 1
-    assert loop._resetting is False
+    session.seal.assert_called_once_with("attempt-0")
+    assert session.add_sample.call_count == 1
+    assert loop.record_phase == "resetting"
+    assert loop.record_completed == 1
+    assert loop.record_pending_attempt == "attempt-0"
 
 
 def test_resumed_record_num_episodes_is_relative_to_start_index(tmp_path: Path, monkeypatch) -> None:
     loop = _loop(tmp_path)
-    writer = MagicMock()
-    loop.writer = writer
+    session = MagicMock()
+    session.new_attempt.return_value = "attempt-6"
+    loop.record_session = session
     loop.mode = "record"
-    loop.recording_start_index = 5
-    loop.episode_index = 5
-    loop.episode_t0 = 0.0
+    loop.record_phase = "recording"
+    loop.record_base_index = 5
+    loop.record_attempt = "attempt-5"
     loop.episode_time_s = 1.0
     loop.reset_time_s = 0.0
     loop.num_episodes = 2
-    monkeypatch.setattr(loop, "_tick_teleop", MagicMock())
-    monkeypatch.setattr(loop, "_maybe_record", MagicMock())
-    close_writer = MagicMock()
-    monkeypatch.setattr(loop, "_close_writer", close_writer)
-    samples = iter((1.1, 2.2, 2.2))
-    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(samples))
 
-    loop._tick_record()
+    loop._finish_record_episode()
+    loop._start_record_episode()
     assert loop.episode_index == 6
-    close_writer.assert_not_called()
-    loop._tick_record()
+    loop._finish_record_episode()
 
-    assert writer.finish_episode.call_args_list == [call(5), call(6)]
-    close_writer.assert_called_once()
+    assert session.seal.call_args_list == [call("attempt-5"), call("attempt-6")]
+    assert session.accept.call_args_list == [call("attempt-5"), call("attempt-6")]
+    session.stop.assert_called_once()
+    assert loop.record_completed == 2
+
+
+def test_record_controls_pause_rewind_and_stop_are_versioned(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    session = MagicMock()
+    session.session_id = "session-1"
+    session.dataset_id = "selected-dataset"
+    session.progress.return_value = {"status": "ready", "saved": 0, "queued": 0, "error": None}
+    session.new_attempt.side_effect = ["attempt-1", "attempt-2"]
+    loop.record_session = session
+    loop.mode = "record"
+    loop.record_phase = "resetting"
+    loop.num_episodes = 2
+    loop.joints = {joint: 0.0 for joint in JOINT_ORDER}
+
+    def control(action: str, operation: str, version: int) -> dict:
+        return _dispatch(loop, f"record_{action}", {
+            "session_id": "session-1", "operation_id": operation, "version": version,
+        })
+
+    started = control("next", "start", 0)
+    assert started["record"]["phase"] == "recording"
+    assert started["record"]["episode_number"] == 1
+    assert control("next", "start", 0)["record"]["episode_number"] == 1
+    paused = control("pause", "pause", started["record"]["version"])
+    assert paused["record"]["paused"] is True
+    session.add_sample.assert_not_called()
+    rewound = control("back", "back", paused["record"]["version"])
+    assert rewound["record"]["phase"] == "resetting"
+    session.seal.assert_called_once_with("attempt-1", discard=True)
+    restarted = control("next", "restart", rewound["record"]["version"])
+    assert restarted["record"]["episode_number"] == 1
+    stopped = control("stop", "stop", restarted["record"]["version"])
+    assert stopped["record"]["phase"] == "finalizing"
+    session.seal.assert_called_with("attempt-2", discard=True)
+    session.stop.assert_called_once()
+    assert loop.mode == "idle"
+    assert control("stop", "stop", restarted["record"]["version"])["record"]["phase"] == "finalizing"
+
+
+def test_estop_keeps_interrupted_record_attempt_out_of_dataset(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    session = MagicMock()
+    loop.record_session = session
+    loop.record_attempt = "interrupted"
+    loop.mode = "record"
+    loop._apply_estop()
+    session.seal.assert_called_once_with("interrupted", discard=False)
+    session.accept.assert_not_called()
+    session.stop.assert_called_once_with(retain_unpublished=True)
+    assert loop.mode == "estop"
 
 
 def test_rollout_policy_deadline_runs_at_policy_rate_without_drift(tmp_path: Path, monkeypatch) -> None:

@@ -42,6 +42,9 @@ let autoRecord = false;
 let capturing = false;
 let selectedVideoId = "";
 let selectedDatasetId = "";
+let liveRecord = null;
+let recordControlBusy = false;
+let lastRecordSaved = -1;
 let selectedModelId = "";
 const librarySelections = {
   model: "",
@@ -293,6 +296,7 @@ function syncStopButton(mode, pending) {
 
 function requestStop() {
   const mode = (last && last.mode) || "";
+  if (mode === "record" && liveRecord) return recordControl("stop");
   const pending = last && last.task && last.task.pending;
   if (stopRequested) {
     localLog("force stop requested", "error");
@@ -307,6 +311,100 @@ function requestStop() {
     localLog("stop requested");
   }
   return api("/api/task/stop").catch(toastError);
+}
+
+async function recordControl(action) {
+  if (recordControlBusy || !liveRecord) return;
+  const record = liveRecord;
+  const payload = {
+    session_id: record.session_id,
+    version: record.version,
+    operation_id: crypto.randomUUID(),
+    resume_speed: jointMaxSpeed,
+  };
+  recordControlBusy = true;
+  renderRecordTransport(record);
+  try {
+    const result = await api(`/api/record/${action}`, payload);
+    if (result.record) renderRecordTransport(result.record);
+  } catch (err) {
+    toastError(err);
+  } finally {
+    recordControlBusy = false;
+    renderRecordTransport(liveRecord);
+  }
+}
+
+function renderRecordTransport(incoming) {
+  if (!incoming && liveRecord?.phase === "preparing" && last?.task?.pending !== "record_start") liveRecord = null;
+  if (incoming && (incoming.phase === "preparing" || !liveRecord || incoming.session_id !== liveRecord.session_id || incoming.version >= liveRecord.version)) {
+    if (!liveRecord || incoming.session_id !== liveRecord.session_id) lastRecordSaved = -1;
+    liveRecord = incoming;
+  }
+  const record = liveRecord;
+  const panel = $("record-transport");
+  if (!panel) return;
+  const preparing = last?.task?.pending === "record_start" && (!record || record.phase === "preparing" || ["completed", "error"].includes(record.phase));
+  const frozen = preparing || !!record && ["resetting", "recording", "finalizing"].includes(record.phase);
+  $("record-panel")?.querySelectorAll("input, select").forEach((input) => { input.disabled = frozen; });
+  $("cam-rows")?.querySelectorAll("input, select, button").forEach((input) => { input.disabled = frozen; });
+  if ($("hw-enc-threads")) $("hw-enc-threads").disabled = frozen;
+  if ($("btn-hdr-scan")) $("btn-hdr-scan").disabled = frozen;
+  const visible = (!!record || preparing) && !replayActive && !["teleop", "rollout"].includes(last?.mode);
+  panel.classList.toggle("hidden", !visible);
+  if (preparing) {
+    const percent = record?.total > 0 ? Math.round(100 * record.done / record.total) : 0;
+    $("record-title").textContent = record?.dataset_id || "Selected Dataset";
+    $("record-phase").textContent = record?.step || "Preparing";
+    $("record-progress-fill").style.width = `${percent}%`;
+    panel.querySelector(".record-progress").setAttribute("aria-valuenow", String(percent));
+    $("record-save-status").textContent = record?.total > 0
+      ? `${Math.round(record.done / 1048576)} / ${Math.round(record.total / 1048576)} MiB copied`
+      : "Checking schema and local storage…";
+    $("record-time").textContent = "";
+    $("btn-record-view").classList.add("hidden");
+    $("btn-record-retry").classList.add("hidden");
+    panel.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+    return;
+  }
+  if (!record) return;
+  const active = ["resetting", "recording"].includes(record.phase);
+  $("record-title").textContent = `${record.dataset_id} · episode ${record.episode_number} / ${record.target}`;
+  const phaseNames = {
+    preparing: "Preparing dataset", resetting: "Reset · arrange the scene",
+    recording: record.paused ? "Paused · arm held" : "Recording",
+    finalizing: "Saving dataset", completed: "Dataset saved", error: "Save failed",
+  };
+  $("record-phase").textContent = phaseNames[record.phase] || record.phase;
+  const progress = record.phase === "recording" || (record.phase === "resetting" && record.auto_next)
+    ? Math.min(100, Math.max(0, 100 * Number(record.elapsed_s || 0) / Math.max(0.01, Number(record.duration_s || 0))))
+    : 0;
+  $("record-progress-fill").style.width = `${progress}%`;
+  const bar = panel.querySelector(".record-progress");
+  bar.setAttribute("aria-valuenow", String(Math.round(progress)));
+  $("record-time").textContent = `${fmtTime(record.elapsed_s)} / ${record.auto_next || record.phase === "recording" ? fmtTime(record.duration_s) : "manual"}`;
+  const pause = $("btn-record-pause");
+  pause.textContent = record.paused ? "Resume" : "Pause";
+  pause.setAttribute("aria-label", record.paused ? "Resume recording" : "Pause recording");
+  pause.disabled = !active || record.needs_rerecord || recordControlBusy;
+  $("btn-record-back").disabled = !active || !record.can_back || recordControlBusy;
+  const next = $("btn-record-next");
+  next.textContent = record.phase === "resetting" ? "Start episode" : "Finish episode";
+  next.disabled = !active || recordControlBusy || (record.phase === "recording" && (record.paused || record.needs_rerecord));
+  $("btn-record-stop").disabled = !active || recordControlBusy;
+  $("btn-record-stop").textContent = record.phase === "recording" ? "Stop · discard current" : "Stop · save completed";
+  $("btn-record-retry").classList.toggle("hidden", record.phase !== "error" || !record.can_retry);
+  $("btn-record-retry").disabled = recordControlBusy;
+  $("btn-record-view").classList.toggle("hidden", !(record.saved > 0 && ["completed", "error"].includes(record.phase)));
+  const saveStatus = $("record-save-status");
+  saveStatus.textContent = record.error
+    ? `${record.error}${record.staging_path ? ` · Staging: ${record.staging_path}` : ""}`
+    : `${record.completed} completed · ${record.pending} pending · ${record.saved} saved to Dataset${record.instant_fallback ? " · resume limited to 30°/s, gripper 30%/s" : ""}`;
+  saveStatus.classList.toggle("error", !!record.error);
+  if (lastRecordSaved !== record.saved && record.saved > 0) {
+    lastRecordSaved = record.saved;
+    refreshLibrarySection("datasets");
+  }
 }
 async function runAction(btnId, message, fn) {
   if (btnId === "btn-hdr-stop") {
@@ -2721,6 +2819,7 @@ function applyStatus(d) {
   updateTaskInfo();
 
   const task = d.task || {};
+  renderRecordTransport(task.record);
   $("st-elapsed").textContent = fmtTime(task.elapsed_s);
   if (replayActive) {
     $("st-episode").textContent = `replay  ep ${vizState.episode}`;
@@ -2970,7 +3069,7 @@ function parentPath(path) {
 function recordDatasetValue() {
   const repo = $("rec-repo") ? $("rec-repo").value.trim() : "";
   const row = datasetsCache.find((item) => (item.repo_id || item.id) === repo);
-  return row ? `dataset:${row.repo_id || row.id}` : "";
+  return row ? `dataset:${row.id}` : "";
 }
 
 function populateRecordDatasetSelect() {
@@ -2991,7 +3090,7 @@ function populateRecordDatasetSelect() {
     group.label = "Datasets";
     datasetsCache.forEach((row) => {
       const option = document.createElement("option");
-      option.value = `dataset:${row.repo_id || row.id}`;
+      option.value = `dataset:${row.id}`;
       option.textContent = libraryDisplayName("dataset", row);
       group.appendChild(option);
     });
@@ -3006,8 +3105,12 @@ function syncRecordDatasetSelection() {
   const value = select.value || "__new__";
   if (value.startsWith("dataset:")) {
     const id = value.slice("dataset:".length);
-    const row = datasetsCache.find((item) => String(item.repo_id || item.id) === id);
-    if ($("rec-repo")) $("rec-repo").value = id;
+    const row = datasetsCache.find((item) => String(item.id) === id);
+    if ($("rec-repo")) $("rec-repo").value = String((row && row.repo_id) || id);
+    if (row && Number(row.fps) > 0) {
+      $("rec-action-fps").value = String(row.fps);
+      $("rec-video-fps").value = String(row.fps);
+    }
     if ($("rec-root")) {
       $("rec-root").value = row && row.source !== "hub" && row.path
         ? parentPath(row.path)
@@ -3049,7 +3152,7 @@ async function createNewRecordDataset() {
       cameras,
     });
     await refreshLibrarySection("datasets");
-    const value = `dataset:${created.repo_id || created.id}`;
+    const value = `dataset:${created.id}`;
     populateRecordDatasetSelect();
     setSelectValue(select, value);
     select.dataset.previousValue = value;
@@ -3120,13 +3223,17 @@ function bindLibraryDropSelect(select) {
 
 function recordFields() {
   const actionFps = Number($("rec-action-fps").value) || 15;
-  const videoFps = Number($("rec-video-fps").value) || actionFps;
+  const videoFps = actionFps;
+  const selection = $("rec-dataset-select")?.value || "";
   return {
+    dataset_id: selection.startsWith("dataset:") ? selection.slice("dataset:".length) : "",
     task: $("rec-task").value,
     repo_id: $("rec-repo").value,
     episode_time_s: Number($("rec-ep").value) || 20,
     reset_time_s: Number($("rec-reset").value) || 0,
     num_episodes: Number($("rec-num").value) || 50,
+    auto_next: !!$("chk-rec-auto-next")?.checked,
+    resume_speed: jointMaxSpeed,
     action_fps: actionFps,
     video_fps: videoFps,
     fps: actionFps,
@@ -3146,6 +3253,17 @@ function updateRecordDestinationUi() {
   const target = $("record-destination");
   if (!target) return;
   const rec = recordFields();
+  const selected = datasetsCache.find((row) => row.id === rec.dataset_id);
+  if (selected) {
+    target.textContent = `Dataset: ${libraryDisplayName("dataset", selected)} · ${selected.path || "preparing local copy"}`;
+    target.classList.remove("required");
+    return;
+  }
+  if (!rec.dataset_id) {
+    target.textContent = "Choose a Dataset to record into";
+    target.classList.add("required");
+    return;
+  }
   const root = rec.root || (meta.recording && meta.recording.root) || meta.recording_root || "data/datasets";
   const separator = String(root).includes("\\") ? "\\" : "/";
   const join = (name) => `${String(root).replace(/[\\/]+$/, "")}${separator}${name}`;
@@ -3176,6 +3294,7 @@ function applyRecordFields(p) {
   if (p.episode_time_s != null) $("rec-ep").value = p.episode_time_s;
   if (p.reset_time_s != null) $("rec-reset").value = p.reset_time_s;
   if (p.num_episodes != null && $("rec-num")) $("rec-num").value = p.num_episodes;
+  if (p.auto_next != null && $("chk-rec-auto-next")) $("chk-rec-auto-next").checked = !!p.auto_next;
   const actionFps = p.action_fps ?? p.fps;
   const videoFps = p.video_fps ?? p.fps ?? actionFps;
   if (actionFps != null && $("rec-action-fps")) $("rec-action-fps").value = actionFps;
@@ -3187,7 +3306,7 @@ function applyRecordFields(p) {
   if (p.deferred_encoding != null && $("chk-rec-deferred-enc")) $("chk-rec-deferred-enc").checked = !!p.deferred_encoding;
   if (p.encoder_threads != null && $("hw-enc-threads")) $("hw-enc-threads").value = p.encoder_threads;
   populateRecordDatasetSelect();
-  setSelectValue($("rec-dataset-select"), recordDatasetValue());
+  setSelectValue($("rec-dataset-select"), p.dataset_id ? `dataset:${p.dataset_id}` : recordDatasetValue());
   syncRecordDatasetSelection();
   updateResumeTargetUi();
 }
@@ -3875,7 +3994,18 @@ bind("btn-arm-toggle", () => togglePortConnection("arm"));
 bind("btn-leader-toggle", () => togglePortConnection("leader"));
 bind("btn-hdr-arm-power", () => togglePortConnection("arm"));
 bind("btn-hdr-leader-power", () => togglePortConnection("leader"));
-bind("btn-rec-next", () => api("/api/record/next"));
+bind("btn-record-pause", () => recordControl("pause"));
+bind("btn-record-back", () => recordControl("back"));
+bind("btn-record-next", () => recordControl("next"));
+bind("btn-record-stop", () => recordControl("stop"));
+bind("btn-record-retry", () => recordControl("retry"));
+bind("btn-record-view", async () => {
+  if (!liveRecord) return;
+  await refreshLibrarySection("datasets");
+  $("lib-tab-datasets")?.click();
+  const row = datasetsCache.find((item) => item.id === liveRecord.dataset_id);
+  if (row) await selectHfDataset(row);
+});
 bind("btn-hdr-scan", () => runAction("btn-hdr-scan", "scan requested", async () => {
   await api("/api/scan");
   camResolutionGeneration += 1;
@@ -3906,24 +4036,12 @@ bind("btn-hdr-record", () => {
     return;
   }
   exitReplayForControl();
-  return runAction("btn-hdr-record", "record requested — writing video session", async () => {
+  return runAction("btn-hdr-record", "record requested — preparing Dataset", async () => {
     const fields = recordFields();
-    if (fields.resume) {
-      const targetExists = selectedVideoId && videosCache.some((row) => row.id === selectedVideoId);
-      if (!targetExists) {
-        updateResumeTargetUi();
-        throw new Error("Continue recording requires an explicit local video target. Browse a video and choose Use browsed video.");
-      }
-      delete fields.action_fps;
-      delete fields.video_fps;
-      delete fields.fps;
-      delete fields.format;
-    } else {
-      delete fields.video_id;
-      delete fields.dataset_id;
-    }
+    if (!fields.dataset_id) throw new Error("Choose a Dataset first");
+    if (!fields.task.trim()) throw new Error("Enter a task before recording");
     await api("/api/record/start", fields);
-    refreshLibrary();
+    await refreshLibrarySection("datasets");
   });
 });
 bind("btn-hdr-rollout", () => {
@@ -8393,7 +8511,20 @@ refreshPorts();
 setInterval(refreshPorts, 4000);
 
 document.addEventListener("keydown", (e) => {
-  if (["INPUT", "TEXTAREA"].includes(e.target.tagName)) return;
+  if (e.repeat || e.altKey || e.ctrlKey || e.metaKey) return;
+  if (["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(e.target.tagName) || e.target.isContentEditable) return;
+  if (document.querySelector(".library-modal:not(.hidden)")) return;
+  if (liveRecord && ["recording", "resetting"].includes(liveRecord.phase) && !replayActive) {
+    const action = e.key === " " ? "pause"
+      : e.key === "ArrowLeft" ? "back"
+      : e.key === "ArrowRight" ? "next"
+      : e.key === "Escape" ? "stop" : "";
+    if (action) {
+      e.preventDefault();
+      recordControl(action);
+      return;
+    }
+  }
   if (e.key === "Escape" && (replayActive || episodeSource)) {
     closeEpisodeSelection();
     e.preventDefault();

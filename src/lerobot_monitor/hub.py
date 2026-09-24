@@ -67,7 +67,6 @@ class RuntimeHub:
             self._snapshot = snapshot
 
     def start(self) -> None:
-        self._trim_video_library()
         self.cameras.start()
         self.loop.start()
         self._restore_active_hardware_preset()

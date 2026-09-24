@@ -1,6 +1,8 @@
 # Example settings. Copy to config.yaml and adjust for your own devices.
 # Cameras are probed locally (DirectShow / V4L). Enable a network stream in
 # the Cameras panel; only those streams appear on the main grid.
+# Set this when the Hugging Face cache lives outside its default location.
+# huggingface_home: D:/Cache/huggingface
 
 server:
   host: "127.0.0.1"
@@ -11,6 +13,8 @@ robot:
   type: so101_follower
   port: ""
   id: so101_follower
+  # Directory containing <id>.json; keep it if calibration predates a cache move.
+  # calibration_dir: D:/datasets/lerobot/calibration/robots/so_follower
   use_degrees: true
   auto_connect: false
   disable_torque_on_disconnect: true
@@ -24,6 +28,7 @@ leader:
   type: so101_leader
   port: ""
   id: so101_leader
+  # calibration_dir: D:/datasets/lerobot/calibration/teleoperators/so_leader
   use_degrees: true
   auto_connect: false
 

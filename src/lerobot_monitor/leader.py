@@ -34,6 +34,7 @@ class LeaderArm:
         cfg = SO101LeaderConfig(
             port=self.config.port,
             id=self.config.id,
+            calibration_dir=self.config.calibration_dir,
             use_degrees=self.config.use_degrees,
         )
         teleop = SO101Leader(cfg)

@@ -37,6 +37,7 @@ Windows 也可以运行 `.\run.ps1`。它优先读取本地 `config.yaml`，否�
 
 - `server.host` 默认是 `127.0.0.1`。显式改为 `0.0.0.0` 或使用 `--host` 会开放控制接口；应用本身没有认证。
 - `robot.port` 和 `leader.port` 初始为空。连接实体设备前，填入对应端口和校准 ID。
+- 缓存迁移后可设置 `huggingface_home`；若校准文件仍在旧目录，分别设置 `robot.calibration_dir` 和 `leader.calibration_dir` 为包含 `<id>.json` 的目录。
 - `recording.root`、`library.*_roots`、`robot_models.root` 可改为你自己的目录。
 - 运行数据默认放在 `data/`，不会提交到 Git。Hugging Face 凭据请使用其标准本机认证方式，不要写入配置文件。
 

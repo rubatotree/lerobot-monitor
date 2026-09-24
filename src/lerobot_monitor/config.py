@@ -23,6 +23,7 @@ class RobotConfig(BaseModel):
     auto_connect: bool = False
     disable_torque_on_disconnect: bool = True
     calibrate: bool = False
+    calibration_dir: Path | None = None
 
 
 class VirtualFollowerConfig(BaseModel):
@@ -40,6 +41,7 @@ class LeaderConfig(BaseModel):
     use_degrees: bool = True
     auto_connect: bool = False
     calibrate: bool = False
+    calibration_dir: Path | None = None
 
 
 class CamerasConfig(BaseModel):
@@ -114,6 +116,7 @@ class RolloutConfig(BaseModel):
 
 class MonitorConfig(BaseModel):
     store_path: Path = Path("data/monitor_store.json")
+    huggingface_home: Path | None = None
     server: ServerConfig = Field(default_factory=ServerConfig)
     robot: RobotConfig = Field(default_factory=RobotConfig)
     virtual_follower: VirtualFollowerConfig = Field(default_factory=VirtualFollowerConfig)

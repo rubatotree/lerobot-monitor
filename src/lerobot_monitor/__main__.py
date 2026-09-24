@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 from pathlib import Path
 
@@ -33,6 +34,9 @@ def main() -> None:
     ensure_lerobot_on_path()
     config_path = Path(args.config)
     config = MonitorConfig.load(config_path if config_path.is_file() else None)
+    if config.huggingface_home is not None:
+        # Hugging Face reads HF_HOME when its modules are first imported.
+        os.environ["HF_HOME"] = str(config.huggingface_home.expanduser())
     host = args.host or config.server.host
     port = args.port or config.server.port
 

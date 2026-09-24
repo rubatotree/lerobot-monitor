@@ -42,6 +42,7 @@ class FollowerArm:
         cfg = SO101FollowerConfig(
             port=self.config.port,
             id=self.config.id,
+            calibration_dir=self.config.calibration_dir,
             use_degrees=self.config.use_degrees,
             disable_torque_on_disconnect=self.config.disable_torque_on_disconnect,
             cameras={},

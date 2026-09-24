@@ -566,3 +566,9 @@
 - 补充公开 README、Apache-2.0 与第三方资源许可说明、Windows 启动脚本和 CI；确认构建产物包含静态资源及许可文件。
 - 验证：项目虚拟环境中 234 passed、9 skipped；Node 前端语法与模型/数据集删除行为脚本通过；离线构建和锁文件检查通过。
 - 剩余限制：实体机械臂和策略推理仍需额外安装兼容的 LeRobot、硬件 SDK 与模型依赖；公开服务接口无内建认证，默认仅监听本机。
+
+## 2026-09-24：Hugging Face 缓存迁移后的校准路径
+
+- 监控配置支持 `huggingface_home`，启动时在导入 Hugging Face 依赖前设置 `HF_HOME`。
+- 从臂与主臂支持独立的 `calibration_dir`，传给 LeRobot 配置，保留旧目录中的实体机械臂校准文件。
+- 本机 `config.yaml` 将缓存指向 `D:/Cache/huggingface`，校准仍指向 `D:/datasets/lerobot/calibration`；已验证从臂六个电机的校准成功载入。重启监控服务后需用实机确认读取恢复。

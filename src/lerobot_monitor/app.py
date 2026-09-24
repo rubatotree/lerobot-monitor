@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .cameras import RemoteMjpegCamera, supported_resolutions
 from .config import MonitorConfig
 from .dataset_hub import (
     DatasetHubError,
@@ -1625,6 +1626,17 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     async def rescan_cameras() -> list[dict[str, Any]]:
         hub.cameras.sync_remote_cameras()
         return hub.cameras.rescan()
+
+    @router.get("/api/cameras/{name}/resolutions")
+    async def camera_resolutions(name: str) -> list[dict[str, int]]:
+        try:
+            camera = hub.cameras.get(name)
+        except KeyError:
+            raise HTTPException(404, f"unknown camera '{name}'") from None
+        if isinstance(camera, RemoteMjpegCamera):
+            raise HTTPException(400, "Blender 相机的分辨率由 Blender 面板控制")
+        modes = await asyncio.to_thread(supported_resolutions, camera.index)
+        return [{"width": width, "height": height} for width, height in modes]
 
     @router.post("/api/cameras/{name}/focus")
     async def set_camera_focus(name: str, body: CameraFocusBody) -> dict[str, Any]:

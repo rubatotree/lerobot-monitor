@@ -2451,17 +2451,42 @@ function renderMainCameras(list) {
 }
 
 let camMenuKey = "";
+const camResolutionModes = new Map();
+const camResolutionPending = new Set();
+let camResolutionGeneration = 0;
+
+async function loadCamResolutions(name) {
+  if (camResolutionModes.has(name) || camResolutionPending.has(name)) return;
+  camResolutionPending.add(name);
+  const generation = camResolutionGeneration;
+  try {
+    const modes = await api(`/api/cameras/${encodeURIComponent(name)}/resolutions`, undefined, "GET");
+    if (generation === camResolutionGeneration) {
+      camResolutionModes.set(name, Array.isArray(modes) ? modes : []);
+    }
+  } catch (err) {
+    if (generation === camResolutionGeneration) {
+      camResolutionModes.set(name, []);
+      toastError(err);
+    }
+  } finally {
+    camResolutionPending.delete(name);
+    camMenuKey = "";
+    renderCamMenu(camMenu);
+  }
+}
 
 function renderCamMenu(list) {
   camMenu = list || [];
   const root = $("cam-rows");
   if (!root) return;
+  camMenu.filter((cam) => !cam.remote).forEach((cam) => loadCamResolutions(String(cam.name)));
   const key = camMenu.map((c) => `${c.name}:${c.label}:${c.enabled}:${c.show_main}:${c.feed_robot}:${c.streaming}:${c.width}x${c.height}:${c.port}:${c.connected}:${c.remote}:${c.url}:${c.error}`).join("|");
   if (key === camMenuKey) return;
-  camMenuKey = key;
   const ae = document.activeElement;
   const focused = ae && root.contains(ae) && ["INPUT", "TEXTAREA", "SELECT"].includes(ae.tagName);
   if (focused) return;
+  camMenuKey = key;
   if (mjpegObserver) {
     root.querySelectorAll("img[data-mjpeg-src]").forEach((img) => mjpegObserver.unobserve(mjpegObservedTarget(img)));
   }
@@ -2480,11 +2505,21 @@ function renderCamMenu(list) {
     const statusText = remote
       ? (cam.connected ? "Blender live" : "Blender offline")
       : (cam.streaming ? "stream on" : "local only");
+    const modes = camResolutionModes.get(name);
+    const selectedSize = `${cam.width}x${cam.height}`;
+    const sizeOptions = (modes || []).map((mode) => {
+      const size = `${mode.width}x${mode.height}`;
+      return `<option value="${size}" ${size === selectedSize ? "selected" : ""}>${mode.width} × ${mode.height}</option>`;
+    }).join("");
+    const sizePlaceholder = !modes ? "Reading camera modes…"
+      : modes.length ? "Select a supported resolution" : "Camera modes unavailable";
     const localControls = remote ? "" : `
-      <div class="pair">
-        <label>Width <input type="number" data-w="${name}" value="${cam.width}" min="16" step="1"/></label>
-        <label>Height <input type="number" data-h="${name}" value="${cam.height}" min="16" step="1"/></label>
-      </div>
+      <label>Width × Height
+        <select data-resolution="${name}" ${modes && modes.length ? "" : "disabled"}>
+          <option value="" ${!(modes || []).some((mode) => `${mode.width}x${mode.height}` === selectedSize) ? "selected" : ""}>${sizePlaceholder}</option>
+          ${sizeOptions}
+        </select>
+      </label>
       <label>Network port
         <input type="number" data-port="${name}" value="${cam.port}" min="1" max="65535"/>
       </label>
@@ -2497,7 +2532,7 @@ function renderCamMenu(list) {
       : `<p class="hw-status ${cam.streaming ? "on" : ""}">${cam.streaming ? `http://127.0.0.1:${cam.port}/video` : "network stream off"}</p>`;
     const actions = remote ? "" : `
       <div class="row-actions">
-        <button type="button" data-apply="${name}">Apply size</button>
+        <button type="button" data-apply="${name}" ${modes && modes.length ? "" : "disabled"}>Apply size</button>
         <button type="button" data-stream="${name}">${cam.streaming ? "Stop stream" : "Open network stream"}</button>
       </div>`;
     card.innerHTML = `
@@ -2523,8 +2558,9 @@ function renderCamMenu(list) {
 }
 
 async function applyCamSize(name) {
-  const width = Number(document.querySelector(`[data-w="${name}"]`).value);
-  const height = Number(document.querySelector(`[data-h="${name}"]`).value);
+  const selected = document.querySelector(`[data-resolution="${name}"]`).value;
+  if (!selected) return;
+  const [width, height] = selected.split("x").map(Number);
   await api(`/api/cameras/${encodeURIComponent(name)}/resolution`, { width, height });
 }
 
@@ -3833,6 +3869,9 @@ bind("btn-hdr-leader-power", () => togglePortConnection("leader"));
 bind("btn-rec-next", () => api("/api/record/next"));
 bind("btn-hdr-scan", () => runAction("btn-hdr-scan", "scan requested", async () => {
   await api("/api/scan");
+  camResolutionGeneration += 1;
+  camResolutionModes.clear();
+  camMenuKey = "";
   await refreshPorts();
   await refreshLibrary();
 }));

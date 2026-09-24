@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from lerobot_monitor import app as app_module
 from lerobot_monitor import dataset_hub, model_hub
 from lerobot_monitor.app import create_app
-from lerobot_monitor.cameras import RemoteMjpegCamera
+from lerobot_monitor.cameras import DeviceCamera, RemoteMjpegCamera
 from lerobot_monitor.config import (
     CamerasConfig,
     LibraryConfig,
@@ -202,6 +202,7 @@ def test_remote_blender_camera_controls_return_bad_request(
         hub.cameras.remote_streams[camera.name] = camera
 
         assert client.get("/lerobot/api/cameras").json()[0]["remote"] is True
+        assert client.get(f"/lerobot/api/cameras/{camera.name}/resolutions").status_code == 400
         assert client.post(
             f"/lerobot/api/cameras/{camera.name}/resolution",
             json={"width": 320, "height": 240},
@@ -214,6 +215,14 @@ def test_remote_blender_camera_controls_return_bad_request(
             f"/lerobot/api/cameras/{camera.name}/stream",
             json={"enable": True, "port": 5000},
         ).status_code == 400
+
+        local_camera = DeviceCamera(2, width=640, height=480, jpeg_quality=80, port=5002)
+        hub.cameras.streams[local_camera.name] = local_camera
+        monkeypatch.setattr(app_module, "supported_resolutions", lambda index: [(640, 480), (1920, 1080)])
+        assert client.get("/lerobot/api/cameras/2/resolutions").json() == [
+            {"width": 640, "height": 480},
+            {"width": 1920, "height": 1080},
+        ]
 
 
 def test_episode_edit_persists(tmp_path: Path, monkeypatch) -> None:

@@ -10,6 +10,7 @@ from lerobot_monitor.cameras import (
     RemoteMjpegCamera,
     extract_jpeg_frames,
     remote_camera_name,
+    supported_resolutions,
 )
 from lerobot_monitor.config import CamerasConfig
 
@@ -40,6 +41,50 @@ def test_extract_jpeg_frames_handles_multipart_noise() -> None:
 
 def test_remote_camera_name_is_url_safe() -> None:
     assert remote_camera_name("sim follower/1", "front camera") == "blender_sim_follower_1_front_camera"
+
+
+@pytest.mark.parametrize("prefix", ["[dshow @ abc]", "[in#0 @ abc]"])
+def test_windows_supported_resolutions_come_from_device_modes(
+    monkeypatch: pytest.MonkeyPatch, prefix: str
+) -> None:
+    devices = "\n".join(
+        [
+            f'{prefix} "Camera A" (none)',
+            f'{prefix}   Alternative name "camera-a-moniker"',
+            f'{prefix} "Camera B" (video)',
+            f'{prefix}   Alternative name "camera-b-moniker"',
+            f'{prefix} "Microphone" (audio)',
+            f'{prefix}   Alternative name "microphone-moniker"',
+        ]
+    )
+    options = "\n".join(
+        [
+            "[dshow @ abc] pixel_format=mjpeg min s=1280x720 fps=5 max s=1280x720 fps=30",
+            "[dshow @ abc] pixel_format=yuyv422 min s=640x480 fps=5 max s=640x480 fps=30",
+            "[dshow @ abc] pixel_format=mjpeg min s=1280x720 fps=5 max s=1280x720 fps=60",
+        ]
+    )
+    commands: list[list[str]] = []
+
+    def fake_output(command: list[str]) -> str:
+        commands.append(command)
+        return devices if "-list_devices" in command else options
+
+    monkeypatch.setattr("lerobot_monitor.cameras.sys.platform", "win32")
+    monkeypatch.setattr("lerobot_monitor.cameras.shutil.which", lambda _tool: "ffmpeg")
+    monkeypatch.setattr("lerobot_monitor.cameras._capture_tool_output", fake_output)
+
+    assert supported_resolutions(1) == [(640, 480), (1280, 720)]
+    assert commands[1][-1] == "video=camera-b-moniker"
+
+
+def test_linux_supported_resolutions_include_all_discrete_modes(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = "Size: Discrete 1920x1080\nSize: Discrete 640x480\nSize: Discrete 1920x1080"
+    monkeypatch.setattr("lerobot_monitor.cameras.sys.platform", "linux")
+    monkeypatch.setattr("lerobot_monitor.cameras.shutil.which", lambda _tool: "v4l2-ctl")
+    monkeypatch.setattr("lerobot_monitor.cameras._capture_tool_output", lambda _command: output)
+
+    assert supported_resolutions(2) == [(640, 480), (1920, 1080)]
 
 
 def test_remote_camera_decodes_frames_from_a_mjpeg_response(monkeypatch: pytest.MonkeyPatch) -> None:

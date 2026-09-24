@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import http.client
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -87,6 +89,57 @@ def detect_cameras(max_probe: int = 8) -> list[int]:
     finally:
         logger.setLogLevel(previous_level)
     return available
+
+
+def supported_resolutions(index: int) -> list[tuple[int, int]]:
+    """Read the capture modes advertised by a local camera, without probing guessed sizes."""
+    if sys.platform == "win32":
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            return []
+        devices = _capture_tool_output(
+            [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+        )
+        # FFmpeg and OpenCV's DirectShow backend both enumerate video filters in
+        # system order. Keep unavailable filters in the count so indices align.
+        names: list[str] = []
+        video_device = False
+        for line in devices.splitlines():
+            # FFmpeg 8 uses [in#0] here; earlier builds used [dshow @ ...].
+            device = re.search(r'^\[[^\]]+\]\s+"([^"]+)"\s+\(([^)]+)\)$', line)
+            alternative = re.search(r'^\[[^\]]+\]\s+Alternative name "([^"]+)"$', line)
+            if device:
+                video_device = device.group(2) in {"video", "none"}
+                if video_device:
+                    names.append(device.group(1))
+            elif alternative and video_device:
+                # The moniker is unique even when two cameras share a display name.
+                names[-1] = alternative.group(1)
+        if index < 0 or index >= len(names):
+            return []
+        output = _capture_tool_output(
+            [ffmpeg, "-hide_banner", "-list_options", "true", "-f", "dshow", "-i", f"video={names[index]}"]
+        )
+        modes = re.findall(r"\b(?:min|max) s=(\d+)x(\d+)\b", output)
+    elif sys.platform.startswith("linux"):
+        v4l2_ctl = shutil.which("v4l2-ctl")
+        if v4l2_ctl is None:
+            return []
+        output = _capture_tool_output([v4l2_ctl, "--list-formats-ext", "-d", f"/dev/video{index}"])
+        modes = re.findall(r"Size:\s+Discrete\s+(\d+)x(\d+)\b", output)
+    else:
+        return []
+    return sorted({(int(w), int(h)) for w, h in modes if int(w) > 0 and int(h) > 0})
+
+
+def _capture_tool_output(command: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, errors="replace", timeout=8, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout + result.stderr
 
 
 class DeviceCamera:

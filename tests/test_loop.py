@@ -159,6 +159,28 @@ def test_policy_loads_are_serialized_across_control_loops(tmp_path: Path, monkey
     assert all(job.result is not None for job in jobs)
 
 
+def test_rtc_changes_reuse_loaded_policy_but_model_changes_do_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = _loop(tmp_path)
+    loaded = SimpleNamespace(path="same", task="", policy=MagicMock())
+    load = MagicMock(return_value=loaded)
+    monkeypatch.setattr(loop_module, "load_policy", load)
+    first_extra = {"policy.n_action_steps": "8", "inference.type": "rtc", "inference.rtc.execution_horizon": "10"}
+    changed_rtc = {
+        "policy.n_action_steps": "8",
+        "inference.type": "rtc",
+        "--inference.rtc.execution_horizon": "15",
+        "inference.queue_threshold": "20",
+    }
+
+    assert loop._get_or_load_policy("same", "cuda", "task", first_extra) is loaded
+    assert loop._cached_policy("same", "cuda", changed_rtc) is loaded
+    assert loop._get_or_load_policy("same", "cuda", "task", changed_rtc) is loaded
+    load.assert_called_once()
+    assert loop._cached_policy("same", "cuda", {**changed_rtc, "policy.n_action_steps": "16"}) is None
+
+
 @pytest.mark.parametrize("kind", ["teleop_start", "record_start"])
 def test_task_start_requires_connected_leader_without_auto_connect(
     tmp_path: Path,

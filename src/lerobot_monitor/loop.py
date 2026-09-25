@@ -778,7 +778,11 @@ class ControlLoop:
             yield
 
     def _policy_key(self, path: str, device: str, extra: dict[str, str]) -> tuple[Any, ...]:
-        return (path, device, tuple(sorted(extra.items())))
+        # Inference settings configure each engine, not the model weights held in this cache.
+        model_extra = tuple(
+            sorted((key, value) for key, value in extra.items() if not key.removeprefix("--").startswith("inference."))
+        )
+        return (path, device, model_extra)
 
     def _get_or_load_policy(self, path: str, device: str, task: str, extra: dict[str, str]) -> LoadedPolicy:
         with _POLICY_LOAD_LOCK:

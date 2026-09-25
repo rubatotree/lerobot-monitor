@@ -248,6 +248,27 @@
             <label class="sr-only" for="replay-seek">Replay timeline</label>
             <input id="replay-seek" type="range" min="0" max="1000" value="0" step="1" aria-describedby="viz-t" disabled/>
             <output id="viz-t" for="replay-seek" aria-live="off">0.00s / 0.00s</output>
+            <div class="replay-speed-control">
+              <button type="button" id="replay-speed-toggle" class="ghost replay-speed-toggle" aria-label="Playback speed" aria-expanded="false" aria-controls="replay-speed-menu" aria-haspopup="dialog" disabled>
+                <span id="replay-speed-label">1×</span><span aria-hidden="true">▾</span>
+              </button>
+              <div id="replay-speed-menu" class="replay-speed-menu hidden" role="dialog" aria-label="Playback speed">
+                <button type="button" class="replay-speed-option" data-replay-speed="0.25">0.25×</button>
+                <button type="button" class="replay-speed-option" data-replay-speed="0.5">0.5×</button>
+                <button type="button" class="replay-speed-option" data-replay-speed="1">1×</button>
+                <button type="button" class="replay-speed-option" data-replay-speed="1.5">1.5×</button>
+                <button type="button" class="replay-speed-option" data-replay-speed="2">2×</button>
+                <button type="button" class="replay-speed-option" data-replay-speed="4">4×</button>
+                <button type="button" id="replay-speed-custom-toggle" class="replay-speed-option" aria-expanded="false" aria-controls="replay-speed-custom">Custom…</button>
+                <div id="replay-speed-custom" class="replay-speed-custom hidden">
+                  <label for="replay-speed">Speed (0× or higher)</label>
+                  <div class="replay-speed-entry">
+                    <input id="replay-speed" type="number" min="0" step="any" value="1" aria-label="Custom playback speed"/>
+                    <button type="button" id="replay-speed-apply">Apply</button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </header>
         <div id="viz-cams" class="viz-cams"></div>

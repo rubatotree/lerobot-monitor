@@ -1541,6 +1541,7 @@ main.episodes-closed {
   letter-spacing: 0;
   text-transform: none;
 }
+.replay-transport.hidden { display: none; }
 .sr-only {
   position: absolute;
   width: 1px;
@@ -1562,6 +1563,77 @@ main.episodes-closed {
 }
 #replay-seek:disabled { opacity: 0.4; cursor: not-allowed; }
 #replay-seek:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.replay-speed-control { position: relative; flex: 0 0 auto; }
+.replay-speed-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 62px;
+  height: 28px;
+  padding: 2px 7px;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.replay-speed-toggle:disabled { opacity: 0.4; cursor: not-allowed; }
+.replay-speed-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  right: 0;
+  width: 156px;
+  max-height: min(340px, calc(100vh - 120px));
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  box-shadow: 0 10px 28px rgb(0 0 0 / 0.45);
+}
+.replay-speed-menu.hidden,
+.replay-speed-custom.hidden { display: none; }
+.replay-speed-option {
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.replay-speed-option:hover,
+.replay-speed-option:focus-visible,
+.replay-speed-option[aria-pressed="true"] {
+  background: var(--surface-2);
+}
+.replay-speed-custom {
+  display: grid;
+  gap: 5px;
+  padding: 7px 4px 3px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+}
+.replay-speed-entry { display: flex; gap: 4px; }
+#replay-speed {
+  flex: 1 1 auto;
+  width: 0;
+  min-width: 0;
+  padding: 3px 5px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #090a12;
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.replay-speed-entry button { padding: 3px 6px; font: inherit; }
+#replay-speed:focus-visible,
+.replay-speed-toggle:focus-visible,
+.replay-speed-entry button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .replay-info .arm-toggle {
   margin-left: auto;
   flex-shrink: 0;
@@ -1570,6 +1642,7 @@ main.episodes-closed {
   margin-left: auto;
   flex-shrink: 0;
 }
+.replay-bar { position: relative; z-index: 5; }
 .replay-transport .icon-btn {
   display: inline-flex;
   align-items: center;
@@ -3164,9 +3237,7 @@ body.dragging-row { cursor: row-resize; user-select: none; }
 
 @media (max-width: 420px) and (pointer: coarse) {
   .replay-transport {
-    overflow-x: auto;
-    overscroll-behavior-x: contain;
-    scrollbar-width: thin;
+    overflow: visible;
   }
   #replay-seek { min-width: 40px; }
   #viz-t { min-width: 10ch; }

@@ -6469,6 +6469,7 @@ const vizState = {
   episodes: 0,
   duration: 0,
   elapsed: 0,
+  speed: 1,
   playing: false,
   clockBaseElapsed: 0,
   clockStartedAt: 0,
@@ -6523,6 +6524,9 @@ function syncReplayAvailability() {
   });
   const seek = $("replay-seek");
   if (seek) seek.disabled = !ready;
+  const speedToggle = $("replay-speed-toggle");
+  if (speedToggle) speedToggle.disabled = !ready || snapshotActive;
+  if (!ready || snapshotActive) closeReplaySpeedMenu();
   const exit = $("viz-exit");
   if (exit) exit.classList.toggle("hidden", !replayActive);
 }
@@ -6775,6 +6779,116 @@ function stopReplayClock() {
   vizState.clockFrame = null;
 }
 
+function syncReplaySpeedControls() {
+  const label = $("replay-speed-label");
+  if (label) label.textContent = `${vizState.speed}×`;
+  const toggle = $("replay-speed-toggle");
+  if (toggle) toggle.setAttribute("aria-label", `Playback speed ${vizState.speed}×`);
+  let presetSelected = false;
+  document.querySelectorAll("#replay-speed-menu [data-replay-speed]").forEach((option) => {
+    const selected = Number(option.dataset.replaySpeed) === vizState.speed;
+    option.setAttribute("aria-pressed", String(selected));
+    presetSelected ||= selected;
+  });
+  const customToggle = $("replay-speed-custom-toggle");
+  if (customToggle) customToggle.setAttribute("aria-pressed", String(!presetSelected));
+  const input = $("replay-speed");
+  if (input) input.value = String(vizState.speed);
+}
+
+function closeReplaySpeedMenu() {
+  const menu = $("replay-speed-menu");
+  if (menu) menu.classList.add("hidden");
+  const toggle = $("replay-speed-toggle");
+  if (toggle) toggle.setAttribute("aria-expanded", "false");
+  const custom = $("replay-speed-custom");
+  if (custom) custom.classList.add("hidden");
+  const customToggle = $("replay-speed-custom-toggle");
+  if (customToggle) customToggle.setAttribute("aria-expanded", "false");
+}
+
+function toggleReplaySpeedMenu() {
+  const menu = $("replay-speed-menu");
+  const toggle = $("replay-speed-toggle");
+  if (!menu || !toggle || toggle.disabled) return;
+  if (!menu.classList.contains("hidden")) {
+    closeReplaySpeedMenu();
+    return;
+  }
+  menu.classList.remove("hidden");
+  const stage = $("replay");
+  if (stage) {
+    const room = stage.getBoundingClientRect().bottom - toggle.getBoundingClientRect().bottom - 8;
+    menu.style.maxHeight = `${Math.max(96, room)}px`;
+  }
+  toggle.setAttribute("aria-expanded", "true");
+  const selected = menu.querySelector('[data-replay-speed][aria-pressed="true"]');
+  (selected || $("replay-speed-custom-toggle"))?.focus();
+}
+
+function applyCustomReplaySpeed() {
+  const input = $("replay-speed");
+  if (!input) return;
+  if (!input.value || !input.checkValidity()) {
+    input.reportValidity();
+    return;
+  }
+  if (setReplaySpeed(input.value)) {
+    closeReplaySpeedMenu();
+    $("replay-speed-toggle")?.focus();
+  }
+}
+
+function replayElapsedAt(now) {
+  return Math.min(
+    refreshReplayDuration(),
+    vizState.clockBaseElapsed + (now - vizState.clockStartedAt) * vizState.speed / 1000,
+  );
+}
+
+function setReplaySpeed(value) {
+  const speed = Number(value);
+  if (!Number.isFinite(speed) || speed < 0) {
+    syncReplaySpeedControls();
+    return false;
+  }
+  const now = performance.now();
+  if (vizState.playing) vizState.elapsed = replayElapsedAt(now);
+  vizState.clockBaseElapsed = vizState.elapsed;
+  vizState.clockStartedAt = now;
+  vizState.speed = speed;
+  vizVideos().forEach((video) => {
+    if (video.readyState >= 1 || speed === 0) setVideoPlaybackRate(video);
+  });
+  syncReplaySpeedControls();
+  if (vizState.playing) {
+    if (speed === 0) stopReplayClock();
+    else if (vizState.clockFrame == null) vizState.clockFrame = requestAnimationFrame(tickReplayClock);
+    syncReplayMedia(vizState.elapsed, true);
+    updateReplayBar(vizState.elapsed, refreshReplayDuration());
+  }
+  return true;
+}
+
+function setVideoPlaybackRate(video) {
+  const speed = vizState.speed;
+  if (speed === 0) {
+    video.pause();
+    return false;
+  }
+  if (video.dataset.unsupportedRate === String(speed)) return false;
+  try {
+    if (video.playbackRate !== speed) video.playbackRate = speed;
+    if (video.playbackRate !== speed) throw new Error("Playback rate was not applied");
+    delete video.dataset.unsupportedRate;
+    return true;
+  } catch {
+    video.dataset.unsupportedRate = String(speed);
+    video.pause();
+    return false;
+  }
+}
+
 function setCameraTimelineState(video, waiting) {
   const wrap = video.closest(".viz-cam");
   if (!wrap) return;
@@ -6796,10 +6910,11 @@ function syncVideoToElapsed(video, elapsed, shouldPlay) {
     return;
   }
   if (video.readyState < 1 || stream.duration <= 0) return;
+  const canPlay = setVideoPlaybackRate(video);
   const target = stream.start + Math.min(stream.duration, Math.max(0, localElapsed));
   if (Math.abs(video.currentTime - target) > 0.18) video.currentTime = target;
   const streamFinished = localElapsed >= stream.duration - 0.02;
-  if (shouldPlay && !streamFinished) video.play().catch(() => {});
+  if (shouldPlay && canPlay && !streamFinished) video.play().catch(() => {});
   else video.pause();
 }
 
@@ -6818,6 +6933,7 @@ function setReplayElapsed(elapsed) {
 }
 
 function tickReplayClock(now) {
+  vizState.clockFrame = null;
   if (
     !vizState.playing
     || !replayActive
@@ -6825,7 +6941,7 @@ function tickReplayClock(now) {
     || vizState.previewGeneration !== previewRequestGeneration
   ) return;
   const duration = refreshReplayDuration();
-  const elapsed = Math.min(duration, vizState.clockBaseElapsed + (now - vizState.clockStartedAt) / 1000);
+  const elapsed = replayElapsedAt(now);
   vizState.elapsed = elapsed;
   syncReplayMedia(elapsed, true);
   updateReplayBar(elapsed, duration);
@@ -6833,6 +6949,7 @@ function tickReplayClock(now) {
     pauseVizVideos();
     return;
   }
+  if (vizState.speed === 0) return;
   vizState.clockFrame = requestAnimationFrame(tickReplayClock);
 }
 
@@ -7116,16 +7233,13 @@ function playVizVideos() {
   vizState.clockStartedAt = performance.now();
   stopReplayClock();
   syncReplayMedia(vizState.elapsed, true);
-  vizState.clockFrame = requestAnimationFrame(tickReplayClock);
+  if (vizState.speed > 0) vizState.clockFrame = requestAnimationFrame(tickReplayClock);
   syncReplayPlayState();
 }
 
 function pauseVizVideos() {
   if (vizState.playing) {
-    vizState.elapsed = Math.min(
-      refreshReplayDuration(),
-      vizState.clockBaseElapsed + (performance.now() - vizState.clockStartedAt) / 1000,
-    );
+    vizState.elapsed = replayElapsedAt(performance.now());
   }
   vizState.playing = false;
   vizState.autoplay = false;
@@ -7440,7 +7554,7 @@ function pushArmReplayFrame() {
     || !vizState.previewReady
     || vizState.previewGeneration !== previewRequestGeneration
   ) return;
-  if (!vizState.playing) return;
+  if (!vizState.playing || vizState.speed === 0) return;
   const robot = (last && last.robot) || {};
   const displayMode = (last && last.display_mode) || "";
   const rawMode = (last && last.mode) || "";
@@ -7643,6 +7757,44 @@ if ($("viz-prev")) bind("viz-prev", () => stepPreview(-1));
 if ($("viz-next")) bind("viz-next", () => stepPreview(1));
 if ($("viz-play")) bind("viz-play", toggleVizPlay);
 if ($("viz-restart")) bind("viz-restart", () => seekViz(0));
+if ($("replay-speed-toggle")) bind("replay-speed-toggle", toggleReplaySpeedMenu);
+document.querySelectorAll("#replay-speed-menu [data-replay-speed]").forEach((option) => {
+  option.addEventListener("click", () => {
+    setReplaySpeed(option.dataset.replaySpeed);
+    closeReplaySpeedMenu();
+    $("replay-speed-toggle")?.focus();
+  });
+});
+if ($("replay-speed-custom-toggle")) bind("replay-speed-custom-toggle", () => {
+  $("replay-speed-custom")?.classList.remove("hidden");
+  $("replay-speed-custom-toggle").setAttribute("aria-expanded", "true");
+  $("replay-speed")?.focus();
+  $("replay-speed")?.select();
+});
+if ($("replay-speed-apply")) bind("replay-speed-apply", applyCustomReplaySpeed);
+if ($("replay-speed")) {
+  $("replay-speed").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      applyCustomReplaySpeed();
+    }
+  });
+}
+document.addEventListener("pointerdown", (event) => {
+  const menu = $("replay-speed-menu");
+  if (menu && !menu.classList.contains("hidden") && !event.target.closest(".replay-speed-control")) {
+    closeReplaySpeedMenu();
+  }
+});
+document.addEventListener("keydown", (event) => {
+  const menu = $("replay-speed-menu");
+  if (event.key !== "Escape" || !menu || menu.classList.contains("hidden")) return;
+  closeReplaySpeedMenu();
+  $("replay-speed-toggle")?.focus();
+  event.preventDefault();
+  event.stopImmediatePropagation();
+});
+syncReplaySpeedControls();
 if ($("viz-arm")) bind("viz-arm", toggleArmReplay);
 if ($("viz-exit")) bind("viz-exit", () => exitReplay());
 if ($("viz-ep")) {

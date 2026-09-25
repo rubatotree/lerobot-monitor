@@ -177,7 +177,7 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         transport_start = html.index(b'class="replay-transport"')
         transport_end = html.index(b"</div>", transport_start)
         replay_transport = html[transport_start:transport_end]
-        for control_id in (b"viz-play", b"viz-restart", b"replay-seek", b"viz-t"):
+        for control_id in (b"viz-play", b"viz-restart", b"replay-seek", b"viz-t", b"replay-speed-toggle"):
             assert b'id="' + control_id + b'"' in replay_transport
         assert b'id="viz-exit"' in html
         assert b'id="viz-exit"' not in replay_transport

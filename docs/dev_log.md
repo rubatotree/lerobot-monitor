@@ -1,5 +1,10 @@
 # Dev log
 
+## 2026-09-25：Replay 倍速播放
+
+- Video/Dataset replay 的进度条右侧新增倍速菜单：常用倍率直接选择，Custom 在菜单内展开数值输入（任意非负有限倍速）。0× 固定当前帧；浏览器不支持的极端媒体速率由统一时间轴驱动视频定位。切换倍速时先结算原速下的播放位置，再按新倍率继续；关节预览和动作控制继续按时间轴采样。
+- 验证：Node 语法检查、倍速切换的时间轴/视频速率行为检查，以及 `test_status_without_hardware` 通过。实体机械臂控制效果尚未实机验证。
+
 ## 2026-09-24（模型删除）
 
 - 已登记的 `rubatotree/classify-blocks-2-smolvla` 在 Library 的实际 ID 是 `rubatotree-classify-blocks-2-smolvla`。前端此前优先发送 `repo_id`，后端返回 404，日志只显示仓库名。

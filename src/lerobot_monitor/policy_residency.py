@@ -84,17 +84,22 @@ def policy_identity(
             pass
     effective: dict[str, str] = {}
     for key, value in values.items():
+        # Revision selects the source snapshot; it is not a field on the loaded policy config.
+        if key == "pretrained_revision":
+            continue
         obj: Any = config
         parts = key.split(".")
         for part in parts[:-1]:
             obj = obj.get(part) if isinstance(obj, dict) else None
-        if not isinstance(obj, dict) or parts[-1] not in obj:
-            continue
+        found = isinstance(obj, dict) and parts[-1] in obj
+        current = obj[parts[-1]] if found else None
         try:
-            normalized = _coerce_override(value, obj[parts[-1]])
+            normalized = _coerce_override(value, current)
         except (TypeError, ValueError):
             normalized = value
-        if normalized != obj[parts[-1]]:
+        # Older checkpoints may omit fields whose values equal dataclass defaults.
+        # Treat a missing leaf as effective and let load-time validation decide.
+        if not found or normalized != current:
             effective[key] = json.dumps(normalized, sort_keys=True, default=str)
     # A remote whose configuration has not yet been cached must retain explicit
     # policy overrides until load_policy can resolve its actual configuration.

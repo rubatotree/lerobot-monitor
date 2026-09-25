@@ -58,6 +58,32 @@ def test_runtime_overrides_and_path_alias_share_identity(tmp_path: Path) -> None
     assert changed != original
 
 
+def test_implicit_config_defaults_still_invalidate_policy_identity(tmp_path: Path) -> None:
+    path = tmp_path / "implicit-defaults"
+    path.mkdir()
+    (path / "config.json").write_text('{"type": "act", "fps": 30}', encoding="utf-8")
+
+    original = policy_identity(str(path), "cuda", {}, robot_type="so101_follower", rename_map={})
+    action_steps = policy_identity(
+        str(path),
+        "cuda",
+        {"policy.n_action_steps": "16"},
+        robot_type="so101_follower",
+        rename_map={},
+    )
+    ensemble = policy_identity(
+        str(path),
+        "cuda",
+        {"policy.temporal_ensemble_coeff": "0.01"},
+        robot_type="so101_follower",
+        rename_map={},
+    )
+
+    assert action_steps != original
+    assert ensemble != original
+    assert action_steps != ensemble
+
+
 def test_repo_id_and_resolved_snapshot_share_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     snapshot = _model(tmp_path / "snapshot")
     monkeypatch.setattr(

@@ -1,5 +1,11 @@
 # Dev log
 
+## 2026-09-25（ACT rollout 预测曲线与配置重载）
+
+- 根因一：ACT 启用 `temporal_ensemble_coeff` 后由 `ACTTemporalEnsembler` 直接输出融合动作，不再维护 `_action_queue`；monitor 的同步预测读取只支持队列，因此曲线始终为空。现改为直接读取 ensembler 中尚未消费的融合动作，不增加第二次 `predict_action_chunk` 推理。
+- 根因二：旧 checkpoint 的 `config.json` 若省略 `n_action_steps`、`temporal_ensemble_coeff` 等 dataclass 默认字段，模型身份计算会丢弃这些显式覆盖，导致既不复用正确配置也不触发重载。现把配置中不存在的覆盖项视为有效差异；覆盖应用后重新执行 `__post_init__`，保证 ACT 的两项耦合约束不会被热覆盖绕过。
+- 验证：ACT/策略/缓存/rollout 定向回归 `85 passed`；完整 monitor 回归 `296 passed, 1 skipped, 3 failed`。3 项失败均为 `D:\Cache\huggingface\lerobot` 写权限导致的既有数据集录制测试，与本次 ACT 推理和模型身份改动无关。
+
 ## 2026-09-25：GPU 模型常驻缓存
 
 - `RuntimeHub` 统一持有模型驻留管理器：相同实例合并冷加载，不同实例排队；Rollout、Debug Inference 和手动载入共用模型与处理器，任务结束仍保留缓存。使用租约覆盖推理和 RTC 停止收尾；加载中取消只取消任务启动，内存清理使迟到结果失效。

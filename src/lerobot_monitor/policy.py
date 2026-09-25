@@ -41,6 +41,8 @@ def _prefer_hub_cache() -> Iterator[None]:
 
 def _coerce_override(raw: str, current: Any) -> Any:
     text = str(raw).strip()
+    if text.lower() in {"none", "null"}:
+        return None
     if isinstance(current, bool):
         return text.lower() in {"1", "true", "yes", "on"}
     if isinstance(current, int) and not isinstance(current, bool):
@@ -91,6 +93,12 @@ def apply_policy_overrides(cfg: Any, extra: Mapping[str, str] | None) -> list[st
         except Exception:
             continue
         applied.append(key)
+    if applied:
+        # ACT couples n_action_steps and temporal_ensemble_coeff in __post_init__.
+        # Applying overrides after config construction must not bypass that validation.
+        validate = getattr(cfg, "__post_init__", None)
+        if callable(validate):
+            validate()
     return applied
 
 
@@ -375,6 +383,31 @@ def _policy_action_queue(policy: Any) -> deque | None:
     return None
 
 
+def temporal_ensemble_poses(
+    loaded: LoadedPolicy,
+    fallback_joints: Mapping[str, float],
+) -> list[dict[str, float]]:
+    """Project ACT's pending temporal-ensemble actions for the rollout chart.
+
+    ``ACT.select_action`` bypasses ``_action_queue`` when temporal ensembling is
+    enabled.  Its ensembler keeps the already-blended future actions, so reading
+    that tensor avoids a second ``predict_action_chunk`` call during rollout.
+    """
+    ensembler = getattr(loaded.policy, "temporal_ensembler", None)
+    actions = getattr(ensembler, "ensembled_actions", None)
+    if actions is None or getattr(actions, "ndim", None) != 3 or actions.shape[0] < 1:
+        return []
+
+    projected: list[dict[str, float]] = []
+    try:
+        for index in range(actions.shape[1]):
+            action = actions[:, index, :]
+            projected.append(_action_pose(loaded.postprocessor(action), loaded, fallback_joints))
+    except Exception as exc:  # noqa: BLE001 - chart telemetry must not affect control
+        logger.debug("could not project ACT temporal-ensemble actions: %s", exc)
+    return projected
+
+
 def sync_leftover_poses(
     loaded: LoadedPolicy,
     fallback_joints: Mapping[str, float],
@@ -403,8 +436,10 @@ def inference_leftover_poses(
     fallback_joints: Mapping[str, float],
 ) -> list[dict[str, float]]:
     """Return future actions from the active LeRobot engine, without extra inference."""
-    return rtc_leftover_poses(engine, loaded, fallback_joints) or sync_leftover_poses(
-        loaded, fallback_joints
+    return (
+        rtc_leftover_poses(engine, loaded, fallback_joints)
+        or temporal_ensemble_poses(loaded, fallback_joints)
+        or sync_leftover_poses(loaded, fallback_joints)
     )
 
 

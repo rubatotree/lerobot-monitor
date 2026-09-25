@@ -22,6 +22,7 @@ from lerobot_monitor.policy import (
     LoadedPolicy,
     create_monitor_inference_engine,
     inference_config_from_extra,
+    inference_leftover_poses,
     predict_action_chunk,
     resolve_cached_policy_path,
 )
@@ -219,6 +220,20 @@ def test_native_chunk_is_truncated_to_chunk_size(fake_lerobot) -> None:
     assert result.strategy == "policy_chunk"
     assert len(result.actions) == 3
     assert result.actions[2]["shoulder_pan"] == pytest.approx(12.0)
+
+
+def test_temporal_ensemble_actions_are_projected_without_extra_inference(fake_lerobot) -> None:
+    chunk = np.arange(1 * 3 * 6, dtype=np.float32).reshape(1, 3, 6)
+    policy = SimpleNamespace(
+        temporal_ensembler=SimpleNamespace(ensembled_actions=FakeTensor(chunk))
+    )
+    loaded = loaded_policy(policy)
+
+    result = inference_leftover_poses(SimpleNamespace(), loaded, observation_joints())
+
+    assert len(result) == 3
+    assert result[0]["shoulder_pan"] == pytest.approx(0.0)
+    assert result[2]["gripper"] == pytest.approx(17.0)
 
 
 def test_missing_native_chunk_degrades_to_sequential_select_action(fake_lerobot) -> None:

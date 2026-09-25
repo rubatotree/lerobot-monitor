@@ -95,6 +95,9 @@ const queued = {
 };
 const queuedContext = vm.createContext(queued);
 vm.runInContext(transitions, queuedContext);
+vm.runInContext(extract("function requestBackendPlaybackState(playing)", "function fillReplayChart("), queuedContext);
+vm.runInContext(extract("function requestBackendPlaybackSpeed(speed)", "function setVideoPlaybackRate("), queuedContext);
+vm.runInContext(extract("function requestBackendPlaybackSeek(elapsed)", "function seekReplayFraction("), queuedContext);
 
 async function checkQueuedPlayback() {
   const start = vm.runInContext("startBackendPlayback('command')", queuedContext);
@@ -107,6 +110,31 @@ async function checkQueuedPlayback() {
   assert.deepEqual(requests, ["/api/control/playback", "/api/control/playback/action"]);
   assert.equal(queued.playbackSession, null);
   process.stdout.write("Queued playback cancellation: passed\n");
+
+  queued.vizState.playing = false;
+  let releaseStart;
+  let startRequested;
+  const started = new Promise((resolve) => { startRequested = resolve; });
+  queued.api = async (route, payload) => {
+    requests.push({ route, payload });
+    if (route === "/api/control/playback") {
+      startRequested();
+      return new Promise((resolve) => { releaseStart = resolve; });
+    }
+    return { playback: { id: "session", version: 2 } };
+  };
+  const pending = vm.runInContext("startBackendPlayback('command')", queuedContext);
+  await started;
+  assert.equal(requests.at(-1).payload.playing, false);
+  vm.runInContext("requestBackendPlaybackState(true)", queuedContext);
+  vm.runInContext("requestBackendPlaybackSpeed(0.5)", queuedContext);
+  vm.runInContext("requestBackendPlaybackSeek(4)", queuedContext);
+  releaseStart({ playback: { id: "session", version: 1 } });
+  await pending;
+  assert.deepEqual(requests.slice(-3).map((item) => item.payload.operation), ["speed", "seek", "resume"]);
+  assert.equal(requests.at(-3).payload.speed, 0.5);
+  assert.equal(requests.at(-2).payload.elapsed_s, 4);
+  process.stdout.write("Transport changes during playback start: passed\n");
 }
 
 checkQueuedPlayback().catch((error) => { process.stderr.write(`${error.stack}\n`); process.exitCode = 1; });

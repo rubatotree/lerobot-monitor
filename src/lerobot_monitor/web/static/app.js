@@ -96,6 +96,7 @@ let playbackSession = null;
 let playbackRequest = Promise.resolve();
 let playbackTransition = Promise.resolve();
 let playbackIntent = 0;
+let playbackPendingIntent = null;
 let playbackStartStatusTs = 0;
 let playbackHeartbeat = 0;
 let playbackStoppingId = null;
@@ -7050,7 +7051,8 @@ function replayElapsedAt(now) {
 
 function setReplaySpeed(value) {
   const speed = Number(value);
-  if (!Number.isFinite(speed) || speed < 0) {
+  if (!Number.isFinite(speed) || speed < 0 || (speed > 0 && (speed < 0.1 || speed > 8))) {
+    toastError(new Error("Playback speed must be 0 (pause) or between 0.1× and 8×"));
     syncReplaySpeedControls();
     return false;
   }
@@ -7059,7 +7061,12 @@ function setReplaySpeed(value) {
   vizState.clockBaseElapsed = vizState.elapsed;
   vizState.clockStartedAt = now;
   vizState.speed = speed;
-  if (playbackSession && speed > 0) playbackOperation("speed", { speed }).catch(toastError);
+  if (speed > 0) {
+    requestBackendPlaybackSpeed(speed);
+  } else if (playbackPendingIntent || playbackSession) {
+    requestBackendPlaybackState(false);
+    pauseVizVideos();
+  }
   vizVideos().forEach((video) => {
     if (video.readyState >= 1 || speed === 0) setVideoPlaybackRate(video);
   });
@@ -7071,6 +7078,11 @@ function setReplaySpeed(value) {
     updateReplayBar(vizState.elapsed, refreshReplayDuration());
   }
   return true;
+}
+
+function requestBackendPlaybackSpeed(speed) {
+  if (playbackPendingIntent) playbackPendingIntent.desiredSpeed = speed;
+  else if (playbackSession) playbackOperation("speed", { speed }).catch(toastError);
 }
 
 function setVideoPlaybackRate(video) {
@@ -7158,7 +7170,12 @@ function tickReplayClock(now) {
 
 function seekViz(elapsed) {
   setReplayElapsed(elapsed);
-  if (playbackSession && !replaySeekId) playbackOperation("seek", { elapsed_s: vizState.elapsed }).catch(toastError);
+  if (!replaySeekId) requestBackendPlaybackSeek(vizState.elapsed);
+}
+
+function requestBackendPlaybackSeek(elapsed) {
+  if (playbackPendingIntent) playbackPendingIntent.desiredElapsed = elapsed;
+  else if (playbackSession) playbackOperation("seek", { elapsed_s: elapsed }).catch(toastError);
 }
 
 function seekReplayFraction(fraction) {
@@ -7179,7 +7196,7 @@ function finishReplayScrub(id, pointerId = null) {
   if (replayScrubPointerId !== pointerId) return;
   replaySeekId = null;
   replayScrubPointerId = null;
-  if (playbackSession) playbackOperation("seek", { elapsed_s: vizState.elapsed }).catch(toastError);
+  requestBackendPlaybackSeek(vizState.elapsed);
   const shouldResume = replayScrubWasPlaying
     && replayActive
     && vizState.elapsed < refreshReplayDuration() - 0.001;
@@ -7455,11 +7472,17 @@ function pauseVizVideos() {
 }
 
 function toggleVizPlay() {
-  if (playbackSession) {
-    playbackOperation(vizState.playing ? "pause" : "resume").catch(toastError);
-  }
+  requestBackendPlaybackState(!vizState.playing);
   if (!vizState.playing) playVizVideos();
   else pauseVizVideos();
+}
+
+function requestBackendPlaybackState(playing) {
+  if (playbackPendingIntent) {
+    playbackPendingIntent.desiredPlaying = playing;
+  } else if (playbackSession) {
+    playbackOperation(playing ? "resume" : "pause").catch(toastError);
+  }
 }
 
 function fillReplayChart(chart, times, series, prefix, overlay = [], overlayStart = 0) {
@@ -7655,6 +7678,7 @@ function queuePlaybackTransition(work) {
 
 function stopBackendPlayback() {
   playbackIntent += 1;
+  playbackPendingIntent = null;
   return queuePlaybackTransition(stopBackendPlaybackNow);
 }
 
@@ -7704,15 +7728,19 @@ async function playbackOperation(operation, values = {}) {
 
 function startBackendPlayback(source = "command") {
   const intent = ++playbackIntent;
-  const request = {
-    kind: vizState.kind, id: vizState.id, episode: vizState.episode,
-    source, interpolation: "linear", speed: Math.max(0.1, vizState.speed), playing: vizState.playing,
-    max_speed: jointMaxSpeed || 720,
+  playbackPendingIntent = {
+    intent, desiredPlaying: vizState.playing, desiredSpeed: vizState.speed, desiredElapsed: null,
   };
-  return queuePlaybackTransition(async () => {
+  const transition = queuePlaybackTransition(async () => {
     if (intent !== playbackIntent) return;
     if (playbackSession) await stopBackendPlaybackNow();
     if (intent !== playbackIntent) return;
+    const request = {
+      kind: vizState.kind, id: vizState.id, episode: vizState.episode,
+      source, interpolation: "linear", speed: Math.max(0.1, vizState.speed),
+      playing: playbackPendingIntent?.intent === intent ? playbackPendingIntent.desiredPlaying : vizState.playing,
+      max_speed: jointMaxSpeed || 720,
+    };
     const reply = await api("/api/control/playback", request);
     playbackSession = reply.playback;
     if (intent !== playbackIntent) return;
@@ -7723,6 +7751,23 @@ function startBackendPlayback(source = "command") {
     playbackHeartbeat = setInterval(() => {
       if (playbackSession) playbackOperation("heartbeat").catch(toastError);
     }, 1000);
+    const pending = playbackPendingIntent?.intent === intent ? playbackPendingIntent : null;
+    const desiredPlaying = pending?.desiredPlaying ?? request.playing;
+    const desiredSpeed = pending?.desiredSpeed ?? request.speed;
+    const desiredElapsed = pending?.desiredElapsed;
+    playbackPendingIntent = null;
+    if (desiredSpeed > 0 && desiredSpeed !== request.speed) {
+      await playbackOperation("speed", { speed: desiredSpeed });
+    }
+    if (desiredElapsed != null) {
+      await playbackOperation("seek", { elapsed_s: desiredElapsed });
+    }
+    if (desiredPlaying !== request.playing) {
+      await playbackOperation(desiredPlaying ? "resume" : "pause");
+    }
+  });
+  return transition.finally(() => {
+    if (playbackPendingIntent?.intent === intent) playbackPendingIntent = null;
   });
 }
 

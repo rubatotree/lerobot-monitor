@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import bisect
 import contextlib
+import json
 import logging
 import math
 import queue
@@ -17,6 +19,7 @@ from typing import Any, Callable, TextIO
 
 from .cameras import CameraHub
 from .config import MonitorConfig
+from .control_rates import RATE_MODES, CadenceStats, RateSetting
 from .hardware import apply_hardware_preset
 from .leader import LeaderArm
 from .library import DatasetRecorder, VideoLibrary
@@ -30,11 +33,14 @@ from .policy import (
     pose_from_action_tensor,
     predict_action_chunk,
 )
+from .policy_worker import PolicyWorker
 from .recording_worker import RecordingWorker
 from .record_dataset import RecordDatasetSession, RecordSample, recover_record_publish
 from .robot import FollowerArm
+from .run_diagnostics import RunDiagnostics
 from .store import JsonStore
 from .thread_priority import set_current_thread_priority
+from .trajectory import JointTrajectory
 from .types import JOINT_ORDER, RELAX_POSE, lerp_pose, merge_partial
 from .virtual_follower import VIRTUAL_PORT
 
@@ -228,6 +234,8 @@ class ControlLoop:
         self.record_aligning = False
         self.record_fault: str | None = None
         self.record_motion_t = 0.0
+        self._record_next_slot = 0
+        self._record_first_sample_t: float | None = None
         self.record_operations: set[str] = set()
         self.record_preparation: dict[str, Any] | None = None
         self._record_prepare_last_push = 0.0
@@ -243,13 +251,22 @@ class ControlLoop:
         self.loaded_policy: LoadedPolicy | None = None
         self.rollout_task = ""
         self.policy_fps = float(config.rollout.default_fps)
-        self.effective_policy_fps = min(self.policy_fps, float(config.control.fps))
+        self.effective_policy_fps = self.policy_fps
         self._policy_interval = 1.0 / max(1.0, self.effective_policy_fps)
         self._next_policy_t = 0.0
         # Latest rollout action-chunk preview for the charts (telemetry only).
         self._rollout_prediction: dict[str, Any] | None = None
         self._prediction_sequence = 0
         self._inference_engine: Any | None = None
+        self._inference_worker: PolicyWorker | None = None
+        self._active_policy_owner: LoadedPolicy | None = None
+        self._rollout_from: dict[str, float] | None = None
+        self._rollout_goal: dict[str, float] | None = None
+        self._rollout_segment_t = 0.0
+        self._rollout_infer_ms: float | None = None
+        self._rollout_waiting = False
+        self._rollout_last_action_t = 0.0
+        self._rollout_interpolation = True
         self._rollout_hw_feature_spec: dict = {}
         self._next_prediction_t = 0.0
         self._prediction_interval = 0.5
@@ -279,6 +296,195 @@ class ControlLoop:
         self._ui_log_handler: logging.Handler | None = None
         self._virtual_power_enabled = bool(config.virtual_follower.enabled)
         self._virtual_model_id = str(config.virtual_follower.model_id or "so101")
+        saved_rates = ui.get("control_rates") if isinstance(ui.get("control_rates"), dict) else {}
+        self.default_control_hz = float(saved_rates.get("default_hz", config.control.fps))
+        self.rate_settings = {
+            mode: RateSetting.parse((saved_rates.get("modes") or {}).get(mode)) for mode in RATE_MODES
+        }
+        self._task_rate_mode: str | None = None
+        self._task_rate: RateSetting | None = None
+        self.cadence = CadenceStats()
+        self._next_output_t = 0.0
+        self._next_read_t = 0.0
+        self._output_due = True
+        self._read_at = 0.0
+        self.playback: dict[str, Any] | None = None
+        self._trajectory: JointTrajectory | None = None
+        self._playback_last_t = 0.0
+        self._playback_last_index = -1
+        self._run_diag: RunDiagnostics | None = None
+        self._run_mode: str | None = None
+        self._trace_control = bool(saved_rates.get("trace", False))
+        self._next_cadence_check = 0.0
+        self._cadence_slow = False
+        self._last_send_t = 0.0
+        self._last_sent_command: dict[str, float] = {}
+        self._rate_save_jobs: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        self._rate_save_thread: threading.Thread | None = None
+
+    def _persist_rates(self) -> None:
+        if self.store is None:
+            return
+        while True:
+            try:
+                settings = self._rate_save_jobs.get(timeout=0.2)
+            except queue.Empty:
+                return
+            try:
+                current = self.store.ui()
+                current["control_rates"] = settings
+                self.store.save_ui(current)
+            except Exception as exc:  # noqa: BLE001 - persistence cannot stall robot output
+                self.log("error", f"control rate settings could not be saved: {exc}")
+
+    def _rate_mode(self) -> str:
+        return {"jogging": "joints", "idle": "joints"}.get(self.mode, self.mode) if self.mode in RATE_MODES or self.mode in {"jogging", "idle"} else "joints"
+
+    def _source_hz(self, mode: str) -> float | None:
+        if mode == "rollout":
+            return self.policy_fps
+        if mode == "playback" and self._trajectory is not None:
+            return self._trajectory.source_hz
+        return None
+
+    def _control_hz(self, mode: str | None = None) -> float:
+        selected = mode or self._rate_mode()
+        setting = self._task_rate if selected == self._task_rate_mode and self._task_rate is not None else self.rate_settings[selected]
+        return setting.resolve(self.default_control_hz, self._source_hz(selected))
+
+    def _task_setting(self, mode: str, payload: dict[str, Any], source_hz: float | None = None) -> RateSetting | None:
+        raw = payload.get("control_rate")
+        if raw is None:
+            return None
+        setting = RateSetting.parse(raw)
+        if setting.kind == "multiplier" and mode not in {"rollout", "playback"}:
+            raise ValueError("this task has no stable action source FPS")
+        setting.resolve(self.default_control_hz, source_hz)
+        return setting
+
+    def rates_snapshot(self) -> dict[str, Any]:
+        mode = self._rate_mode()
+        return {
+            "default_hz": self.default_control_hz,
+            "modes": {name: setting.as_dict() for name, setting in self.rate_settings.items()},
+            "mode": mode,
+            "source_hz": self._source_hz(mode),
+            "effective_hz": self._control_hz(mode),
+            "source": "task" if self._task_rate_mode == mode and self._task_rate is not None else "mode" if self.rate_settings[mode].kind != "inherit" else "global",
+            "policy_hz": self.policy_fps if self.mode == "rollout" else None,
+            "dataset_hz": self.record_session.fps if self.record_session is not None else None,
+            "video_hz": float(getattr(self.writer, "video_fps", 0) or 0) or (
+                float(self.record_session.fps) if self.mode == "record" and self.record_session is not None else None
+            ),
+            "trace": self._trace_control,
+        }
+
+    def _playback_snapshot(self) -> dict[str, Any] | None:
+        state = self.playback
+        trajectory = self._trajectory
+        if state is None or trajectory is None:
+            return None
+        elapsed = self._playback_elapsed(time.perf_counter())
+        return {
+            "id": state["id"],
+            "version": state["version"],
+            "kind": state["kind"],
+            "source_id": state["source_id"],
+            "episode": state["episode"],
+            "source": state["source"],
+            "interpolation": state["interpolation"],
+            "speed": state["speed"],
+            "elapsed_s": round(elapsed, 4),
+            "duration_s": trajectory.duration_s,
+            "source_hz": trajectory.source_hz,
+            "playing": state["playing"],
+            "aligning": state["aligning"],
+        }
+
+    def _playback_elapsed(self, now: float) -> float:
+        state = self.playback
+        if state is None or self._trajectory is None:
+            return 0.0
+        elapsed = state["elapsed_s"]
+        if state["playing"]:
+            elapsed += max(0.0, now - state["clock_t"]) * state["speed"]
+        return min(self._trajectory.duration_s, max(0.0, elapsed))
+
+    def _end_playback(self) -> None:
+        self.playback = None
+        self._trajectory = None
+        self._playback_last_index = -1
+        if self.mode == "playback":
+            self.mode = "idle" if self.follower.connected else "offline"
+        if self._task_rate_mode == "playback":
+            self._task_rate_mode = None
+            self._task_rate = None
+
+    def _send_pose(self, pose: dict[str, float], *, hold: bool = False, requested: dict[str, float] | None = None) -> bool:
+        if not self._output_due or self._estop.is_set():
+            return False
+        try:
+            sent = self.follower.send_pose(pose)
+        except Exception:
+            self.cadence.failed += 1
+            raise
+        self.cadence.sent_at(hold=hold)
+        self._last_send_t = time.perf_counter()
+        self._last_sent_command = dict(sent) if isinstance(sent, dict) else dict(pose)
+        if self._run_diag is not None:
+            self._run_diag.tick({
+                "source": self._run_mode or "",
+                "target_hz": self._control_hz(),
+                "hold": int(hold),
+                "requested": json.dumps(requested or pose, separators=(",", ":")),
+                "sent": json.dumps(self._last_sent_command, separators=(",", ":")),
+                "feedback": json.dumps(self.joints, separators=(",", ":")),
+                "source_elapsed_s": self._playback_elapsed(self._last_send_t) if self.mode == "playback" else None,
+                "state_read_t": self._read_at,
+            })
+        return True
+
+    def _sync_run_diagnostics(self) -> None:
+        mode = self.mode if self.mode in {"jogging", "teleop", "record", "rollout", "playback"} else None
+        if mode == self._run_mode:
+            return
+        if self._run_diag is not None:
+            self._run_diag.finish(
+                self.cadence.snapshot(self._run_diag.segments[-1]["target_hz"]), self.cadence.sent
+            )
+            self._run_diag = None
+        self._run_mode = mode
+        self._cadence_slow = False
+        if mode is None:
+            self._task_rate_mode = None
+            self._task_rate = None
+        if mode is not None:
+            self.cadence = CadenceStats()
+            run_settings = self.rates_snapshot()
+            run_settings["provenance"] = {
+                "dataset_id": self.selected_dataset_id if mode == "record" else None,
+                "model_path": self.loaded_policy.path if mode == "rollout" and self.loaded_policy is not None else None,
+                "playback": None if mode != "playback" else self._playback_snapshot(),
+            }
+            self._run_diag = RunDiagnostics(
+                self.config.store_path.parent / "runs", mode, run_settings, trace=self._trace_control
+            )
+            self._next_cadence_check = time.perf_counter() + 2.0
+
+    def _check_cadence(self, now: float) -> None:
+        if self._run_diag is None or now < self._next_cadence_check:
+            return
+        self._next_cadence_check = now + 1.0
+        if (self.mode == "playback" and self.playback is not None and not self.playback["playing"]) or (
+            self.mode == "record" and self.record_paused
+        ):
+            return
+        target = self._control_hz()
+        actual = self.cadence.snapshot(target, now)["actual_hz"]
+        slow = actual < 0.9 * target
+        if slow != self._cadence_slow:
+            self._cadence_slow = slow
+            self._note_control_event("cadence_slow" if slow else "cadence_recovered", now)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -474,6 +680,7 @@ class ControlLoop:
         first = self.mode != "estop"
         if self.mode == "record" and self.record_session is not None:
             self._stop_record(preserve_current=True)
+        self._end_playback()
         self.mode = "estop"
         self._clear_debug_lease()
         self._clear_live_control()
@@ -523,6 +730,7 @@ class ControlLoop:
             "teleop": "teleop",
             "record": "record",
             "rollout": "rollout",
+            "playback": "playback",
             "jogging": "jog",
             "idle": "hold" if self.hold_when_idle else "monitor",
             "offline": "free",
@@ -656,6 +864,8 @@ class ControlLoop:
         self.task_t0 = time.perf_counter()
         self.task_deadline = None if duration <= 0 else self.task_t0 + duration
         self.policy_fps, self.effective_policy_fps = self._policy_rates(payload)
+        self._rollout_interpolation = bool(payload.get("interpolation", True))
+        task_rate = self._task_setting("rollout", payload, self.policy_fps)
         self._policy_interval = 1.0 / self.effective_policy_fps
         self._next_policy_t = self.task_t0
         if payload.get("auto_record") is not None:
@@ -680,6 +890,8 @@ class ControlLoop:
                     self.episode_t0 = self.task_t0
                 self.pending = None
                 self.mode = "rollout"
+                self._task_rate_mode = "rollout" if task_rate is not None else None
+                self._task_rate = task_rate
         if cancelled:
             if recorder is not None:
                 recorder.close()
@@ -762,6 +974,16 @@ class ControlLoop:
             "live_control": self._live_control,
             "motion_locked": self.mode == "jogging" and not self._live_control,
             "fps": round(self.loop_fps, 1),
+            "rates": self.rates_snapshot(),
+            "cadence": self.cadence.snapshot(self._control_hz()),
+            "run_id": None if self._run_diag is None else self._run_diag.id,
+            "run_events": [] if self._run_diag is None else list(self._run_diag.events),
+            "run_log_dropped": 0 if self._run_diag is None else self._run_diag.dropped_trace,
+            "run_log_error": None if self._run_diag is None else self._run_diag.error,
+            "control_source": self.bus_owner(),
+            "playback": self._playback_snapshot(),
+            "rollout_inference_ms": self._rollout_infer_ms if self.mode == "rollout" else None,
+            "rollout_waiting": self._rollout_waiting if self.mode == "rollout" else False,
             "robot": self.follower.snapshot(),
             "leader": self.leader.snapshot(),
             "cameras": self.cameras.snapshots(),
@@ -884,6 +1106,8 @@ class ControlLoop:
             self.record_session.accept(self.record_pending_attempt)
             self.record_pending_attempt = None
         self.record_attempt = self.record_session.new_attempt()
+        self._record_next_slot = 0
+        self._record_first_sample_t = None
         self.episode_index = self.record_base_index + self.record_completed
         self._set_record_phase("recording")
         self.record_aligning = True
@@ -896,6 +1120,13 @@ class ControlLoop:
             raise RuntimeError("this episode needs re-recording")
         if not self.record_session.has_samples(self.record_attempt):
             raise RuntimeError("wait for the first recorded frame before finishing this episode")
+        elapsed = self.record_elapsed + (0.0 if self.record_paused else max(0.0, time.perf_counter() - self.record_phase_t0))
+        fps = self.record_session.fps
+        expected = max(
+            self._record_next_slot,
+            math.ceil(min(elapsed, self.episode_time_s) * fps - 1e-9) if isinstance(fps, (int, float)) else 0,
+        )
+        self.record_session.set_expected_slots(self.record_attempt, expected)
         self.record_session.seal(self.record_attempt)
         self.record_pending_attempt = self.record_attempt
         self.record_attempt = None
@@ -987,11 +1218,8 @@ class ControlLoop:
         )
         if action_fps <= 0 or video_fps <= 0:
             raise ValueError("action_fps and video_fps must be positive")
-        control_limit = max(1, int(self.config.control.fps))
-        if action_fps > control_limit:
-            raise ValueError(f"action_fps={action_fps} exceeds control loop capacity ({control_limit} fps)")
-        if video_fps > control_limit:
-            raise ValueError(f"video_fps={video_fps} exceeds camera sampling capacity ({control_limit} fps)")
+        if action_fps > 240 or video_fps > 240:
+            raise ValueError("recording rates must be at most 240 fps")
         return action_fps, video_fps
 
     def _policy_rates(self, payload: dict[str, Any]) -> tuple[float, float]:
@@ -1003,8 +1231,9 @@ class ControlLoop:
         )
         if not math.isfinite(requested) or requested <= 0:
             raise ValueError("policy_fps must be positive")
-        control_limit = max(1.0, float(self.config.control.fps))
-        return requested, min(requested, control_limit)
+        if requested > 240:
+            raise ValueError("policy_fps must be at most 240")
+        return requested, requested
 
     def _open_recorder(self, kind: str, payload: dict[str, Any] | None = None) -> DatasetRecorder:
         self.recording_mutation_lock.acquire()
@@ -1165,29 +1394,60 @@ class ControlLoop:
             and self.config.virtual_follower.auto_connect
         ):
             self._connect_virtual_follower()
-        period = 1.0 / max(1.0, self.config.control.fps)
         fps_n = 0
         fps_t = time.perf_counter()
+        self._next_output_t = fps_t
+        self._next_read_t = fps_t
+        next_snapshot_t = fps_t
         while not self._stop.is_set():
             t0 = time.perf_counter()
             if self._estop.is_set() and self.mode != "estop":
                 self._apply_estop()
             self._drain_commands()
             self._complete_rollout_load()
+            self._sync_run_diagnostics()
+            output_hz = self._control_hz()
+            self._output_due = time.perf_counter() >= self._next_output_t
+            read_hz = max(
+                30.0,
+                self.policy_fps if self.mode == "rollout" else 0.0,
+                float(self.record_session.fps) if self.mode == "record" and self.record_session else 0.0,
+                float(getattr(self.writer, "video_fps", 0) or 0),
+                float(getattr(self.writer, "action_fps", 0) or 0),
+            )
             self._tick()
-            fps_n += 1
             now = time.perf_counter()
+            if self._output_due:
+                missed = max(0, math.floor((now - self._next_output_t) * output_hz + 1e-9))
+                self.cadence.missed_slots += missed
+                if missed:
+                    self._note_control_event("missed_output_slots", now, {"count": missed})
+                self._next_output_t = self._advance_deadline(self._next_output_t, 1.0 / output_hz, now)
+            if now >= self._next_read_t:
+                self._next_read_t = self._advance_deadline(self._next_read_t, 1.0 / read_hz, now)
+            fps_n += 1
             if now - fps_t >= 1.0:
                 self.loop_fps = fps_n / (now - fps_t)
                 fps_n = 0
                 fps_t = now
-            if self.on_snapshot is not None:
+            self._check_cadence(now)
+            self._sync_run_diagnostics()
+            if self.on_snapshot is not None and now >= next_snapshot_t:
                 self.on_snapshot(self.snapshot())
-            _precise_sleep(max(0.0, period - (time.perf_counter() - t0)))
+                next_snapshot_t = now + 0.1
+            deadlines = [self._next_output_t, self._next_read_t]
+            if self.mode == "rollout":
+                deadlines.append(self._next_policy_t)
+            if self.mode == "record" and self.record_phase == "recording":
+                deadlines.append(self._next_action_t)
+            _precise_sleep(max(0.0, min(deadlines) - time.perf_counter()))
         if self.follower.connected and self.mode != "estop":
             self._park_relax_blocking()
         self.leader.disconnect()
         self.follower.disconnect()
+        if self._run_diag is not None:
+            self._run_diag.finish(self.cadence.snapshot(self._control_hz()), self.cadence.sent)
+            self._run_diag = None
 
     def _touch_bus(self) -> None:
         self._last_bus_use = time.perf_counter()
@@ -1289,7 +1549,7 @@ class ControlLoop:
             or self.pending is not None
         ):
             return False
-        return self.bus_owner() in {"hold", "monitor", "teleop", "record", "rollout", "jog"}
+        return self.bus_owner() in {"hold", "monitor", "teleop", "record", "rollout", "playback", "jog"}
 
     def _begin_relax_then_release(self, reason: str) -> None:
         if not self.follower.connected or self._pending_release:
@@ -1356,7 +1616,133 @@ class ControlLoop:
     def _handle(self, cmd: Command) -> None:
         kind = cmd.kind
         p = cmd.payload
-        if kind == "debug_lease_acquire":
+        if kind == "playback_start":
+            self._require_no_debug_lease("start playback")
+            self._require_follower_connected("start playback")
+            if self.mode not in {"idle", "playback"} or self.pending:
+                raise RuntimeError("stop the active task before playback")
+            trajectory = p.get("trajectory")
+            if not isinstance(trajectory, JointTrajectory):
+                raise ValueError("playback needs a complete joint trajectory")
+            interpolation = str(p.get("interpolation") or "linear")
+            trajectory.sample(0.0, interpolation)
+            task_rate = self._task_setting("playback", p, trajectory.source_hz)
+            speed = float(p.get("speed", 1.0))
+            if not math.isfinite(speed) or speed < 0.1 or speed > 8:
+                raise ValueError("playback speed must be between 0.1 and 8")
+            max_speed = float(p.get("max_speed", 180.0))
+            if not math.isfinite(max_speed) or max_speed <= 0 or max_speed > 720:
+                raise ValueError("playback speed cap must be between 0 and 720")
+            if self.playback is not None:
+                same_task = all((
+                    self.playback["kind"] == str(p["kind"]),
+                    self.playback["source_id"] == str(p["source_id"]),
+                    self.playback["episode"] == int(p["episode"]),
+                    self.playback["source"] == str(p.get("source") or "command"),
+                ))
+                if same_task:
+                    self._reply(cmd, ok=True, playback=self._playback_snapshot())
+                    return
+                if p.get("replace_id") != self.playback["id"]:
+                    raise ValueError("playback session has changed; stop the active session first")
+            self._end_playback()
+            now = time.perf_counter()
+            self._trajectory = trajectory
+            self.playback = {
+                "id": uuid.uuid4().hex, "version": 1,
+                "kind": str(p["kind"]), "source_id": str(p["source_id"]),
+                "episode": int(p["episode"]), "source": str(p.get("source") or "command"),
+                "interpolation": interpolation, "speed": speed, "max_speed": max_speed,
+                "elapsed_s": 0.0, "clock_t": now,
+                "playing": False, "aligning": True, "resume_after_align": bool(p.get("playing", True)),
+                "last_client_t": now,
+            }
+            self._playback_last_t = now
+            self.mode = "playback"
+            self._task_rate_mode = "playback" if task_rate is not None else None
+            self._task_rate = task_rate
+            self._next_output_t = now
+            self._reply(cmd, ok=True, playback=self._playback_snapshot())
+        elif kind == "playback_control":
+            state = self.playback
+            if state is None or p.get("id") != state["id"]:
+                raise ValueError("playback session has changed")
+            if int(p.get("version", -1)) != state["version"]:
+                raise ValueError("playback state changed; refresh before retrying")
+            operation = str(p.get("operation") or "")
+            now = time.perf_counter()
+            elapsed = self._playback_elapsed(now)
+            if operation == "stop":
+                self._end_playback()
+            elif operation in {"pause", "resume", "seek", "speed", "heartbeat"}:
+                if operation != "heartbeat":
+                    state["elapsed_s"] = elapsed
+                    state["clock_t"] = now
+                if operation == "pause":
+                    state["playing"] = False
+                    state["resume_after_align"] = False
+                elif operation == "resume":
+                    state["playing"] = not state["aligning"]
+                    state["resume_after_align"] = True
+                elif operation == "seek":
+                    target = float(p.get("elapsed_s", 0.0))
+                    if not math.isfinite(target):
+                        raise ValueError("seek time must be finite")
+                    state["resume_after_align"] = bool(state["playing"] or state["resume_after_align"])
+                    state["elapsed_s"] = min(self._trajectory.duration_s, max(0.0, target))
+                    state["playing"] = False
+                    state["aligning"] = True
+                elif operation == "speed":
+                    speed = float(p.get("speed", 1.0))
+                    if not math.isfinite(speed) or speed < 0.1 or speed > 8:
+                        raise ValueError("playback speed must be between 0.1 and 8")
+                    state["speed"] = speed
+                state["last_client_t"] = now
+                if operation != "heartbeat":
+                    state["version"] += 1
+            else:
+                raise ValueError("unknown playback operation")
+            self._reply(cmd, ok=True, playback=self._playback_snapshot())
+        elif kind == "control_rates":
+            selected = str(p.get("mode") or "")
+            if selected and selected not in RATE_MODES:
+                raise ValueError("unknown control rate mode")
+            default_hz = float(p.get("default_hz", self.default_control_hz))
+            RateSetting("hz", default_hz).resolve(default_hz)
+            new_settings = dict(self.rate_settings)
+            if selected:
+                setting = RateSetting.parse(p.get("setting"))
+                if setting.kind == "multiplier" and selected not in {"playback", "rollout"}:
+                    raise ValueError("this mode has no stable action source FPS")
+                if setting.kind != "multiplier" or self._source_hz(selected) is not None:
+                    setting.resolve(default_hz, self._source_hz(selected))
+                new_settings[selected] = setting
+            old_hz = self._control_hz()
+            self.default_control_hz = default_hz
+            self.rate_settings = new_settings
+            if p.get("trace") is not None:
+                self._trace_control = bool(p["trace"])
+                if self._run_diag is not None:
+                    self._run_diag.trace = self._trace_control
+            new_hz = self._control_hz()
+            if new_hz != old_hz:
+                self._next_output_t = time.perf_counter() + 1.0 / new_hz
+                if self._run_diag is not None:
+                    self._run_diag.change_rate(new_hz, self.cadence.sent)
+            if self.store is not None:
+                settings = {
+                    "default_hz": self.default_control_hz,
+                    "modes": {mode: setting.as_dict() for mode, setting in self.rate_settings.items()},
+                    "trace": self._trace_control,
+                }
+                if self._rate_save_jobs.full():
+                    self._rate_save_jobs.get_nowait()
+                self._rate_save_jobs.put_nowait(settings)
+                if self._rate_save_thread is None or not self._rate_save_thread.is_alive():
+                    self._rate_save_thread = threading.Thread(target=self._persist_rates, daemon=True, name="save-control-rates")
+                    self._rate_save_thread.start()
+            self._reply(cmd, ok=True, rates=self.rates_snapshot())
+        elif kind == "debug_lease_acquire":
             if self._debug_lease_token is not None:
                 self._reply(cmd, ok=False, error="model debug is already active")
             elif self.pending is not None or self.writer is not None:
@@ -1481,6 +1867,7 @@ class ControlLoop:
             self.pending = None
             self._close_writer()
             self._end_rollout()
+            self._end_playback()
             if role in {"arm", "all"}:
                 self._release_follower("force disconnect")
             if role in {"leader", "all"}:
@@ -1509,7 +1896,7 @@ class ControlLoop:
                 return
             self._require_follower_connected("adjust joints")
             self._pending_release = None
-            if self.mode in {"teleop", "record", "rollout"}:
+            if self.mode in {"teleop", "record", "rollout", "playback"}:
                 raise RuntimeError(f"cannot jog while {self.mode} is running")
             if source == "leader":
                 self._require_leader_connected("relay leader pose")
@@ -1543,7 +1930,7 @@ class ControlLoop:
                 self.latched = dict(target)
                 self.action = dict(target)
                 self.mode = "idle"
-                self.follower.send_pose(target)
+                self._send_pose(target)
                 self._touch_bus()
                 self._reply(cmd, ok=True, target=target, live=True, source=source)
                 return
@@ -1616,6 +2003,9 @@ class ControlLoop:
                 self._touch_bus()
                 self.log("info", "rollout stopped")
                 self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
+            elif stopped == "playback":
+                self._end_playback()
+                self._reply(cmd, ok=True, stopped=stopped)
             elif stopped == "jogging":
                 self._slew_goal = None
                 if self.joints:
@@ -1647,6 +2037,7 @@ class ControlLoop:
             self.log("info", "torque re-enabled, idle")
             self._reply(cmd, ok=True)
         elif kind == "teleop_start":
+            task_rate = self._task_setting("teleop", p)
             self._require_no_debug_lease("start teleop")
             start_token = self._start_token(p)
             if self.mode in {"teleop", "record", "rollout"}:
@@ -1670,6 +2061,8 @@ class ControlLoop:
                 cancelled = self._start_cancelled(start_token)
                 if not cancelled:
                     self.mode = "teleop"
+                    self._task_rate_mode = "teleop" if task_rate is not None else None
+                    self._task_rate = task_rate
                     self.task_t0 = task_t0
                     if recorder is not None:
                         self._publish_recorder(recorder, "teleop")
@@ -1694,9 +2087,10 @@ class ControlLoop:
                 self._touch_bus()
             self._reply(cmd, ok=True)
         elif kind == "record_start":
+            task_rate = self._task_setting("record", p)
             self._require_no_debug_lease("start recording")
             start_token = self._start_token(p)
-            if self.mode in {"teleop", "record", "rollout"}:
+            if self.mode in {"teleop", "record", "rollout", "playback"}:
                 raise RuntimeError(f"stop {self.mode} before starting record")
             self._clear_live_control()
             if self._aborted(cmd, "record", start_token):
@@ -1758,6 +2152,8 @@ class ControlLoop:
                     self.record_version = 0
                     self.record_operations.clear()
                     self.mode = "record"
+                    self._task_rate_mode = "record" if task_rate is not None else None
+                    self._task_rate = task_rate
                     self.task_t0 = task_t0
                     self._set_record_phase("resetting")
             if cancelled:
@@ -1836,7 +2232,7 @@ class ControlLoop:
             self._reply(cmd, ok=True, record=self._record_snapshot())
         elif kind == "rollout_start":
             self._require_no_debug_lease("start rollout")
-            if self.mode in {"teleop", "record", "rollout"}:
+            if self.mode in {"teleop", "record", "rollout", "playback"}:
                 raise RuntimeError(f"stop {self.mode} before starting rollout")
             self._clear_live_control()
             if self._aborted(cmd, "rollout"):
@@ -1933,7 +2329,7 @@ class ControlLoop:
             return
         if not self.leader.connected:
             self.leader_joints = {}
-        elif self.mode not in {"teleop", "record"}:
+        elif self.mode not in {"teleop", "record"} and time.perf_counter() >= self._next_read_t:
             try:
                 self.leader_joints = dict(self.leader.get_action_pose())
             except Exception as exc:  # noqa: BLE001
@@ -1943,19 +2339,22 @@ class ControlLoop:
                 with contextlib.suppress(Exception):
                     self.leader.disconnect()
         if not self.follower.connected:
-            if self.mode in {"jogging", "teleop", "record", "rollout"}:
+            if self.mode in {"jogging", "teleop", "record", "rollout", "playback"}:
                 self._abort_active_task("follower disconnected")
             elif self.mode not in {"offline", "estop"}:
                 self.mode = "offline"
             return
         try:
-            self.joints = self.follower.get_pose()
+            if not self.joints or time.perf_counter() >= self._next_read_t:
+                self.joints = self.follower.get_pose()
+                self._read_at = time.perf_counter()
+                self.cadence.read_at(self._read_at)
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
             self.log("error", f"read failed: {exc}")
             if self._pending_release:
                 self._release_follower(self._pending_release)
-            elif self.mode in {"jogging", "teleop", "record", "rollout"}:
+            elif self.mode in {"jogging", "teleop", "record", "rollout", "playback"}:
                 self._abort_active_task(f"read failed: {exc}")
             return
 
@@ -1968,9 +2367,11 @@ class ControlLoop:
                 self._tick_record()
             elif self.mode == "rollout":
                 self._tick_rollout()
+            elif self.mode == "playback":
+                self._tick_playback()
             elif self.mode == "idle":
                 if self._debug_lease_token is None and self.hold_when_idle and self.latched:
-                    self.follower.send_pose(self.latched)
+                    self._send_pose(self.latched, hold=True)
                     self.action = dict(self.latched)
                 self._maybe_record(self.record_kind or "capture")
         except Exception as exc:  # noqa: BLE001
@@ -1979,9 +2380,11 @@ class ControlLoop:
             self.log("error", f"{self.mode} tick failed: {exc}")
             if self.mode == "jogging" and self._pending_release:
                 self._release_follower(self._pending_release)
-            elif self.mode in {"rollout", "record", "teleop"}:
+            elif self.mode in {"rollout", "record", "teleop", "playback"}:
                 if self.mode == "rollout":
                     self._end_rollout()
+                elif self.mode == "playback":
+                    self._end_playback()
                 self._close_writer()
                 self.mode = "idle"
 
@@ -1992,6 +2395,7 @@ class ControlLoop:
         self.pending = None
         self._invalidate_policy_load()
         self._end_rollout()
+        self._end_playback()
         self.loaded_policy = None
         self._close_writer()
         self._slew_goal = None
@@ -2003,13 +2407,22 @@ class ControlLoop:
     def _force_abort_active_task(self) -> None:
         """Detach slow shutdown work so force stop can return immediately."""
         self._clear_live_control()
+        self._end_playback()
         self.pending = None
         self._invalidate_policy_load()
         engine = self._inference_engine
+        worker = self._inference_worker
+        owner = self._active_policy_owner
+        self._inference_worker = None
+        self._active_policy_owner = None
         self._inference_engine = None
         self._rollout_hw_feature_spec = {}
         self._clear_rollout_prediction()
-        if engine is not None:
+        if worker is not None:
+            worker.stop_async()
+            if owner is not None:
+                self._policy_cache = {key: cached for key, cached in self._policy_cache.items() if cached is not owner}
+        elif engine is not None:
             threading.Thread(
                 target=self._stop_inference_engine_safely,
                 args=(engine,),
@@ -2030,13 +2443,15 @@ class ControlLoop:
             pass
 
     def _tick_jog(self) -> None:
+        if not self._output_due:
+            return
         if self._live_control:
             self._tick_live_jog()
             return
         assert self._slew_start is not None and self._slew_goal is not None
         alpha = (time.perf_counter() - self._slew_t0) / max(self._slew_duration, 1e-3)
         pose = lerp_pose(self._slew_start, self._slew_goal, alpha)
-        self.follower.send_pose(pose)
+        self._send_pose(pose)
         self.action = dict(pose)
         self.latched = dict(pose)
         if alpha >= 1.0:
@@ -2056,13 +2471,13 @@ class ControlLoop:
             self.mode = "idle"
             return
         now = time.perf_counter()
-        dt = max(now - self._live_last_t, 1.0 / max(1.0, self.config.control.fps))
+        dt = max(now - self._live_last_t, 1.0 / self._control_hz())
         self._live_last_t = now
         current = self.action or self.joints
         if not current:
             current = self.follower.get_pose()
         pose = _step_pose_toward(current, target, self._live_max_speed * dt)
-        self.follower.send_pose(pose)
+        self._send_pose(pose)
         self.action = dict(pose)
         self.latched = dict(pose)
         if all(abs(float(pose[name]) - float(target[name])) <= 1e-6 for name in pose):
@@ -2072,9 +2487,12 @@ class ControlLoop:
             self._touch_bus()
 
     def _tick_teleop(self) -> None:
+        if not self._output_due:
+            self._maybe_record(self.record_kind or "teleop")
+            return
         pose = self.leader.get_action_pose()
         self.leader_joints = dict(pose)
-        self.follower.send_pose(pose)
+        self._send_pose(pose)
         self.action = dict(pose)
         self.latched = dict(pose)
         if self.mode == "teleop":
@@ -2092,19 +2510,22 @@ class ControlLoop:
         now = time.perf_counter()
         if self.record_phase == "recording" and self.record_paused:
             if self.latched:
-                self.follower.send_pose(self.latched)
+                self._send_pose(self.latched, hold=True)
             return
-        pose = self.leader.get_action_pose()
-        self.leader_joints = dict(pose)
-        if self.record_aligning:
-            delta_t = min(2.0 / max(1.0, self.config.control.fps), max(0.0, now - self.record_motion_t))
+        pose = self.leader.get_action_pose() if self._output_due else dict(self.action or self.latched)
+        if self._output_due:
+            self.leader_joints = dict(pose)
+        if self.record_aligning and self._output_due:
+            delta_t = min(2.0 / self._control_hz(), max(0.0, now - self.record_motion_t))
             limited = _step_pose_toward(self.joints, pose, self.record_speed * delta_t)
             self.record_aligning = any(abs(limited.get(j, 0.0) - pose.get(j, 0.0)) > 1e-5 for j in pose)
             pose = limited
-        self.record_motion_t = now
-        self.follower.send_pose(pose)
-        self.action = dict(pose)
-        self.latched = dict(pose)
+        if self._output_due:
+            self.record_motion_t = now
+        self._send_pose(pose)
+        if self._output_due:
+            self.action = dict(pose)
+            self.latched = dict(pose)
         if self.record_phase == "resetting":
             if self.record_auto_next and not self.record_paused and self.record_elapsed + now - self.record_phase_t0 >= self.reset_time_s:
                 self._start_record_episode()
@@ -2113,26 +2534,48 @@ class ControlLoop:
             return
         elapsed = self.record_elapsed + now - self.record_phase_t0
         if now >= self._next_action_t and self.record_attempt is not None:
-            if session.camera_keys:
-                connected = {
-                    str(cam.get("label") or cam.get("name"))
-                    for cam in self.cameras.snapshots()
-                    if cam.get("enabled") and cam.get("show_main") and cam.get("connected")
-                }
-                if connected != set(session.camera_keys):
-                    self._pause_record_for_fault("record camera disconnected; re-record this episode", now)
-                    return
-            images = self.cameras.latest_main_jpeg_map() if session.camera_keys else {}
-            if session.camera_keys and set(images) != set(session.camera_keys):
-                self._pause_record_for_fault("record camera unavailable; re-record this episode", now)
-                return
-            try:
-                session.add_sample(RecordSample(self.record_attempt, dict(self.joints), dict(pose), images))
-            except RuntimeError as exc:
-                self._pause_record_for_fault(str(exc), now)
-                return
+            missed = max(0, math.floor((now - self._next_action_t) * session.fps + 1e-9))
+            slot = self._record_next_slot + missed
+            for skipped_slot in range(self._record_next_slot, slot):
+                session.mark_missing(self.record_attempt, skipped_slot, "sampling_deadline_missed")
+            self._record_next_slot = slot + 1
             self._next_action_t = self._advance_deadline(self._next_action_t, 1.0 / session.fps, now)
-        if elapsed >= self.episode_time_s:
+            captures = self.cameras.latest_main_capture_map() if session.camera_keys else {}
+            images = {name: capture[0] for name, capture in captures.items()}
+            if session.camera_keys and set(images) != set(session.camera_keys):
+                session.mark_missing(self.record_attempt, slot, "camera_frame_unavailable")
+                self._note_control_event("record_sample_missing_camera", now, {"slot": slot})
+            else:
+                camera_ids = {name: capture[1] for name, capture in captures.items()}
+                camera_received = {
+                    name: self.record_elapsed + capture[2] - self.record_phase_t0
+                    for name, capture in captures.items()
+                    if capture[2] is not None
+                }
+                sample = RecordSample(
+                    self.record_attempt, dict(self.joints), dict(self.action or pose), images,
+                    slot_index=slot,
+                    capture_elapsed_s=0.0 if self._record_first_sample_t is None else elapsed,
+                    state_elapsed_s=0.0 if self._record_first_sample_t is None else max(0.0, self.record_elapsed + self._read_at - self.record_phase_t0),
+                    command_elapsed_s=0.0 if self._record_first_sample_t is None else max(0.0, self.record_elapsed + self._last_send_t - self.record_phase_t0),
+                    camera_frame_ids=camera_ids,
+                    camera_received_elapsed_s=camera_received,
+                )
+                try:
+                    session.add_sample(sample)
+                    if self._record_first_sample_t is None:
+                        self._record_first_sample_t = now
+                        self.record_phase_t0 = now
+                        self.record_elapsed = 0.0
+                        elapsed = 0.0
+                except RuntimeError as exc:
+                    if "cannot keep up" in str(exc):
+                        session.mark_missing(self.record_attempt, slot, "capture_queue_overflow")
+                        self._note_control_event("record_sample_dropped", now, {"slot": slot})
+                    else:
+                        self._pause_record_for_fault(str(exc), now)
+                        return
+        if self._record_first_sample_t is not None and elapsed >= self.episode_time_s:
             self._finish_record_episode()
 
     def _tick_rollout(self) -> None:
@@ -2149,36 +2592,121 @@ class ControlLoop:
             self.mode = "idle"
             self.latched = dict(self.joints)
             return
-        if now < self._next_policy_t:
-            self._maybe_record("rollout")
-            return
-        self._next_policy_t = self._advance_deadline(self._next_policy_t, self._policy_interval, now)
         engine = self._inference_engine
         if engine is None:
             raise RuntimeError("rollout inference engine is not running")
         if engine.failed:
             raise RuntimeError(engine.failure_traceback or "rollout inference engine failed")
-
-        observation = dict(self.joints or {})
-        observation.update(self.cameras.latest_rgb_map())
-        engine.notify_observation(observation)
-        obs_frame = self._build_rollout_obs_frame(observation)
-        action = engine.get_action(obs_frame)
-        if action is None:
-            self._maybe_record("rollout")
-            return
-        pose = pose_from_action_tensor(self.loaded_policy, action, self.joints)
-        if self._cancel.is_set() or self._estop.is_set() or self.mode != "rollout":
-            return
-        self.follower.send_pose(pose)
-        self.action = dict(pose)
-        self.latched = dict(pose)
+        action = None
+        worker = self._inference_worker
+        if worker is not None:
+            result = worker.latest()
+            if result is not None:
+                self._rollout_infer_ms, action, error, queued = result
+                if error:
+                    raise RuntimeError(f"policy inference failed: {error}")
+                if queued and now >= self._next_prediction_t:
+                    self._record_rollout_prediction(queued)
+                    self._next_prediction_t = now + self._prediction_interval
+        if now >= self._next_policy_t:
+            self._next_policy_t = self._advance_deadline(self._next_policy_t, self._policy_interval, now)
+            observation = dict(self.joints or {})
+            observation.update(self.cameras.latest_rgb_map())
+            engine.notify_observation(observation)
+            obs_frame = self._build_rollout_obs_frame(observation)
+            if worker is None:
+                started = time.perf_counter()
+                action = engine.get_action(obs_frame)
+                self._rollout_infer_ms = (time.perf_counter() - started) * 1000.0
+            elif not worker.submit(obs_frame, dict(self.joints)):
+                self._note_control_event("policy_request_skipped", now)
+        if action is not None:
+            pose = pose_from_action_tensor(self.loaded_policy, action, self.joints)
+            self._rollout_from = dict(self.action or self.joints or pose)
+            self._rollout_goal = dict(pose)
+            self._rollout_segment_t = now
+            self._rollout_last_action_t = now
+            if self._rollout_waiting:
+                self._note_control_event("policy_resumed", now)
+            self._rollout_waiting = False
+            self.cadence.source_updates += 1
+        elif not self._rollout_waiting and (
+            self._rollout_goal is None or now - self._rollout_last_action_t > 1.5 * self._policy_interval
+        ):
+            self._rollout_waiting = True
+            self._note_control_event("policy_waiting", now)
+        if self._output_due and self._rollout_goal is not None:
+            if self._rollout_interpolation and self._control_hz() > self.policy_fps and self._rollout_from is not None:
+                alpha = min(1.0, max(0.0, (now - self._rollout_segment_t) / self._policy_interval))
+                pose = {
+                    name: float(self._rollout_from.get(name, goal))
+                    + alpha * (float(goal) - float(self._rollout_from.get(name, goal)))
+                    for name, goal in self._rollout_goal.items()
+                }
+            else:
+                pose = dict(self._rollout_goal)
+            self._send_pose(pose, hold=self._rollout_waiting)
+            self.action = dict(pose)
+            self.latched = dict(pose)
+        elif self._output_due:
+            hold_pose = self.action or self.latched or self.joints
+            if hold_pose:
+                self._send_pose(dict(hold_pose), hold=True)
         self._maybe_record("rollout")
-        if now >= self._next_prediction_t:
+        if worker is None and now >= self._next_prediction_t:
             queued = inference_leftover_poses(engine, self.loaded_policy, self.joints)
             if queued:
                 self._record_rollout_prediction(queued)
             self._next_prediction_t = now + self._prediction_interval
+
+    def _tick_playback(self) -> None:
+        state = self.playback
+        trajectory = self._trajectory
+        if state is None or trajectory is None:
+            self._end_playback()
+            return
+        now = time.perf_counter()
+        if now - state["last_client_t"] > 3.0 and (state["playing"] or state["resume_after_align"]):
+            state["elapsed_s"] = self._playback_elapsed(now)
+            state["playing"] = False
+            state["resume_after_align"] = False
+            state["version"] += 1
+            self.log("info", "playback paused after browser disconnected")
+        if not self._output_due:
+            return
+        dt = max(0.0, now - self._playback_last_t)
+        self._playback_last_t = now
+        elapsed = self._playback_elapsed(now)
+        target = trajectory.sample(elapsed, state["interpolation"])
+        current = self.action or self.joints
+        full_target = merge_partial(current, target)
+        speed_cap = float(state.get("max_speed", 180.0))
+        limited = _step_pose_toward(current, full_target, speed_cap * dt)
+        if state["aligning"]:
+            if all(abs(limited[name] - full_target[name]) <= 1e-5 for name in limited):
+                state["aligning"] = False
+                state["clock_t"] = now
+                state["playing"] = state["resume_after_align"]
+        if limited != full_target:
+            self._note_control_event("speed_limited", now)
+        self._send_pose(limited, hold=not state["playing"], requested=full_target)
+        self.action = dict(limited)
+        self.latched = dict(limited)
+        source_index = bisect.bisect_right(trajectory.times, elapsed) - 1
+        if source_index != self._playback_last_index:
+            self._playback_last_index = source_index
+            self.cadence.source_updates += 1
+        if state["playing"] and elapsed >= trajectory.duration_s:
+            state["playing"] = False
+            state["elapsed_s"] = trajectory.duration_s
+            state["version"] += 1
+
+    def _note_control_event(self, name: str, when: float, details: dict[str, Any] | None = None) -> None:
+        if self._run_diag is not None:
+            payload = dict(details or {})
+            if self.mode == "playback":
+                payload["elapsed_s"] = self._playback_elapsed(when)
+            self._run_diag.event(name, payload, when=when)
 
     def _rollout_hw_features(self) -> dict:
         """Describe the raw observation keys consumed by LeRobot's engine."""
@@ -2234,6 +2762,12 @@ class ControlLoop:
             self.mode = "idle" if self.follower.connected else "offline"
             return False
         self._inference_engine = engine
+        self._active_policy_owner = loaded
+        if getattr(config, "type", "") == "sync":
+            self._inference_worker = PolicyWorker(
+                engine, _POLICY_INFER_LOCK,
+                preview=lambda joints: inference_leftover_poses(engine, loaded, joints),
+            )
         self._rollout_hw_feature_spec = hw_features
         self._next_prediction_t = self.task_t0
         self.log("info", f"rollout inference engine started ({config.type})")
@@ -2242,9 +2776,23 @@ class ControlLoop:
     def _end_rollout(self) -> None:
         """Stop background inference and clear chart state for the current rollout."""
         engine = self._inference_engine
+        worker = self._inference_worker
+        owner = self._active_policy_owner
+        self._inference_worker = None
+        self._active_policy_owner = None
         self._inference_engine = None
         self._rollout_hw_feature_spec = {}
-        if engine is not None:
+        self._rollout_from = None
+        self._rollout_goal = None
+        self._rollout_waiting = False
+        self._rollout_last_action_t = 0.0
+        if isinstance(worker, PolicyWorker):
+            worker.stop_async()
+            if owner is not None:
+                self._policy_cache = {
+                    key: cached for key, cached in self._policy_cache.items() if cached is not owner
+                }
+        elif engine is not None:
             engine.stop()
         self._clear_rollout_prediction()
 

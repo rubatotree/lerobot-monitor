@@ -92,8 +92,10 @@ let replayActive = false;
 let replaySeekId = null;
 let replayScrubPointerId = null;
 let armReplay = false;
-let replayRobotTimer = null;
-let replayRobotInFlight = false;
+let playbackSession = null;
+let playbackRequest = Promise.resolve();
+let playbackHeartbeat = 0;
+let playbackStoppingId = null;
 let episodeRequestGeneration = 0;
 let previewRequestGeneration = 0;
 let episodeLoading = false;
@@ -2181,7 +2183,7 @@ function syncJointControls() {
     autoButton.setAttribute("aria-label", title);
     autoButton.classList.toggle("on", jointAutoSyncEnabled);
     autoButton.setAttribute("aria-pressed", String(jointAutoSyncEnabled));
-    autoButton.disabled = running;
+    autoButton.disabled = running && mode !== "playback";
   }
 
   const relayWanted = (
@@ -2219,6 +2221,13 @@ function applyJointUi(config) {
 function setJointSyncSource(value) {
   if (!JOINT_SYNC_SOURCES.has(value)) return;
   jointSyncSource = value;
+  if (armReplay && replayActive) {
+    if (value === "state" || value === "command") {
+      stopBackendPlayback().then(() => startBackendPlayback(value)).catch(toastError);
+    } else {
+      stopBackendPlayback().catch(toastError);
+    }
+  }
   clearPendingLive();
   stopJointRelay();
   jointPredictionStale = false;
@@ -2357,7 +2366,7 @@ function markJointEdited(name) {
 
 function taskFollowing() {
   const mode = (last && (last.display_mode || last.mode)) || "";
-  return mode === "teleop" || mode === "record" || mode === "rollout" || (replayActive && armReplay);
+  return mode === "teleop" || mode === "record" || mode === "rollout" || mode === "playback";
 }
 
 function ensureJointRows(names) {
@@ -2469,7 +2478,7 @@ function updateJoints(joints, replayElapsed = vizState.elapsed) {
       row.classList.toggle("unmatched", !matched && cur != null);
     }
   });
-  if (sourcePose && jointSyncSource !== "leader" && jointSyncSource !== "none") {
+  if (sourcePose && jointSyncSource !== "leader" && jointSyncSource !== "none" && !replayActive && !armReplay) {
     sendJointCommand({ ...targets });
   }
   syncJointControls();
@@ -2779,6 +2788,154 @@ async function refreshSessions() {
   } catch { /* ignore */ }
 }
 
+function updateRateDisplay(d) {
+  const rates = d.rates || {};
+  const cadence = d.cadence || {};
+  const output = Number(cadence.actual_hz || 0);
+  const target = Number(rates.effective_hz || cadence.target_hz || 30);
+  const label = $("fps");
+  if (label) {
+    label.textContent = `Arm output ${output.toFixed(1)} / ${target.toFixed(1)} Hz`;
+    label.title = `${rates.mode || "joints"} · ${rates.source || "global"} · loop ${Number(d.fps || 0).toFixed(1)} Hz`;
+  }
+  const details = $("rate-settings");
+  const selector = $("rate-mode");
+  if (!details?.open && selector) selector.value = rates.mode || "joints";
+  if (!details?.open && $("rate-default")) $("rate-default").value = String(rates.default_hz || 30);
+  if (!details?.open && $("rate-trace")) $("rate-trace").checked = !!rates.trace;
+  if (!details?.open) syncRateEditor(rates);
+  const events = (d.run_events || []).slice(-3).map((event) => event.type).join(", ");
+  const rateDetail = $("rate-detail");
+  if (rateDetail) rateDetail.textContent = [
+    `${rates.mode || "joints"} · ${rates.source || "global"}`,
+    `source ${rates.source_hz || "—"} Hz · read ${cadence.read_hz || 0} Hz`,
+    `P95 ${cadence.interval_p95_ms ?? "—"} ms · max ${cadence.interval_max_ms ?? "—"} ms`,
+    `missed ${cadence.missed_slots || 0} · holds ${cadence.hold_sends || 0}`,
+    rates.policy_hz ? `policy ${rates.policy_hz} Hz · inference ${d.rollout_inference_ms?.toFixed(1) || "—"} ms${d.rollout_waiting ? " · waiting" : ""}` : "",
+    rates.dataset_hz ? `Dataset ${rates.dataset_hz} FPS` : "",
+    rates.video_hz ? `video ${rates.video_hz} FPS` : "",
+    d.run_log_dropped ? `log overflow ${d.run_log_dropped}` : "",
+    d.run_log_error ? `log error: ${d.run_log_error}` : "",
+    events ? `events: ${events}` : "",
+  ].filter(Boolean).join(" | ");
+  const exports = $("rate-exports");
+  if (exports && d.run_id && exports.dataset.runId !== d.run_id) {
+    exports.dataset.runId = d.run_id;
+    exports.innerHTML = `<a href="${BASE}/api/control/runs/${d.run_id}/summary.json" target="_blank">JSON summary</a> · <a href="${BASE}/api/control/runs/${d.run_id}/events.jsonl" target="_blank">Events</a>${rates.trace ? ` · <a href="${BASE}/api/control/runs/${d.run_id}/ticks.csv" target="_blank">CSV trace</a>` : ""}`;
+  }
+  ["joints", "teleop", "record", "rollout"].forEach((mode) => {
+    const node = $(`${mode}-rate`);
+    if (!node) return;
+    const setting = rates.modes?.[mode] || { kind: "inherit" };
+    const shown = mode === rates.mode ? `${target.toFixed(1)} Hz`
+      : setting.kind === "hz" ? `${setting.value} Hz`
+        : setting.kind === "multiplier" ? `${setting.value}× source`
+          : `${rates.default_hz || 30} Hz`;
+    node.textContent = `Arm ${shown}${mode === rates.mode ? ` · ${rates.source || "global"}` : ""}`;
+  });
+  const replayRate = $("playback-rate");
+  if (replayRate) {
+    const sourceHz = d.playback?.source_hz || vizState.sourceHz || "—";
+    replayRate.textContent = `Source ${sourceHz} Hz · Arm ${rates.mode === "playback" ? target.toFixed(1) : "—"} Hz · ${vizState.speed}× speed`;
+  }
+}
+
+function syncRateEditor(rates = (last && last.rates) || {}) {
+  const mode = $("rate-mode")?.value || "joints";
+  const setting = (rates.modes || {})[mode] || { kind: "inherit" };
+  const kind = $("rate-kind");
+  if (!kind) return;
+  kind.querySelectorAll('option[value^="multiplier"]').forEach((option) => {
+    option.disabled = !["playback", "rollout"].includes(mode);
+  });
+  kind.value = setting.kind === "multiplier" ? `multiplier:${setting.value}` : setting.kind;
+  if ($( "rate-hz") && setting.kind === "hz") $("rate-hz").value = String(setting.value);
+}
+
+function syncBackendPlayback(d) {
+  const state = d.playback;
+  if (!state) {
+    if (playbackSession) {
+      playbackSession = null;
+      armReplay = false;
+      if (playbackHeartbeat) clearInterval(playbackHeartbeat);
+      playbackHeartbeat = 0;
+      syncArmToggle();
+    }
+    playbackStoppingId = null;
+    return;
+  }
+  if (playbackSession?.id !== state.id || state.version >= playbackSession.version) playbackSession = state;
+  if (playbackStoppingId === state.id) return;
+  armReplay = true;
+  if (!playbackHeartbeat) playbackHeartbeat = setInterval(() => {
+    if (playbackSession) playbackOperation("heartbeat").catch(toastError);
+  }, 1000);
+  syncArmToggle();
+  if (!replayActive || !vizState.previewReady || vizState.kind !== state.kind
+      || vizState.id !== state.source_id || vizState.episode !== state.episode) return;
+  renderReplayMarkers(d.run_events || []);
+  if (replaySeekId) return;
+  vizState.elapsed = Number(state.elapsed_s) || 0;
+  vizState.clockBaseElapsed = vizState.elapsed;
+  vizState.clockStartedAt = performance.now();
+  vizState.speed = state.speed;
+  vizState.playing = !!state.playing;
+  if (!vizState.playing) stopReplayClock();
+  else if (vizState.clockFrame == null) vizState.clockFrame = requestAnimationFrame(tickReplayClock);
+  syncReplayMedia(vizState.elapsed, vizState.playing);
+  updateReplayBar(vizState.elapsed, refreshReplayDuration());
+  syncReplayPlayState();
+  syncReplaySpeedControls();
+}
+
+function renderReplayMarkers(events = []) {
+  const host = $("replay-markers");
+  if (!host) return;
+  host.replaceChildren();
+  const quality = vizState.quality;
+  const markers = [];
+  if (quality?.frames) {
+    (quality.filled_frames || []).forEach((frame) => {
+      markers.push({ fraction: frame / Math.max(1, quality.frames - 1), label: "Filled Dataset slot", className: "quality" });
+    });
+  }
+  const duration = Number(vizState.duration) || 0;
+  if (duration > 0) {
+    events.forEach((event) => {
+      if (Number.isFinite(Number(event.elapsed_s))) {
+        markers.push({ fraction: Number(event.elapsed_s) / duration, label: event.type, className: "warning" });
+      }
+    });
+  }
+  markers.slice(0, 500).forEach((marker) => {
+    const tick = document.createElement("i");
+    tick.className = marker.className;
+    tick.style.left = `${Math.max(0, Math.min(100, marker.fraction * 100))}%`;
+    tick.title = marker.label;
+    host.appendChild(tick);
+  });
+}
+
+if ($("rate-mode")) $("rate-mode").addEventListener("change", () => syncRateEditor());
+document.querySelectorAll("[data-rate-mode]").forEach((button) => button.addEventListener("click", () => {
+  const details = $("rate-settings");
+  if (details) details.open = true;
+  $("rate-mode").value = button.dataset.rateMode;
+  syncRateEditor();
+  details?.scrollIntoView({ block: "nearest" });
+}));
+if ($("rate-apply")) $("rate-apply").addEventListener("click", () => {
+  const kind = $("rate-kind").value;
+  const setting = kind.startsWith("multiplier:")
+    ? { kind: "multiplier", value: Number(kind.split(":")[1]) }
+    : kind === "hz" ? { kind: "hz", value: Number($("rate-hz").value) } : { kind: "inherit" };
+  api("/api/control/rates", {
+    default_hz: Number($("rate-default").value), mode: $("rate-mode").value,
+    setting, trace: $("rate-trace").checked,
+  }, "PUT").catch(toastError);
+});
+
 function applyStatus(d) {
   last = d;
   window.RobotPreview?.setStatus(d);
@@ -2793,7 +2950,8 @@ function applyStatus(d) {
   const pill = $("mode-pill");
   pill.textContent = replayActive ? "REPLAY" : mode;
   pill.className = `pill ${replayActive ? "replay" : mode}`;
-  $("fps").textContent = `${Number(d.fps || 0).toFixed(1)} Hz`;
+  updateRateDisplay(d);
+  syncBackendPlayback(d);
 
   const robot = d.robot || {};
   const leader = d.leader || {};
@@ -3392,6 +3550,7 @@ function rolloutFields() {
     duration_s: Number($("pol-dur").value),
     device: $("pol-dev").value.trim() || "cuda",
     policy_fps: Number($("pol-fps") && $("pol-fps").value) || 15,
+    interpolation: !!$("pol-interpolation")?.checked,
     auto_record: autoRecord,
     extra: kvPairs(),
   };
@@ -3404,6 +3563,7 @@ function applyRolloutFields(p) {
   if (p.device != null) $("pol-dev").value = p.device;
   const policyFps = p.policy_fps ?? p.fps;
   if (policyFps != null && $("pol-fps")) $("pol-fps").value = policyFps;
+  if (p.interpolation != null && $("pol-interpolation")) $("pol-interpolation").checked = !!p.interpolation;
   if (p.extra != null) setKvPairs(p.extra);
   populateModelSelects();
   setSelectValue($("pol-path"), String(p.policy_path || ""));
@@ -3988,6 +4148,10 @@ function syncJointTargetFromSource() {
 
 function toggleJointAutoSync() {
   jointAutoSyncEnabled = !jointAutoSyncEnabled;
+  if (replayActive && jointControlEnabled && (jointSyncSource === "state" || jointSyncSource === "command")) {
+    if (jointAutoSyncEnabled && !armReplay) startBackendPlayback(jointSyncSource).catch(toastError);
+    if (!jointAutoSyncEnabled && armReplay) stopBackendPlayback().catch(toastError);
+  }
   if (jointAutoSyncEnabled) {
     syncJointTargetFromSource();
   } else {
@@ -5331,6 +5495,12 @@ function renderDatasets() {
   rows.forEach((ds) => {
     const id = ds.repo_id || ds.id;
     const li = makeLibraryItem("dataset", ds, () => selectHfDataset(ds), libraryResourceTools("dataset", ds));
+    if (ds.quality?.episodes_with_gaps) {
+      const marker = document.createElement("span");
+      marker.className = "dataset-quality-marker";
+      marker.textContent = `${ds.quality.episodes_with_gaps} episodes with filled slots`;
+      li.appendChild(marker);
+    }
     const transfer = activeDatasetTransfer(id);
     if (transfer) li.appendChild(makeDatasetTransferBar(transfer));
     ol.appendChild(li);
@@ -6857,6 +7027,7 @@ function setReplaySpeed(value) {
   vizState.clockBaseElapsed = vizState.elapsed;
   vizState.clockStartedAt = now;
   vizState.speed = speed;
+  if (playbackSession && speed > 0) playbackOperation("speed", { speed }).catch(toastError);
   vizVideos().forEach((video) => {
     if (video.readyState >= 1 || speed === 0) setVideoPlaybackRate(video);
   });
@@ -6955,6 +7126,7 @@ function tickReplayClock(now) {
 
 function seekViz(elapsed) {
   setReplayElapsed(elapsed);
+  if (playbackSession && !replaySeekId) playbackOperation("seek", { elapsed_s: vizState.elapsed }).catch(toastError);
 }
 
 function seekReplayFraction(fraction) {
@@ -6975,6 +7147,7 @@ function finishReplayScrub(id, pointerId = null) {
   if (replayScrubPointerId !== pointerId) return;
   replaySeekId = null;
   replayScrubPointerId = null;
+  if (playbackSession) playbackOperation("seek", { elapsed_s: vizState.elapsed }).catch(toastError);
   const shouldResume = replayScrubWasPlaying
     && replayActive
     && vizState.elapsed < refreshReplayDuration() - 0.001;
@@ -7250,6 +7423,9 @@ function pauseVizVideos() {
 }
 
 function toggleVizPlay() {
+  if (playbackSession) {
+    playbackOperation(vizState.playing ? "pause" : "resume").catch(toastError);
+  }
   if (!vizState.playing) playVizVideos();
   else pauseVizVideos();
 }
@@ -7435,13 +7611,67 @@ function armReplayTrack(data) {
   return { times: (data.t || []).map((value) => value == null ? Number.NaN : Number(value)), track };
 }
 
-const ARM_REPLAY_HZ = 20;
-
 function stopArmReplayLoop() {
-  if (!replayRobotTimer) return;
-  clearInterval(replayRobotTimer);
-  replayRobotTimer = null;
-  replayRobotInFlight = false;
+  stopBackendPlayback().catch(toastError);
+}
+
+async function stopBackendPlayback() {
+  const id = playbackSession?.id;
+  if (!id) return;
+  playbackStoppingId = id;
+  armReplay = false;
+  if (playbackHeartbeat) clearInterval(playbackHeartbeat);
+  playbackHeartbeat = 0;
+  syncArmToggle();
+  await playbackRequest.catch(() => {});
+  let stopped = false;
+  try {
+    const session = playbackSession;
+    if (session?.id !== id) return;
+    try {
+      await api("/api/control/playback/action", { id, version: session.version, operation: "stop" });
+    } catch (error) {
+      const fresh = await api("/api/status", undefined, "GET");
+      if (fresh.playback?.id !== id) return;
+      await api("/api/control/playback/action", { id, version: fresh.playback.version, operation: "stop" });
+    }
+    stopped = true;
+  } finally {
+    if (playbackSession?.id === id && stopped) playbackSession = null;
+    playbackStoppingId = null;
+    if (!stopped && playbackSession?.id === id) armReplay = true;
+    syncArmToggle();
+  }
+}
+
+async function playbackOperation(operation, values = {}) {
+  const expectedId = playbackSession?.id;
+  if (!expectedId) return;
+  playbackRequest = playbackRequest.catch(() => {}).then(async () => {
+    const session = playbackSession;
+    if (session?.id !== expectedId) return;
+    const reply = await api("/api/control/playback/action", {
+      id: session.id, version: session.version, operation, ...values,
+    });
+    if (playbackSession?.id === expectedId && reply.playback) playbackSession = reply.playback;
+  });
+  return playbackRequest;
+}
+
+async function startBackendPlayback(source = "command") {
+  if (playbackSession) await stopBackendPlayback();
+  const reply = await api("/api/control/playback", {
+    kind: vizState.kind, id: vizState.id, episode: vizState.episode,
+    source, interpolation: "linear", speed: Math.max(0.1, vizState.speed), playing: vizState.playing,
+    max_speed: jointMaxSpeed || 720,
+  });
+  playbackSession = reply.playback;
+  armReplay = true;
+  syncArmToggle();
+  if (playbackHeartbeat) clearInterval(playbackHeartbeat);
+  playbackHeartbeat = setInterval(() => {
+    if (playbackSession) playbackOperation("heartbeat").catch(toastError);
+  }, 1000);
 }
 
 function sampleArmJoints(elapsed) {
@@ -7546,33 +7776,9 @@ function syncReplayJointPanel(elapsed) {
   updateJoints(last && last.joints ? last.joints : {}, value);
 }
 
-function pushArmReplayFrame() {
-  if (
-    !armReplay
-    || !replayActive
-    || replayRobotInFlight
-    || !vizState.previewReady
-    || vizState.previewGeneration !== previewRequestGeneration
-  ) return;
-  if (!vizState.playing || vizState.speed === 0) return;
-  const robot = (last && last.robot) || {};
-  const displayMode = (last && last.display_mode) || "";
-  const rawMode = (last && last.mode) || "";
-  const pending = last && last.task && last.task.pending;
-  if (!robot.connected || pending || !["idle", "hold"].includes(displayMode) || (rawMode && rawMode !== "idle")) return;
-  const joints = sampleArmJoints(vizState.elapsed);
-  if (!joints || Object.values(joints).some((value) => !Number.isFinite(value))) return;
-  replayRobotInFlight = true;
-  api("/api/joints", { joints, duration_s: 0, live: true })
-    .catch(toastError)
-    .finally(() => { replayRobotInFlight = false; });
-}
-
-function toggleArmReplay() {
+async function toggleArmReplay() {
   if (armReplay) {
-    armReplay = false;
-    stopArmReplayLoop();
-    syncArmToggle();
+    await stopBackendPlayback();
     return;
   }
   if (!vizState.previewReady || vizState.previewGeneration !== previewRequestGeneration) return;
@@ -7587,13 +7793,13 @@ function toggleArmReplay() {
     localLog("arm replay is available only while the backend is idle or holding", "error");
     return;
   }
-  if (!Object.keys(vizState.arm.track).length) {
-    localLog("this episode has no action series", "error");
+  const source = jointSyncSource === "state" ? "state" : "command";
+  const prefix = source === "state" ? "obs." : "act.";
+  if (!Object.keys(vizState.series || {}).some((key) => key.startsWith(prefix))) {
+    localLog(`this episode has no ${source} joint series`, "error");
     return;
   }
-  armReplay = true;
-  if (!replayRobotTimer) replayRobotTimer = setInterval(pushArmReplayFrame, 1000 / ARM_REPLAY_HZ);
-  syncArmToggle();
+  await startBackendPlayback(source);
 }
 
 function finitePositive(value) {
@@ -7641,6 +7847,8 @@ async function loadPreview(kind, id, episode, autoplay = false) {
   vizState.elapsed = 0;
   vizState.times = [];
   vizState.arm = { times: [], track: {} };
+  vizState.quality = null;
+  vizState.sourceHz = null;
   vizState.previewMeta = "";
   vizState.task = "";
   lastReplayJointPanelElapsed = Number.NaN;
@@ -7676,10 +7884,23 @@ async function loadPreview(kind, id, episode, autoplay = false) {
   vizState.duration = previewDuration(data, cameras);
   vizState.elapsed = 0;
   vizState.previewMeta = previewMetadataLabel(data);
+  vizState.quality = data.quality || null;
+  vizState.sourceHz = Number(data.action_fps || data.fps) || null;
+  const qualityLink = $("replay-quality");
+  if (qualityLink) {
+    qualityLink.classList.toggle("hidden", !(kind === "dataset" && vizState.quality));
+    if (kind === "dataset" && vizState.quality) {
+      qualityLink.href = `${BASE}/api/datasets/${encodeURIComponent(id)}/episodes/${episode}/quality`;
+    }
+  }
+  if (vizState.quality?.filled_count) {
+    vizState.previewMeta += ` · ${vizState.quality.filled_count} filled Dataset slots`;
+  }
   vizState.arm = armReplayTrack(data);
   vizState.task = data.task || "";
   vizState.autoplay = !!autoplay;
   vizState.previewReady = true;
+  renderReplayMarkers();
   vizState.previewGeneration = generation;
   syncReplayAvailability();
   renderEpisodes();
@@ -7795,7 +8016,7 @@ document.addEventListener("keydown", (event) => {
   event.stopImmediatePropagation();
 });
 syncReplaySpeedControls();
-if ($("viz-arm")) bind("viz-arm", toggleArmReplay);
+if ($("viz-arm")) bind("viz-arm", () => toggleArmReplay().catch(toastError));
 if ($("viz-exit")) bind("viz-exit", () => exitReplay());
 if ($("viz-ep")) {
   $("viz-ep").addEventListener("change", () => {

@@ -156,6 +156,7 @@ class DeviceCamera:
         self.error: str | None = None
         self.capture_fps = 0.0
         self.frame_id = 0
+        self.frame_received_at: float | None = None
         self.streaming = False
         self.enabled = True
         self.show_main = False
@@ -202,6 +203,10 @@ class DeviceCamera:
         with self._lock:
             return self._jpeg
 
+    def latest_capture(self) -> tuple[bytes, int, float | None]:
+        with self._lock:
+            return self._jpeg, self.frame_id, self.frame_received_at
+
     def latest_bgr(self) -> np.ndarray | None:
         with self._lock:
             return None if self._bgr is None else self._bgr.copy()
@@ -246,6 +251,7 @@ class DeviceCamera:
             "focus_min": self.focus_min,
             "focus_max": self.focus_max,
             "frame_id": self.frame_id,
+            "frame_received_at": self.frame_received_at,
             "url": f"http://127.0.0.1:{self.port}/video" if self.streaming else None,
             "virtual": False,
             "remote": False,
@@ -325,8 +331,9 @@ class DeviceCamera:
                     self._bgr = frame
                     if ok_j:
                         self._jpeg = buf.tobytes()
-                    self.frame_id += 1
-                    self._frame_ready.notify_all()
+                        self.frame_id += 1
+                        self.frame_received_at = time.perf_counter()
+                        self._frame_ready.notify_all()
                 frames += 1
                 now = time.perf_counter()
                 if now - window >= 1.0:
@@ -457,6 +464,7 @@ class RemoteMjpegCamera:
         self.error: str | None = None
         self.capture_fps = 0.0
         self.frame_id = 0
+        self.frame_received_at: float | None = None
         self.streaming = True
         self.enabled = True
         self.show_main = True
@@ -529,6 +537,10 @@ class RemoteMjpegCamera:
         with self._lock:
             return self._jpeg
 
+    def latest_capture(self) -> tuple[bytes, int, float | None]:
+        with self._lock:
+            return self._jpeg, self.frame_id, self.frame_received_at
+
     def latest_bgr(self) -> np.ndarray | None:
         with self._lock:
             return None if self._bgr is None else self._bgr.copy()
@@ -574,6 +586,7 @@ class RemoteMjpegCamera:
             "focus_min": 0.0,
             "focus_max": 0.0,
             "frame_id": self.frame_id,
+            "frame_received_at": self.frame_received_at,
             "url": self.url,
             "virtual": True,
             "remote": True,
@@ -639,6 +652,7 @@ class RemoteMjpegCamera:
             self._jpeg = jpeg
             self._bgr = frame
             self.frame_id += 1
+            self.frame_received_at = time.perf_counter()
             self._frame_ready.notify_all()
 
 
@@ -973,6 +987,21 @@ class CameraHub:
                 continue
             key = device.label.strip() if device.label else device.name
             out[key or device.name] = jpeg
+        return out
+
+    def latest_main_capture_map(self) -> dict[str, tuple[bytes, int, float | None]]:
+        """Return each JPEG and its receive metadata from the same camera-lock read."""
+        out: dict[str, tuple[bytes, int, float | None]] = {}
+        with self._lock:
+            devices = list(self.streams.values()) + list(self.remote_streams.values())
+        for device in devices:
+            if not device.enabled or not device.show_main or not device.connected:
+                continue
+            jpeg, frame_id, received_at = device.latest_capture()
+            if not jpeg:
+                continue
+            key = device.label.strip() if device.label else device.name
+            out[key or device.name] = jpeg, frame_id, received_at
         return out
 
     def latest_jpeg_map(self) -> dict[str, bytes]:

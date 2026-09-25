@@ -26,6 +26,12 @@ class RecordSample:
     observation: dict[str, float]
     action: dict[str, float]
     images: dict[str, bytes]
+    slot_index: int | None = None
+    capture_elapsed_s: float | None = None
+    state_elapsed_s: float | None = None
+    command_elapsed_s: float | None = None
+    camera_frame_ids: dict[str, int] | None = None
+    camera_received_elapsed_s: dict[str, float] | None = None
 
 
 class RecordDatasetSession:
@@ -119,7 +125,10 @@ class RecordDatasetSession:
         folder.mkdir()
         with self._lock:
             self._attempts[attempt] = {
-                "folder": folder, "sealed": threading.Event(), "frames": 0, "submitted": 0, "discard": False,
+                "folder": folder, "sealed": threading.Event(), "frames": 0, "submitted": 0,
+                "discard": False, "last_sample": None, "expected_slots": None,
+                "slot_origin": None, "filled": 0,
+                "missing_reasons": {},
             }
         return attempt
 
@@ -134,11 +143,11 @@ class RecordDatasetSession:
             if self._closed:
                 raise RuntimeError("record dataset is closing")
             if self._queue.qsize() >= max(2, self.fps * 2):
-                raise RuntimeError("record capture cannot keep up; current episode needs re-recording")
+                raise RuntimeError("record capture cannot keep up; sample slot omitted")
         try:
             self._queue.put_nowait(sample)
         except queue.Full as exc:
-            raise RuntimeError("record capture cannot keep up; current episode needs re-recording") from exc
+            raise RuntimeError("record capture cannot keep up; sample slot omitted") from exc
         with self._lock:
             self._attempts[sample.attempt]["submitted"] += 1
 
@@ -147,6 +156,47 @@ class RecordDatasetSession:
             entry = self._attempts[attempt]
             entry["discard"] = discard
         self._queue.put_nowait(("seal", attempt))
+
+    def set_expected_slots(self, attempt: str, count: int) -> None:
+        with self._lock:
+            self._attempts[attempt]["expected_slots"] = max(0, int(count))
+
+    def mark_missing(self, attempt: str, slot: int, reason: str) -> None:
+        with self._lock:
+            self._attempts[attempt]["missing_reasons"][int(slot)] = str(reason)
+
+    def _write_capture_sample(
+        self, entry: dict[str, Any], sample: RecordSample, *, synthetic: bool, source_slot: int
+    ) -> None:
+        index = int(entry["frames"])
+        folder = entry["folder"]
+        images = folder / "images" / f"{index:06d}"
+        images.mkdir(parents=True, exist_ok=True)
+        for camera, jpeg in sample.images.items():
+            (images / f"{safe_cam_name(camera)}.jpg").write_bytes(jpeg)
+        row = {
+            "observation": sample.observation, "action": sample.action,
+            "image_names": list(sample.images),
+        }
+        with (folder / "samples.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row, allow_nan=False) + "\n")
+        quality = {
+            "frame_index": index, "expected_t_s": round(index / self.fps, 6),
+            "filled": synthetic, "source_frame_index": source_slot,
+            "missing_reason": (
+                entry["missing_reasons"].get(index + (entry["slot_origin"] or 0), "no_complete_sample_for_time_slot")
+                if synthetic else None
+            ),
+            "capture_elapsed_s": sample.capture_elapsed_s,
+            "state_elapsed_s": sample.state_elapsed_s,
+            "command_elapsed_s": sample.command_elapsed_s,
+            "camera_frame_ids": sample.camera_frame_ids or {},
+            "camera_received_elapsed_s": sample.camera_received_elapsed_s or {},
+        }
+        with (folder / "quality.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(quality, allow_nan=False) + "\n")
+        entry["frames"] += 1
+        entry["filled"] += int(synthetic)
 
     def discard(self, attempt: str) -> None:
         with self._lock:
@@ -251,8 +301,23 @@ class RecordDatasetSession:
                     return
                 with self._lock:
                     entry = self._attempts[attempt]
-                    entry["sealed"].set()
                     discard = entry["discard"]
+                if not discard:
+                    try:
+                        expected = entry["expected_slots"]
+                        if expected is not None and entry["slot_origin"] is not None:
+                            expected = max(0, expected - entry["slot_origin"])
+                        previous = entry["last_sample"]
+                        if expected is not None and previous is not None:
+                            for _ in range(entry["frames"], expected):
+                                self._write_capture_sample(
+                                    entry, previous, synthetic=True,
+                                    source_slot=entry["last_source_slot"],
+                                )
+                    except Exception as exc:  # noqa: BLE001
+                        with self._lock:
+                            self._error = f"capture failed: {exc}"
+                entry["sealed"].set()
                 if discard:
                     shutil.rmtree(entry["folder"], ignore_errors=True)
                 continue
@@ -260,18 +325,24 @@ class RecordDatasetSession:
                 entry = self._attempts.get(job.attempt)
                 if entry is None or entry["discard"]:
                     continue
-                index = int(entry["frames"])
             try:
-                folder = entry["folder"]
-                images = folder / "images" / f"{index:06d}"
-                images.mkdir(parents=True, exist_ok=True)
-                for camera, jpeg in job.images.items():
-                    (images / f"{safe_cam_name(camera)}.jpg").write_bytes(jpeg)
-                sample = {"observation": job.observation, "action": job.action, "image_names": list(job.images)}
-                with (folder / "samples.jsonl").open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(sample, allow_nan=False) + "\n")
-                with self._lock:
-                    entry["frames"] += 1
+                raw_slot = int(job.slot_index) if job.slot_index is not None else int(entry["frames"])
+                if entry["slot_origin"] is None:
+                    # The first complete sample establishes the episode time origin.
+                    entry["slot_origin"] = raw_slot
+                slot = raw_slot - entry["slot_origin"]
+                if slot < entry["frames"]:
+                    raise ValueError("record sample slot was already written")
+                previous = entry["last_sample"]
+                if previous is not None:
+                    for _ in range(entry["frames"], slot):
+                        self._write_capture_sample(
+                            entry, previous, synthetic=True,
+                            source_slot=entry["last_source_slot"],
+                        )
+                self._write_capture_sample(entry, job, synthetic=False, source_slot=slot)
+                entry["last_sample"] = job
+                entry["last_source_slot"] = slot
             except Exception as exc:  # noqa: BLE001 - surface disk failures to the operator
                 with self._lock:
                     self._error = f"capture failed: {exc}"
@@ -343,6 +414,30 @@ class RecordDatasetSession:
             dataset.save_episode(parallel_encoding=False)
         finally:
             dataset.finalize()
+        info = json.loads((stage / "meta" / "info.json").read_text(encoding="utf-8"))
+        episode_index = int(info["total_episodes"]) - 1
+        quality_rows = [
+            json.loads(line)
+            for line in (folder / "quality.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        quality_dir = stage / "meta" / "quality"
+        quality_dir.mkdir(parents=True, exist_ok=True)
+        quality = {
+            "schema": 1, "fps": self.fps, "frames": len(quality_rows),
+            "filled_count": sum(bool(row["filled"]) for row in quality_rows),
+            "status": "gaps" if any(row["filled"] for row in quality_rows) else "ok",
+            "samples": quality_rows,
+        }
+        (quality_dir / f"episode_{episode_index:06d}.json").write_text(
+            json.dumps(quality, ensure_ascii=False), encoding="utf-8"
+        )
+        index_path = quality_dir / "index.json"
+        quality_index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.is_file() else {}
+        quality_index[str(episode_index)] = {
+            "status": quality["status"], "filled_count": quality["filled_count"], "frames": quality["frames"],
+        }
+        index_path.write_text(json.dumps(quality_index, ensure_ascii=False), encoding="utf-8")
         self._commit(stage)
 
     def _commit(self, stage: Path) -> None:

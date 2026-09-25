@@ -45,7 +45,19 @@
         <span class="hdr-stat" id="st-episode">—</span>
       </div>
       <div class="header-meta">
-        <span id="fps">0.0 Hz</span>
+        <details id="rate-settings" class="rate-settings">
+          <summary id="fps">Arm output — / 30 Hz</summary>
+          <div class="rate-popover">
+            <label>Global default Hz <input id="rate-default" aria-label="Global default Hz" type="number" min="1" max="240" step="1" value="30"/></label>
+            <label>Mode <select id="rate-mode" aria-label="Control mode"><option value="joints">Joints</option><option value="teleop">Teleop</option><option value="record">Record</option><option value="playback">Playback</option><option value="rollout">Rollout</option></select></label>
+            <label>Output rate <select id="rate-kind" aria-label="Output rate type"><option value="inherit">Inherit global</option><option value="multiplier:1">1× source</option><option value="multiplier:2">2× source</option><option value="multiplier:4">4× source</option><option value="hz">Custom Hz</option></select></label>
+            <label>Custom Hz <input id="rate-hz" aria-label="Custom output Hz" type="number" min="1" max="240" step="1" value="30"/></label>
+            <label><input id="rate-trace" aria-label="Save every send" type="checkbox"/> Save every send</label>
+            <button type="button" id="rate-apply">Apply rate</button>
+            <div id="rate-detail">—</div>
+            <div id="rate-exports"></div>
+          </div>
+        </details>
         <span id="clock">00:00:00</span>
       </div>
     </div>
@@ -236,6 +248,7 @@
             <span id="snapshot-badge" class="replay-tag snapshot hidden">SNAPSHOT</span>
             <span id="replay-title">—</span>
             <span id="replay-status" class="replay-status" role="status" aria-live="polite"></span>
+            <a id="replay-quality" class="hidden" target="_blank" rel="noopener">Quality JSON</a>
             <button type="button" id="viz-exit" class="ghost replay-exit video-exit hidden">EXIT</button>
           </div>
           <div class="replay-transport" role="group" aria-label="Replay transport">
@@ -246,8 +259,12 @@
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.3-5.7"/><polyline points="4 4 4 10 10 10"/></svg>
             </button>
             <label class="sr-only" for="replay-seek">Replay timeline</label>
-            <input id="replay-seek" type="range" min="0" max="1000" value="0" step="1" aria-describedby="viz-t" disabled/>
+            <div class="replay-timeline">
+              <input id="replay-seek" type="range" min="0" max="1000" value="0" step="1" aria-describedby="viz-t" disabled/>
+              <div id="replay-markers" class="replay-markers" aria-hidden="true"></div>
+            </div>
             <output id="viz-t" for="replay-seek" aria-live="off">0.00s / 0.00s</output>
+            <button type="button" class="ghost mode-rate-link" data-rate-mode="playback" id="playback-rate">Source — · Arm — Hz</button>
             <div class="replay-speed-control">
               <button type="button" id="replay-speed-toggle" class="ghost replay-speed-toggle" aria-label="Playback speed" aria-expanded="false" aria-controls="replay-speed-menu" aria-haspopup="dialog" disabled>
                 <span id="replay-speed-label">1×</span><span aria-hidden="true">▾</span>
@@ -355,6 +372,7 @@
             <span>Speed cap</span>
             <input id="joint-max-speed" type="range" min="0" max="720" step="30" value="180"/>
             <output id="joint-max-speed-value" for="joint-max-speed">180°/s</output>
+            <button type="button" class="ghost mode-rate-link" data-rate-mode="joints" id="joints-rate">Arm — Hz</button>
           </label>
           <div class="joint-sync-row">
             <label class="joint-control">
@@ -411,6 +429,7 @@
               <label>Dataset FPS
                 <input id="rec-action-fps" type="number" value="15" min="1" step="1"/>
               </label>
+              <button type="button" class="ghost mode-rate-link" data-rate-mode="record" id="record-rate">Arm — Hz</button>
               <input id="rec-video-fps" type="hidden" value="15"/>
               <input id="rec-format" type="hidden" value="mp4"/>
               <input id="rec-root" type="hidden"/>
@@ -430,6 +449,7 @@
             </div>
             <div class="task-block">
               <label>Teleop</label>
+              <button type="button" class="ghost mode-rate-link" data-rate-mode="teleop" id="teleop-rate">Arm — Hz</button>
               <details class="task-info">
                 <summary>Command preview</summary>
                 <pre id="info-teleop"></pre>
@@ -455,6 +475,8 @@
                   <input id="pol-fps" type="number" value="15" min="1" step="1"/>
                 </label>
               </div>
+              <label><input id="pol-interpolation" type="checkbox" checked/> Interpolate between policy actions</label>
+              <button type="button" class="ghost mode-rate-link" data-rate-mode="rollout" id="rollout-rate">Arm — Hz</button>
               <label>Device
                 <input id="pol-dev" type="text" value="cuda"/>
               </label>

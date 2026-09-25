@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -47,6 +48,7 @@ from .preview import (
 )
 from .snapshots import SnapshotTooLargeError, _decode_camera_payloads
 from .store import PRESET_KINDS
+from .trajectory import JointTrajectory
 from .types import JOINT_ORDER
 
 STATIC_DIR = Path(__file__).resolve().parent / "web" / "static"
@@ -58,6 +60,34 @@ class JogBody(BaseModel):
     live: bool = False
     source: str = "manual"
     max_speed: float | None = None
+
+
+class ControlRatesBody(BaseModel):
+    default_hz: float | None = None
+    mode: str | None = None
+    setting: dict[str, Any] | None = None
+    trace: bool | None = None
+
+
+class PlaybackStartBody(BaseModel):
+    kind: str
+    id: str
+    episode: int = 0
+    source: str = "command"
+    interpolation: str = "linear"
+    speed: float = 1.0
+    playing: bool = True
+    max_speed: float = 180.0
+    control_rate: dict[str, Any] | None = None
+    replace_id: str | None = None
+
+
+class PlaybackControlBody(BaseModel):
+    id: str
+    version: int
+    operation: str
+    elapsed_s: float | None = None
+    speed: float | None = None
 
 
 class PresetBody(BaseModel):
@@ -104,6 +134,7 @@ class RecordStartBody(BaseModel):
     auto_record: bool | None = None
     auto_next: bool = False
     resume_speed: float = 30.0
+    control_rate: dict[str, Any] | None = None
 
 
 class RecordControlBody(BaseModel):
@@ -122,6 +153,7 @@ class RolloutStartBody(BaseModel):
     auto_record: bool | None = None
     fps: int | None = None
     policy_fps: int | None = None
+    interpolation: bool = True
     action_fps: int | None = None
     video_fps: int | None = None
     streaming_encoding: bool | None = None
@@ -131,6 +163,7 @@ class RolloutStartBody(BaseModel):
     extra: dict[str, str] | None = None
     dataset_id: str | None = None
     format: str | None = None
+    control_rate: dict[str, Any] | None = None
 
 
 class DatasetCreateBody(BaseModel):
@@ -289,6 +322,7 @@ class CaptureStartBody(BaseModel):
     deferred_encoding: bool | None = None
     encoder_threads: int | None = None
     auto_record: bool | None = None
+    control_rate: dict[str, Any] | None = None
 
 
 class ConnectBody(BaseModel):
@@ -535,6 +569,61 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 "max_speed": body.max_speed,
             },
         )
+
+    @router.get("/api/control/rates")
+    async def control_rates() -> dict[str, Any]:
+        return hub.snapshot().get("rates") or hub.loop.rates_snapshot()
+
+    @router.put("/api/control/rates")
+    async def update_control_rates(body: ControlRatesBody) -> dict[str, Any]:
+        return await _submit("control_rates", body.model_dump(exclude_none=True))
+
+    @router.post("/api/control/playback")
+    async def start_control_playback(body: PlaybackStartBody) -> dict[str, Any]:
+        if body.kind not in {"video", "dataset"}:
+            raise HTTPException(400, "playback kind must be video or dataset")
+        try:
+            row, count, _ = await asyncio.to_thread(_episode_source, body.kind, body.id)
+            if body.episode < 0 or body.episode >= count:
+                raise HTTPException(404, "episode not found")
+            root = Path(str(row["path"]))
+            trajectory = await asyncio.to_thread(JointTrajectory.load, body.kind, root, body.episode, body.source)
+        except (FileNotFoundError, KeyError) as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return await _submit(
+            "playback_start",
+            {"kind": body.kind, "source_id": body.id, "episode": body.episode,
+             "source": body.source, "interpolation": body.interpolation,
+             "speed": body.speed, "playing": body.playing, "max_speed": body.max_speed, "trajectory": trajectory,
+             "control_rate": body.control_rate, "replace_id": body.replace_id},
+        )
+
+    @router.post("/api/control/playback/action")
+    async def control_playback(body: PlaybackControlBody) -> dict[str, Any]:
+        return await _submit("playback_control", body.model_dump(exclude_none=True))
+
+    @router.get("/api/control/runs/{run_id}/{artifact}")
+    async def control_run_artifact(run_id: str, artifact: str) -> FileResponse:
+        allowed = {"summary.json", "events.jsonl", "ticks.csv"}
+        if re.fullmatch(r"[0-9a-f]{32}", run_id) is None or artifact not in allowed:
+            raise HTTPException(404, "run artifact not found")
+        path = hub.config.store_path.parent / "runs" / run_id / artifact
+        if not path.is_file():
+            raise HTTPException(404, "run artifact not ready")
+        return FileResponse(path)
+
+    @router.get("/api/datasets/{dataset_id}/episodes/{episode}/quality")
+    async def dataset_episode_quality(dataset_id: str, episode: int) -> FileResponse:
+        try:
+            row = await asyncio.to_thread(hub.resolve_dataset, dataset_id)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(404, str(exc)) from exc
+        path = Path(str(row["path"])) / "meta" / "quality" / f"episode_{episode:06d}.json"
+        if episode < 0 or not path.is_file():
+            raise HTTPException(404, "episode quality not available")
+        return FileResponse(path)
 
     @router.post("/api/joints/preset")
     async def preset(body: PresetBody) -> dict[str, Any]:
@@ -1003,10 +1092,21 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.get("/api/datasets")
     async def list_datasets() -> list[dict[str, Any]]:
         rows = await asyncio.to_thread(hub.hf_datasets)
-        return [
-            _merge_library_override("dataset", str(row.get("repo_id") or row.get("id") or ""), row)
-            for row in rows
-        ]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            merged = _merge_library_override("dataset", str(row.get("repo_id") or row.get("id") or ""), row)
+            quality_index = Path(str(merged.get("path") or "")) / "meta" / "quality" / "index.json"
+            if quality_index.is_file():
+                try:
+                    episodes = json.loads(quality_index.read_text(encoding="utf-8"))
+                    merged["quality"] = {
+                        "episodes": len(episodes),
+                        "episodes_with_gaps": sum(item.get("status") == "gaps" for item in episodes.values()),
+                    }
+                except (OSError, ValueError, TypeError):
+                    pass
+            result.append(merged)
+        return result
 
     @router.get("/api/datasets/search")
     async def search_datasets(q: str, limit: int = 20) -> list[dict[str, Any]]:

@@ -142,11 +142,32 @@ h3 {
   display: flex;
   gap: 12px;
   flex-shrink: 0;
+  min-width: 180px;
   font-family: "IBM Plex Mono", ui-monospace, monospace;
   font-size: 12px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
+.rate-settings { position: relative; color: var(--text); min-width: 180px; }
+.rate-settings > summary { cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.rate-popover {
+  position: absolute;
+  z-index: 100;
+  right: 0;
+  top: calc(100% + 12px);
+  width: min(340px, calc(100vw - 24px));
+  padding: 14px;
+  display: grid;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 30px #0005;
+  white-space: normal;
+}
+.rate-popover > label { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; text-align: left; }
+.rate-popover input[type="number"], .rate-popover select { width: 126px; max-width: 50%; }
+#rate-detail { line-height: 1.5; overflow-wrap: anywhere; }
+.mode-rate-link { font: 11px "IBM Plex Mono", ui-monospace, monospace; color: var(--muted); text-align: left; white-space: nowrap; }
 .hdr-icon {
   display: flex;
   flex-direction: column;
@@ -1561,6 +1582,12 @@ main.episodes-closed {
   accent-color: var(--blue);
   cursor: pointer;
 }
+.replay-timeline { position: relative; flex: 1 1 auto; min-width: 64px; display: flex; }
+.replay-timeline #replay-seek { width: 100%; }
+.replay-markers { position: absolute; inset: 15px 9px auto; height: 4px; pointer-events: none; }
+.replay-markers i { position: absolute; top: 0; width: 3px; height: 5px; background: var(--blue); }
+.replay-markers i.quality { background: #d39e4b; }
+.replay-markers i.warning { background: #d05b55; }
 #replay-seek:disabled { opacity: 0.4; cursor: not-allowed; }
 #replay-seek:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .replay-speed-control { position: relative; flex: 0 0 auto; }
@@ -3097,7 +3124,12 @@ body.dragging-row { cursor: row-resize; user-select: none; }
 #sessions li { color: var(--faint); }
 
 @media (max-width: 1400px) {
-  #st-env, #st-elapsed, .header-meta { display: none; }
+  #st-env, #st-elapsed, #clock { display: none; }
+  .header-meta { display: flex; font-size: 10px; }
+  .topbar { flex-wrap: wrap; overflow: visible; }
+  .header-summary { flex-basis: 100%; }
+  .header-controls { width: 100%; }
+  .header-actions { flex: 1 1 auto; overflow-x: auto; justify-content: flex-start; }
 }
 
 @media (max-width: 1200px) {

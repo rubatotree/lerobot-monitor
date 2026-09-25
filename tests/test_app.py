@@ -175,7 +175,7 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert html.count(b'id="replay-seek"') == 1
         assert b'id="prog-seek"' not in html
         transport_start = html.index(b'class="replay-transport"')
-        transport_end = html.index(b"</div>", transport_start)
+        transport_end = html.index(b"</header>", transport_start)
         replay_transport = html[transport_start:transport_end]
         for control_id in (b"viz-play", b"viz-restart", b"replay-seek", b"viz-t", b"replay-speed-toggle"):
             assert b'id="' + control_id + b'"' in replay_transport
@@ -1765,7 +1765,7 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert "function syncJointTargetFromSource" in script.text
     assert "let jointAutoSyncEnabled = false;" in script.text
     assert "function toggleJointAutoSync" in script.text
-    assert "autoButton.disabled = running;" in script.text
+    assert 'autoButton.disabled = running && mode !== "playback";' in script.text
     assert "const availablePose = jointSourcePose" in script.text
     assert "const sourcePose = jointAutoSyncEnabled ? availablePose : null" in script.text
     assert "function sendJointCommand" in script.text

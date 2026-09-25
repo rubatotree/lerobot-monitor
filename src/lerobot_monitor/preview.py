@@ -26,10 +26,12 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def sample_index(length: int, limit: int = MAX_SERIES_POINTS) -> list[int]:
+def sample_index(length: int, limit: int | None = MAX_SERIES_POINTS) -> list[int]:
     """One shared index for every series so all columns keep the same time base."""
     if length <= 0:
         return []
+    if limit is None:
+        return list(range(length))
     if limit <= 0:
         raise ValueError("sample limit must be positive")
     if length <= limit:
@@ -112,7 +114,7 @@ def _rows_from_columns(columns: dict[str, list[Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def series_from_joints_csv(path: Path) -> dict[str, Any]:
+def series_from_joints_csv(path: Path, *, full: bool = False) -> dict[str, Any]:
     if not path.is_file():
         return {"t": [], "series": {}, "frames": 0, "fps": None}
     times: list[float] = []
@@ -143,7 +145,7 @@ def series_from_joints_csv(path: Path) -> dict[str, Any]:
     fps = None
     if frames >= 2 and times[-1] > times[0]:
         fps = round((frames - 1) / (times[-1] - times[0]), 2)
-    index = sample_index(frames)
+    index = sample_index(frames, None if full else MAX_SERIES_POINTS)
     return {
         "t": _pick(times, index),
         "series": {key: _pick(values, index) for key, values in columns.items()},
@@ -152,7 +154,7 @@ def series_from_joints_csv(path: Path) -> dict[str, Any]:
     }
 
 
-def local_episode_payload(root: Path, index: int) -> dict[str, Any]:
+def local_episode_payload(root: Path, index: int, *, full: bool = False) -> dict[str, Any]:
     folder = root / "episodes" / f"{int(index):06d}"
     if not folder.is_dir():
         raise FileNotFoundError(f"episode {index}")
@@ -194,7 +196,7 @@ def local_episode_payload(root: Path, index: int) -> dict[str, Any]:
             }
             for name in names
         ]
-    payload = series_from_joints_csv(folder / "joints.csv")
+    payload = series_from_joints_csv(folder / "joints.csv", full=full)
     action_fps = episode_meta.get("action_fps") or root_meta.get("action_fps") or root_meta.get("fps")
     duration_value = episode_meta.get("duration_s")
     duration_s = (
@@ -432,7 +434,7 @@ def _episode_positions(
     return []
 
 
-def _series_from_parquet(root: Path, index: int) -> dict[str, Any]:
+def _series_from_parquet(root: Path, index: int, *, full: bool = False) -> dict[str, Any]:
     row = _episode_row(root, index)
     files, expected = _episode_data_files(root, index, row)
     selected: list[dict[str, Any]] = []
@@ -492,7 +494,7 @@ def _series_from_parquet(root: Path, index: int) -> dict[str, Any]:
     fps = None
     if frames >= 2 and times[-1] > times[0]:
         fps = round((frames - 1) / (times[-1] - times[0]), 2)
-    sample = sample_index(frames)
+    sample = sample_index(frames, None if full else MAX_SERIES_POINTS)
     return {
         "t": _pick(times, sample),
         "series": {key: _pick(values, sample) for key, values in columns.items()},
@@ -515,7 +517,7 @@ def lerobot_episode_count(root: Path) -> int:
     return max(indices) + 1 if indices else 0
 
 
-def lerobot_episode_payload(root: Path, index: int) -> dict[str, Any]:
+def lerobot_episode_payload(root: Path, index: int, *, full: bool = False) -> dict[str, Any]:
     videos = lerobot_episode_videos(root, index)
     cameras = [
         {
@@ -525,8 +527,15 @@ def lerobot_episode_payload(root: Path, index: int) -> dict[str, Any]:
         }
         for row in videos
     ]
-    payload = _series_from_parquet(root, index)
+    payload = _series_from_parquet(root, index, full=full)
     info = _read_json(root / "meta" / "info.json")
+    quality = _read_json(root / "meta" / "quality" / f"episode_{int(index):06d}.json")
+    quality_summary = {
+        "status": quality.get("status", "unknown"),
+        "filled_count": int(quality.get("filled_count") or 0),
+        "frames": int(quality.get("frames") or 0),
+        "filled_frames": [row["frame_index"] for row in quality.get("samples", []) if row.get("filled")],
+    } if quality else None
     payload.update(
         {
             "kind": "dataset",
@@ -537,6 +546,7 @@ def lerobot_episode_payload(root: Path, index: int) -> dict[str, Any]:
             "video_fps": info.get("video_fps") or info.get("fps"),
             "episodes": lerobot_episode_count(root),
             "task": info.get("task") or "",
+            "quality": quality_summary,
         }
     )
     return payload

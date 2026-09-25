@@ -623,6 +623,7 @@ def test_record_reset_finishes_episode_and_does_not_record_reset_frames(tmp_path
     loop.record_session = session
     loop.record_phase = "recording"
     loop.record_attempt = "attempt-0"
+    loop._record_first_sample_t = 0.0
     loop.record_phase_t0 = 0.0
     loop.episode_time_s = 1.0
     loop.reset_time_s = 0.5
@@ -726,13 +727,14 @@ def test_rollout_policy_deadline_runs_at_policy_rate_without_drift(tmp_path: Pat
     monkeypatch.setattr(loop_module.time, "perf_counter", lambda: 0.0)
     assert loop._begin_rollout(loaded, {"record": False, "policy_fps": 15}, "policy")
 
-    clock = iter((0.0, 1 / 30, 2 / 30, 3 / 30, 4 / 30))
-    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(clock))
-    for _ in range(5):
+    clock = [0.0]
+    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: clock[0])
+    for step in range(5):
+        clock[0] = step / 30
         loop._tick_rollout()
 
     assert engine.get_action.call_count == 3
-    assert loop.follower.send_pose.call_count == 3
+    assert loop.follower.send_pose.call_count == 5
     assert loop._next_policy_t == pytest.approx(0.2)
 
 
@@ -749,15 +751,15 @@ def test_rollout_prediction_reads_lerobot_rtc_queue(tmp_path: Path, monkeypatch)
         leftovers=[{"gripper": 1.0}, {"gripper": 2.0}],
     )
     monkeypatch.setattr(loop, "_build_rollout_obs_frame", lambda observation: observation)
-    clock = iter((12.0, 12.25, 13.0, 13.25))
-    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(clock))
+    clock = [12.0]
+    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: clock[0])
 
     loop._tick_rollout()
     first = loop._rollout_prediction
 
     assert first is not None
     assert first["id"] == 1
-    assert first["t_s"] == 2.25
+    assert first["t_s"] == 2.0
     assert first["step_s"] == 0.05
     assert first["strategy"] == "policy_queue"
     assert first["latency_ms"] == 0.0
@@ -780,8 +782,8 @@ def test_rollout_prediction_reads_sync_policy_queue(tmp_path: Path, monkeypatch)
     loop._next_prediction_t = 0.0
     loop._inference_engine = FakeInferenceEngine({"gripper": 0.0})
     monkeypatch.setattr(loop, "_build_rollout_obs_frame", lambda observation: observation)
-    clock = iter((12.0, 12.25))
-    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: next(clock))
+    clock = [12.0]
+    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: clock[0])
 
     loop._tick_rollout()
 
@@ -814,11 +816,11 @@ def test_start_inference_engine_uses_hw_features_method(tmp_path: Path, monkeypa
     assert captured["hw_features"] == {"observation.state": {"names": []}}
 
 
-def test_rollout_legacy_fps_is_policy_rate_and_is_capped_to_control(tmp_path: Path) -> None:
+def test_rollout_legacy_fps_is_policy_rate_without_silent_cap(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
 
     assert loop._policy_rates({"fps": 15}) == (15.0, 15.0)
-    assert loop._policy_rates({"fps": 120}) == (120.0, 30.0)
+    assert loop._policy_rates({"fps": 120}) == (120.0, 120.0)
     with pytest.raises(ValueError, match="policy_fps must be positive"):
         loop._policy_rates({"fps": 0})
 

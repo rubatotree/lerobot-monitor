@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 import numpy as np
 
@@ -60,6 +60,10 @@ def _coerce_override(raw: str, current: Any) -> Any:
     return text
 
 
+RUNTIME_POLICY_EXTRA_KEYS = frozenset({"task", "fps", "interpolation_multiplier", "control_rate"})
+RUNTIME_POLICY_EXTRA_PREFIXES = ("inference.", "robot.", "dataset.", "teleop.", "strategy.", "record.")
+
+
 def apply_policy_overrides(cfg: Any, extra: Mapping[str, str] | None) -> list[str]:
     """Set ``policy.n_action_steps``-style extras onto a loaded policy config.
 
@@ -74,8 +78,7 @@ def apply_policy_overrides(cfg: Any, extra: Mapping[str, str] | None) -> list[st
             path = path[2:]
         if path.startswith("policy."):
             path = path[len("policy.") :]
-        skipped = {"robot", "teleop", "dataset", "strategy", "inference"}
-        if not path or ("." in path and path.split(".", 1)[0] in skipped):
+        if not path or path in RUNTIME_POLICY_EXTRA_KEYS or path.startswith(RUNTIME_POLICY_EXTRA_PREFIXES):
             continue
         try:
             obj = cfg
@@ -119,6 +122,10 @@ class ActionChunk:
     strategy: str
     degraded: bool
     warnings: list[str]
+    cache_hit: bool = False
+    model_wait_ms: float = 0.0
+    model_load_ms: float = 0.0
+    compute_ms: float = 0.0
 
 
 def resolve_cached_policy_path(path: str, revision: str = "") -> str | None:
@@ -149,6 +156,7 @@ def load_policy(
     robot_type: str = "so101_follower",
     rename_map: dict[str, str] | None = None,
     extra: Mapping[str, str] | None = None,
+    progress: Callable[[str, int], None] | None = None,
 ) -> LoadedPolicy:
     ensure_lerobot_on_path()
     import torch
@@ -172,8 +180,13 @@ def load_policy(
             f"or set device=cpu."
         )
 
+    def report(phase: str, completed: int) -> None:
+        if progress is not None:
+            progress(phase, completed)
+
     def _load(*, local_only: bool) -> LoadedPolicy:
         kwargs = {"local_files_only": local_only}
+        report("config", 0)
         cfg = PreTrainedConfig.from_pretrained(load_path, **kwargs)
         cfg.pretrained_path = load_path
         cfg.device = device
@@ -184,10 +197,13 @@ def load_policy(
             if cached_vlm is not None:
                 logger.info("using cached VLM snapshot for %s: %s", vlm_model_name, cached_vlm)
                 cfg.vlm_model_name = cached_vlm
+        report("weights", 1)
         policy_cls = get_policy_class(cfg.type)
         policy = policy_cls.from_pretrained(load_path, config=cfg, local_files_only=local_only)
+        report("device", 2)
         policy = policy.to(device)
         policy.eval()
+        report("processors", 3)
         preprocessor_overrides = {
             "device_processor": {"device": device},
             "rename_observations_processor": {"rename_map": rename_map or {}},

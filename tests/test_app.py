@@ -1778,3 +1778,120 @@ def test_static_library_search_and_live_chart_contract(tmp_path: Path, monkeypat
     assert '["loading", "teleop", "record", "rollout"].includes(backendMode)' in script.text
     assert 'sampleReplayJointPose("obs.", replayElapsed)' in script.text
     assert 'sampleReplayJointPose("act.", replayElapsed)' in script.text
+
+
+def test_static_rate_panel_contract(tmp_path: Path, monkeypatch) -> None:
+    """The arm rate editor must stay reachable at every viewport width."""
+
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+
+    with TestClient(app) as client:
+        css = client.get("/lerobot/static/styles.css")
+        script = client.get("/lerobot/static/app.js")
+        page = client.get("/lerobot/")
+
+    assert css.status_code == 200
+    assert script.status_code == 200
+    assert page.status_code == 200
+
+    # One shared editor, mounted outside <main> so no header clip can crop it.
+    assert page.text.index("</main>") < page.text.index('id="rate-panel"')
+    for marker in (
+        'id="rate-open"',
+        'id="rate-close"',
+        'id="rate-mode"',
+        'id="rate-kind"',
+        'id="rate-hz"',
+        'id="rate-default"',
+        'id="rate-trace"',
+        'id="rate-apply"',
+        'id="rate-error"',
+        'id="rate-exports"',
+        'id="rate-live"',
+        'id="rate-stat-output"',
+        'id="rate-stat-policy"',
+        'id="rate-stat-dataset"',
+        'id="rate-notes"',
+        'id="playback-source"',
+        'aria-controls="rate-panel"',
+        'data-rate-mode="playback"',
+        'data-rate-mode="joints"',
+        'data-rate-mode="teleop"',
+        'data-rate-mode="record"',
+        'data-rate-mode="rollout"',
+        'value="multiplier:1"',
+        'value="multiplier:2"',
+        'value="multiplier:4"',
+        'value="multiplier:6"',
+        'value="multiplier:8"',
+    ):
+        assert marker in page.text, marker
+    # The old in-header disclosure and its text-only links are gone.
+    assert 'id="rate-settings"' not in page.text
+    assert "mode-rate-link" not in page.text
+    # The global `label` rule stacks label children vertically, so an inline
+    # checkbox row (here the rollout block right under the arm rate field) has
+    # to opt into the row layout, otherwise the box floats above its caption.
+    assert '<label class="check"><input id="pol-interpolation"' in page.text
+
+    popover_rule = re.search(r"\.rate-popover\s*\{(?P<body>.*?)\}", css.text, re.DOTALL)
+    assert popover_rule is not None
+    popover_body = popover_rule.group("body")
+    assert "position: fixed" in popover_body
+    assert "overflow-y: auto" in popover_body
+    assert "max-height" in popover_body
+    assert ".rate-popover.hidden" in css.text
+    for selector in (
+        ".rate-trigger",
+        ".rate-chevron",
+        ".rate-panel-head",
+        ".rate-row",
+        ".rate-entry",
+        ".rate-stats",
+        ".rate-stat[hidden]",
+        ".rate-notes",
+        ".rate-error.ok",
+        ".rate-panel-foot",
+        ".rate-field",
+        ".rate-hint",
+        ".rate-chip",
+        ".rate-chip-value",
+        ".rate-chip-source",
+        ".replay-source",
+    ):
+        assert selector in css.text, selector
+    fps_rule = re.search(r"#fps\s*\{(?P<body>.*?)\}", css.text, re.DOTALL)
+    assert fps_rule is not None
+    assert "width: 8ch" not in fps_rule.group("body")
+    assert ".mode-rate-link" not in css.text
+
+    # A crowded single-row header must wrap before its action groups cover the
+    # summary (and the rate trigger), and must scroll them rather than overlap.
+    actions_rule = re.search(r"\.header-actions\s*\{(?P<body>.*?)\}", css.text, re.DOTALL)
+    assert actions_rule is not None
+    assert "overflow-x: auto" in actions_rule.group("body")
+    wrap_rule = re.search(r"@media \(max-width: 1700px\)\s*\{(?P<body>.*?)\n\}", css.text, re.DOTALL)
+    assert wrap_rule is not None
+    assert "flex-wrap: wrap" in wrap_rule.group("body")
+    assert "max-width: 1400px" not in css.text
+
+    for symbol in (
+        "function openRatePanel",
+        "function closeRatePanel",
+        "function positionRatePanel",
+        "function syncRatePanel",
+        "function syncRateChips",
+        "function updateRateStats",
+        "function submitRatePanel",
+        "function validateRatePanel",
+        '"rate-panel"',
+        'window.addEventListener("resize"',
+    ):
+        assert symbol in script.text, symbol
+    # The panel is anchored by JS instead of scrolling the page to the header.
+    assert "details.open" not in script.text
+    assert 'id="rate-settings"' not in script.text
+    open_body = re.search(r"function openRatePanel\(.*?\n\}", script.text, re.DOTALL)
+    assert open_body is not None
+    assert "scrollIntoView" not in open_body.group(0)

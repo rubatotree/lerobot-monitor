@@ -100,6 +100,12 @@ def test_live_rate_changes_do_not_change_playback_clock(tmp_path: Path, monkeypa
     assert before == pytest.approx(0.5)
     _dispatch(loop, "control_rates", {"mode": "playback", "setting": {"kind": "multiplier", "value": 4}})
     assert loop._control_hz() == 60
+    # A 15 FPS action source also supports the 6× and 8× presets.
+    _dispatch(loop, "control_rates", {"mode": "playback", "setting": {"kind": "multiplier", "value": 6}})
+    assert loop._control_hz() == 90
+    _dispatch(loop, "control_rates", {"mode": "playback", "setting": {"kind": "multiplier", "value": 8}})
+    assert loop._control_hz() == 120
+    assert loop._playback_elapsed(100.25) == before
     _dispatch(loop, "control_rates", {"mode": "playback", "setting": {"kind": "hz", "value": 50}})
     assert loop._control_hz() == 50
     assert loop._playback_elapsed(100.25) == before
@@ -130,3 +136,25 @@ def test_dataset_fps_cannot_be_used_as_record_control_multiplier(tmp_path: Path)
     loop = _loop(tmp_path)
     with pytest.raises(ValueError, match="no stable action source"):
         loop._task_setting("record", {"control_rate": {"kind": "multiplier", "value": 4}}, 15)
+
+
+@pytest.mark.parametrize("preset", [1, 2, 4, 6, 8])
+def test_control_multiplier_presets_scale_the_source(preset: int) -> None:
+    setting = RateSetting.parse({"kind": "multiplier", "value": preset})
+    assert setting.kind == "multiplier"
+    assert setting.value == float(preset)
+    # A 15 FPS action source keeps every preset inside the 1-240 Hz band.
+    assert setting.resolve(30, 15.0) == 15.0 * preset
+
+
+def test_control_multiplier_rejects_unknown_presets_and_reports_the_overflow() -> None:
+    for value in (3, 5, 7, 16):
+        with pytest.raises(ValueError, match="1, 2, 4, 6, or 8"):
+            RateSetting.parse({"kind": "multiplier", "value": value})
+    with pytest.raises(ValueError, match="positive and finite"):
+        RateSetting.parse({"kind": "multiplier", "value": 0})
+    # 8× a 60 FPS policy would need 480 Hz; the error names the resolved value
+    # so the panel can explain why the request was refused.
+    with pytest.raises(ValueError, match="resolves to 480"):
+        RateSetting("multiplier", 8).resolve(30, 60.0)
+    assert RateSetting("multiplier", 8).resolve(30, 30.0) == 240.0

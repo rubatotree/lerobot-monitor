@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from typing import Any
 
 RATE_MODES = ("joints", "teleop", "record", "playback", "rollout")
-RATE_PRESETS = (1.0, 2.0, 4.0)
+RATE_PRESETS = (1.0, 2.0, 4.0, 6.0, 8.0)
+RATE_HZ_MIN = 1.0
+RATE_HZ_MAX = 240.0
 
 
 @dataclass(frozen=True)
@@ -37,7 +39,7 @@ class RateSetting:
         if not math.isfinite(value) or value <= 0:
             raise ValueError("control rate value must be positive and finite")
         if kind == "multiplier" and value not in RATE_PRESETS:
-            raise ValueError("control multiplier must be 1, 2, or 4")
+            raise ValueError("control multiplier must be 1, 2, 4, 6, or 8")
         return cls(kind, value)
 
     def resolve(self, default_hz: float, source_hz: float | None = None) -> float:
@@ -49,8 +51,13 @@ class RateSetting:
             if source_hz is None or not math.isfinite(source_hz) or source_hz <= 0:
                 raise ValueError("control multiplier needs a known action source FPS")
             result = source_hz * float(self.value)
-        if not math.isfinite(result) or result < 1 or result > 240:
-            raise ValueError("control frequency must be between 1 and 240 Hz")
+        if not math.isfinite(result) or result < RATE_HZ_MIN or result > RATE_HZ_MAX:
+            # Name the resolved value: a high multiplier over a fast source is
+            # the usual way to land outside the supported band.
+            raise ValueError(
+                f"control frequency must be between {RATE_HZ_MIN:g} and {RATE_HZ_MAX:g} Hz "
+                f"(this setting resolves to {result:g} Hz)"
+            )
         return result
 
     def as_dict(self) -> dict[str, Any]:

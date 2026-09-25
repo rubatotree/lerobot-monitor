@@ -2810,64 +2810,184 @@ async function refreshSessions() {
   } catch { /* ignore */ }
 }
 
+const RATE_MODE_CHIPS = ["joints", "teleop", "record", "rollout"];
+const RATE_MULTIPLIER_MODES = new Set(["playback", "rollout"]);
+const RATE_HZ_MIN = 1;
+const RATE_HZ_MAX = 240;
+let ratePanelAnchor = null;
+
 function updateRateDisplay(d) {
   const rates = d.rates || {};
   const cadence = d.cadence || {};
   const output = Number(cadence.actual_hz || 0);
   const target = Number(rates.effective_hz || cadence.target_hz || 30);
   const label = $("fps");
-  if (label) {
-    label.textContent = `Arm output ${output.toFixed(1)} / ${target.toFixed(1)} Hz`;
-    label.title = `${rates.mode || "joints"} · ${rates.source || "global"} · loop ${Number(d.fps || 0).toFixed(1)} Hz`;
+  if (label) label.textContent = `Arm ${target.toFixed(1)} Hz`;
+  const trigger = $("rate-open");
+  if (trigger) {
+    trigger.title = `${rates.mode || "joints"} · ${rates.source || "global"} · output ${output.toFixed(1)} / ${target.toFixed(1)} Hz · loop ${Number(d.fps || 0).toFixed(1)} Hz`;
   }
-  const details = $("rate-settings");
-  const selector = $("rate-mode");
-  if (!details?.open && selector) selector.value = rates.mode || "joints";
-  if (!details?.open && $("rate-default")) $("rate-default").value = String(rates.default_hz || 30);
-  if (!details?.open && $("rate-trace")) $("rate-trace").checked = !!rates.trace;
-  if (!details?.open) syncRateEditor(rates);
+  const live = $("rate-live");
+  if (live) live.textContent = `${output.toFixed(1)} / ${target.toFixed(1)} Hz`;
+  // Editing in progress is never overwritten by a status push; the measured
+  // numbers below still refresh live.
+  if (!isRatePanelOpen()) syncRatePanel(rates);
+  updateRateStats(d, rates, cadence);
+  syncRateChips(rates, target, d);
+}
+
+function updateRateStats(d, rates, cadence) {
+  const set = (id, text) => { const node = $(id); if (node) node.textContent = text; };
+  const row = (name, visible) => {
+    const node = document.querySelector(`#rate-detail .rate-stat[data-stat="${name}"]`);
+    if (node) node.hidden = !visible;
+  };
+  const sourceHz = Number(rates.source_hz);
+  const hasSource = Number.isFinite(sourceHz) && sourceHz > 0;
+  const sourceDetail = !hasSource ? `${rates.source || "global"}`
+    : rates.mode === "playback" && d.playback?.effective_source_hz
+      ? `${sourceHz.toFixed(1)} → ${Number(d.playback.effective_source_hz).toFixed(1)} Hz`
+      : `${sourceHz.toFixed(1)} Hz`;
+  set("rate-stat-output", `${Number(rates.effective_hz || 0).toFixed(1)} Hz · ${rates.source || "global"}`);
+  set("rate-stat-read", `${cadence.read_hz || 0} Hz`);
+  set("rate-stat-source", `${rates.mode || "joints"} · ${sourceDetail}`);
+  set("rate-stat-sent", String(cadence.sent ?? 0));
+  set("rate-stat-jitter", `${cadence.interval_p95_ms ?? "—"} / ${cadence.interval_max_ms ?? "—"} ms`);
+  set("rate-stat-missed", `${cadence.missed_slots || 0} / ${cadence.hold_sends || 0}`);
+  const policy = !!rates.policy_hz;
+  row("policy", policy);
+  if (policy) {
+    set("rate-stat-policy", `${rates.policy_hz} Hz · ${d.rollout_inference_ms?.toFixed(1) || "—"} ms${d.rollout_waiting ? " · waiting" : ""}`);
+  }
+  const dataset = !!(rates.dataset_hz || rates.video_hz);
+  row("dataset", dataset);
+  if (dataset) {
+    set("rate-stat-dataset", [
+      rates.dataset_hz ? `${rates.dataset_hz} FPS` : "",
+      rates.video_hz ? `video ${rates.video_hz} FPS` : "",
+    ].filter(Boolean).join(" · "));
+  }
   const events = (d.run_events || []).slice(-3).map((event) => event.type).join(", ");
-  const sourceDetail = rates.mode === "playback" && d.playback?.effective_source_hz
-    ? `source ${rates.source_hz} Hz · effective ${Number(d.playback.effective_source_hz).toFixed(1)} Hz`
-    : `source ${rates.source_hz || "—"} Hz`;
-  const rateDetail = $("rate-detail");
-  if (rateDetail) rateDetail.textContent = [
-    `${rates.mode || "joints"} · ${rates.source || "global"}`,
-    `${sourceDetail} · read ${cadence.read_hz || 0} Hz`,
-    `P95 ${cadence.interval_p95_ms ?? "—"} ms · max ${cadence.interval_max_ms ?? "—"} ms`,
-    `missed ${cadence.missed_slots || 0} · holds ${cadence.hold_sends || 0}`,
-    rates.policy_hz ? `policy ${rates.policy_hz} Hz · inference ${d.rollout_inference_ms?.toFixed(1) || "—"} ms${d.rollout_waiting ? " · waiting" : ""}` : "",
-    rates.dataset_hz ? `Dataset ${rates.dataset_hz} FPS` : "",
-    rates.video_hz ? `video ${rates.video_hz} FPS` : "",
+  const notes = [
     d.run_log_dropped ? `log overflow ${d.run_log_dropped}` : "",
     d.run_log_error ? `log error: ${d.run_log_error}` : "",
     events ? `events: ${events}` : "",
-  ].filter(Boolean).join(" | ");
+  ].filter(Boolean).join(" · ");
+  const notesNode = $("rate-notes");
+  if (notesNode) {
+    notesNode.textContent = notes;
+    notesNode.hidden = !notes;
+  }
   const exports = $("rate-exports");
   if (exports && d.run_id && exports.dataset.runId !== d.run_id) {
     exports.dataset.runId = d.run_id;
     exports.innerHTML = `<a href="${BASE}/api/control/runs/${d.run_id}/summary.json" target="_blank">JSON summary</a> · <a href="${BASE}/api/control/runs/${d.run_id}/events.jsonl" target="_blank">Events</a>${rates.trace ? ` · <a href="${BASE}/api/control/runs/${d.run_id}/ticks.csv" target="_blank">CSV trace</a>` : ""}`;
   }
-  ["joints", "teleop", "record", "rollout"].forEach((mode) => {
+}
+
+function syncRateChips(rates, target, d = {}) {
+  RATE_MODE_CHIPS.forEach((mode) => {
     const node = $(`${mode}-rate`);
     if (!node) return;
     const setting = rates.modes?.[mode] || { kind: "inherit" };
-    const shown = mode === rates.mode ? `${target.toFixed(1)} Hz`
+    const active = mode === rates.mode;
+    const shown = active ? `${target.toFixed(1)} Hz`
       : setting.kind === "hz" ? `${setting.value} Hz`
         : setting.kind === "multiplier" ? `${setting.value}× source`
           : `${rates.default_hz || 30} Hz`;
-    node.textContent = `Arm ${shown}${mode === rates.mode ? ` · ${rates.source || "global"}` : ""}`;
+    const value = node.querySelector(".rate-chip-value");
+    const source = node.querySelector(".rate-chip-source");
+    if (value) value.textContent = `Arm ${shown}`;
+    if (source) {
+      source.textContent = active ? (rates.source || "global") : "";
+      source.hidden = !active;
+    }
+    node.title = `${mode} · ${shown}${active ? ` · ${rates.source || "global"}` : ""} — click to edit`;
   });
   const replayRate = $("playback-rate");
-  if (replayRate) {
+  const replayValue = replayRate?.querySelector(".rate-chip-value");
+  if (replayValue) replayValue.textContent = `Arm ${rates.mode === "playback" ? target.toFixed(1) : "—"} Hz`;
+  const sourceNode = $("playback-source");
+  if (sourceNode) {
     const sourceHz = Number(d.playback?.source_hz || vizState.sourceHz);
     const speed = Number(d.playback?.speed ?? vizState.speed) || 1;
     const effectiveSourceHz = Number(d.playback?.effective_source_hz || sourceHz * speed);
-    const sourceLabel = Number.isFinite(sourceHz) && sourceHz > 0
-      ? `Source ${sourceHz.toFixed(1)} Hz · effective ${effectiveSourceHz.toFixed(1)} Hz @${speed}×`
+    sourceNode.textContent = Number.isFinite(sourceHz) && sourceHz > 0
+      ? `Source ${sourceHz.toFixed(1)} Hz · eff ${effectiveSourceHz.toFixed(1)} Hz @${speed}×`
       : "Source — Hz";
-    replayRate.textContent = `${sourceLabel} · Arm ${rates.mode === "playback" ? target.toFixed(1) : "—"} Hz`;
   }
+}
+
+function isRatePanelOpen() {
+  const panel = $("rate-panel");
+  return !!panel && !panel.classList.contains("hidden");
+}
+
+function rateTriggerNodes() {
+  return [...document.querySelectorAll("[data-rate-mode]"), $("rate-open")].filter(Boolean);
+}
+
+function setRateTriggersExpanded(active) {
+  rateTriggerNodes().forEach((node) => node.setAttribute("aria-expanded", String(node === active)));
+}
+
+// The panel is a body-level fixed element, so it must follow whichever trigger
+// opened it without ever being cropped by an ancestor.
+function positionRatePanel() {
+  const panel = $("rate-panel");
+  if (!panel || panel.classList.contains("hidden")) return;
+  const anchor = ratePanelAnchor;
+  if (!anchor || !anchor.getClientRects().length) {
+    closeRatePanel({ restoreFocus: false });
+    return;
+  }
+  const margin = 8;
+  const gap = 6;
+  const rect = anchor.getBoundingClientRect();
+  const size = panel.getBoundingClientRect();
+  const maxLeft = Math.max(margin, window.innerWidth - margin - size.width);
+  const maxTop = Math.max(margin, window.innerHeight - margin - size.height);
+  const left = Math.min(Math.max(margin, rect.left), maxLeft);
+  let top = rect.bottom + gap;
+  if (top > maxTop) {
+    const above = rect.top - gap - size.height;
+    top = above >= margin ? above : maxTop;
+  }
+  top = Math.min(Math.max(margin, top), maxTop);
+  panel.style.left = `${Math.round(left)}px`;
+  panel.style.top = `${Math.round(top)}px`;
+}
+
+function syncRatePanel(rates = (last && last.rates) || {}) {
+  if ($("rate-mode")) $("rate-mode").value = rates.mode || "joints";
+  if ($("rate-default")) $("rate-default").value = String(rates.default_hz || 30);
+  if ($("rate-trace")) $("rate-trace").checked = !!rates.trace;
+  syncRateEditor(rates);
+}
+
+function openRatePanel(anchor) {
+  const panel = $("rate-panel");
+  if (!panel) return;
+  ratePanelAnchor = anchor || $("rate-open");
+  // Every open re-reads the loop snapshot: unapplied edits are dropped so the
+  // panel never shows a value the running loop is not using.
+  syncRatePanel();
+  ratePanelStatus("");
+  panel.classList.remove("hidden");
+  positionRatePanel();
+  setRateTriggersExpanded(ratePanelAnchor);
+  panel.focus({ preventScroll: true });
+}
+
+function closeRatePanel({ restoreFocus = true } = {}) {
+  const panel = $("rate-panel");
+  if (!panel || panel.classList.contains("hidden")) return;
+  panel.classList.add("hidden");
+  ratePanelStatus("");
+  setRateTriggersExpanded(null);
+  const anchor = ratePanelAnchor;
+  ratePanelAnchor = null;
+  if (restoreFocus && anchor && anchor.getClientRects().length) anchor.focus({ preventScroll: true });
 }
 
 function syncRateEditor(rates = (last && last.rates) || {}) {
@@ -2875,11 +2995,93 @@ function syncRateEditor(rates = (last && last.rates) || {}) {
   const setting = (rates.modes || {})[mode] || { kind: "inherit" };
   const kind = $("rate-kind");
   if (!kind) return;
+  const multiplierAllowed = RATE_MULTIPLIER_MODES.has(mode);
   kind.querySelectorAll('option[value^="multiplier"]').forEach((option) => {
-    option.disabled = !["playback", "rollout"].includes(mode);
+    option.disabled = !multiplierAllowed;
   });
+  kind.title = multiplierAllowed ? "" : "Multipliers need a stable action source (playback or rollout).";
   kind.value = setting.kind === "multiplier" ? `multiplier:${setting.value}` : setting.kind;
-  if ($( "rate-hz") && setting.kind === "hz") $("rate-hz").value = String(setting.value);
+  if ($("rate-hz") && setting.kind === "hz") $("rate-hz").value = String(setting.value);
+  syncRateHzRow();
+}
+
+function syncRateHzRow() {
+  const custom = $("rate-kind")?.value === "hz";
+  const input = $("rate-hz");
+  if (input) input.disabled = !custom;
+  const row = $("rate-hz-row");
+  if (row) row.classList.toggle("disabled", !custom);
+}
+
+function ratePanelSetting() {
+  const kind = $("rate-kind")?.value || "inherit";
+  if (kind.startsWith("multiplier:")) return { kind: "multiplier", value: Number(kind.split(":")[1]) };
+  if (kind === "hz") return { kind: "hz", value: Number($("rate-hz")?.value) };
+  return { kind: "inherit" };
+}
+
+function ratePanelStatus(message, state = "") {
+  const node = $("rate-error");
+  if (!node) return;
+  node.textContent = message || "";
+  node.classList.toggle("ok", state === "ok");
+  node.classList.toggle("pending", state === "pending");
+}
+
+function finiteRateHz(input) {
+  const value = Number(input?.value);
+  return Number.isFinite(value) && value >= RATE_HZ_MIN && value <= RATE_HZ_MAX ? value : null;
+}
+
+function validateRatePanel() {
+  if (finiteRateHz($("rate-default")) == null) {
+    return `Global default must be between ${RATE_HZ_MIN} and ${RATE_HZ_MAX} Hz`;
+  }
+  const setting = ratePanelSetting();
+  if (setting.kind === "multiplier" && !RATE_MULTIPLIER_MODES.has($("rate-mode")?.value || "joints")) {
+    return "Multipliers need a stable action source (playback or rollout)";
+  }
+  if (setting.kind === "hz" && finiteRateHz($("rate-hz")) == null) {
+    return `Custom Hz must be between ${RATE_HZ_MIN} and ${RATE_HZ_MAX}`;
+  }
+  return "";
+}
+
+async function submitRatePanel() {
+  const invalid = validateRatePanel();
+  if (invalid) {
+    ratePanelStatus(invalid);
+    return;
+  }
+  const button = $("rate-apply");
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  }
+  ratePanelStatus("Applying…", "pending");
+  try {
+    const data = await api("/api/control/rates", {
+      default_hz: Number($("rate-default").value),
+      mode: $("rate-mode").value,
+      setting: ratePanelSetting(),
+      trace: $("rate-trace").checked,
+    }, "PUT");
+    if (data?.rates) {
+      // Reflect the accepted values immediately instead of waiting for the next
+      // status push, so the header and the chips never lag behind Apply.
+      last = { ...last, rates: data.rates };
+      updateRateDisplay(last);
+    }
+    ratePanelStatus("Applied", "ok");
+  } catch (err) {
+    ratePanelStatus(err.message || "rate update failed");
+    toastError(err);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    }
+  }
 }
 
 function syncBackendPlayback(d) {
@@ -2949,24 +3151,46 @@ function renderReplayMarkers(events = []) {
   });
 }
 
-if ($("rate-mode")) $("rate-mode").addEventListener("change", () => syncRateEditor());
-document.querySelectorAll("[data-rate-mode]").forEach((button) => button.addEventListener("click", () => {
-  const details = $("rate-settings");
-  if (details) details.open = true;
-  $("rate-mode").value = button.dataset.rateMode;
+if ($("rate-mode")) $("rate-mode").addEventListener("change", () => {
+  ratePanelStatus("");
   syncRateEditor();
-  details?.scrollIntoView({ block: "nearest" });
-}));
-if ($("rate-apply")) $("rate-apply").addEventListener("click", () => {
-  const kind = $("rate-kind").value;
-  const setting = kind.startsWith("multiplier:")
-    ? { kind: "multiplier", value: Number(kind.split(":")[1]) }
-    : kind === "hz" ? { kind: "hz", value: Number($("rate-hz").value) } : { kind: "inherit" };
-  api("/api/control/rates", {
-    default_hz: Number($("rate-default").value), mode: $("rate-mode").value,
-    setting, trace: $("rate-trace").checked,
-  }, "PUT").catch(toastError);
 });
+if ($("rate-kind")) $("rate-kind").addEventListener("change", () => {
+  ratePanelStatus("");
+  syncRateHzRow();
+});
+["rate-default", "rate-hz"].forEach((id) => {
+  if ($(id)) $(id).addEventListener("input", () => ratePanelStatus(""));
+});
+document.querySelectorAll("[data-rate-mode]").forEach((button) => button.addEventListener("click", () => {
+  const alreadyOpen = isRatePanelOpen() && ratePanelAnchor === button;
+  if ($("rate-mode")) $("rate-mode").value = button.dataset.rateMode;
+  if (alreadyOpen) closeRatePanel();
+  else openRatePanel(button);
+}));
+if ($("rate-open")) $("rate-open").addEventListener("click", () => {
+  if (isRatePanelOpen()) closeRatePanel();
+  else openRatePanel($("rate-open"));
+});
+if ($("rate-close")) $("rate-close").addEventListener("click", () => closeRatePanel());
+if ($("rate-apply")) $("rate-apply").addEventListener("click", () => { submitRatePanel().catch(toastError); });
+document.addEventListener("pointerdown", (event) => {
+  if (!isRatePanelOpen()) return;
+  if (event.target.closest?.("#rate-panel, [data-rate-mode], #rate-open")) return;
+  closeRatePanel({ restoreFocus: false });
+}, true);
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !isRatePanelOpen()) return;
+  // Keep the global Escape shortcuts from also firing while the panel is open.
+  event.stopImmediatePropagation();
+  closeRatePanel();
+});
+window.addEventListener("resize", () => positionRatePanel());
+window.addEventListener("scroll", (event) => {
+  if (!isRatePanelOpen()) return;
+  if (event.target instanceof Node && $("rate-panel")?.contains(event.target)) return;
+  positionRatePanel();
+}, { capture: true, passive: true });
 
 function applyStatus(d) {
   last = d;
@@ -4585,6 +4809,9 @@ if (previewCameraHost) {
 
 initTabList("library-tabs", "lerobot-monitor-library-tab", "models", selectLibrarySearchKind);
 initTabList("side-tabs", "lerobot-monitor-side-tab", "joints", (kind) => {
+  // The rate panel is anchored to a control inside one pane, so a tab switch
+  // must not leave it floating next to a hidden trigger.
+  closeRatePanel({ restoreFocus: false });
   selectPresetKind(PRESET_KIND_BY_TAB[kind] || "pose");
 });
 document.querySelectorAll(".panel.side-tab-panel").forEach((panel) => {

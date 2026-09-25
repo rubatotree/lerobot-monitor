@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
-  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260924-header-library-log"/>
+  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260925-rate-panel"/>
   <script src="/lerobot/static/vendor/chart/chart.umd.min.js"></script>
   <script type="importmap">
     {
@@ -45,19 +45,10 @@
         <span class="hdr-stat" id="st-episode">—</span>
       </div>
       <div class="header-meta">
-        <details id="rate-settings" class="rate-settings">
-          <summary id="fps">Arm output — / 30 Hz</summary>
-          <div class="rate-popover">
-            <label>Global default Hz <input id="rate-default" aria-label="Global default Hz" type="number" min="1" max="240" step="1" value="30"/></label>
-            <label>Mode <select id="rate-mode" aria-label="Control mode"><option value="joints">Joints</option><option value="teleop">Teleop</option><option value="record">Record</option><option value="playback">Playback</option><option value="rollout">Rollout</option></select></label>
-            <label>Output rate <select id="rate-kind" aria-label="Output rate type"><option value="inherit">Inherit global</option><option value="multiplier:1">1× source</option><option value="multiplier:2">2× source</option><option value="multiplier:4">4× source</option><option value="hz">Custom Hz</option></select></label>
-            <label>Custom Hz <input id="rate-hz" aria-label="Custom output Hz" type="number" min="1" max="240" step="1" value="30"/></label>
-            <label><input id="rate-trace" aria-label="Save every send" type="checkbox"/> Save every send</label>
-            <button type="button" id="rate-apply">Apply rate</button>
-            <div id="rate-detail">—</div>
-            <div id="rate-exports"></div>
-          </div>
-        </details>
+        <button type="button" id="rate-open" class="rate-trigger" aria-haspopup="dialog" aria-controls="rate-panel" aria-expanded="false" title="Arm output rate">
+          <span id="fps">Arm 30.0 Hz</span>
+          <svg class="rate-chevron" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
         <span id="clock">00:00:00</span>
       </div>
     </div>
@@ -264,7 +255,10 @@
               <div id="replay-markers" class="replay-markers" aria-hidden="true"></div>
             </div>
             <output id="viz-t" for="replay-seek" aria-live="off">0.00s / 0.00s</output>
-            <button type="button" class="ghost mode-rate-link" data-rate-mode="playback" id="playback-rate">Source — · Arm — Hz</button>
+            <span id="playback-source" class="replay-source" title="Playback source rate">Source — Hz</span>
+            <button type="button" class="rate-chip rate-chip-inline" data-rate-mode="playback" id="playback-rate" aria-haspopup="dialog" aria-controls="rate-panel" aria-expanded="false">
+              <span class="rate-chip-value">Arm — Hz</span>
+            </button>
             <div class="replay-speed-control">
               <button type="button" id="replay-speed-toggle" class="ghost replay-speed-toggle" aria-label="Playback speed" aria-expanded="false" aria-controls="replay-speed-menu" aria-haspopup="dialog" disabled>
                 <span id="replay-speed-label">1×</span><span aria-hidden="true">▾</span>
@@ -278,9 +272,9 @@
                 <button type="button" class="replay-speed-option" data-replay-speed="4">4×</button>
                 <button type="button" id="replay-speed-custom-toggle" class="replay-speed-option" aria-expanded="false" aria-controls="replay-speed-custom">Custom…</button>
                 <div id="replay-speed-custom" class="replay-speed-custom hidden">
-                  <label for="replay-speed">Speed (0× or higher)</label>
+                  <label for="replay-speed">Speed (0 pauses; 0.1–8× plays)</label>
                   <div class="replay-speed-entry">
-                    <input id="replay-speed" type="number" min="0" step="any" value="1" aria-label="Custom playback speed"/>
+                    <input id="replay-speed" type="number" min="0" max="8" step="any" value="1" aria-label="Custom playback speed"/>
                     <button type="button" id="replay-speed-apply">Apply</button>
                   </div>
                 </div>
@@ -372,8 +366,14 @@
             <span>Speed cap</span>
             <input id="joint-max-speed" type="range" min="0" max="720" step="30" value="180"/>
             <output id="joint-max-speed-value" for="joint-max-speed">180°/s</output>
-            <button type="button" class="ghost mode-rate-link" data-rate-mode="joints" id="joints-rate">Arm — Hz</button>
           </label>
+          <div class="rate-field">
+            <span>Arm rate</span>
+            <button type="button" class="rate-chip" data-rate-mode="joints" id="joints-rate" aria-haspopup="dialog" aria-controls="rate-panel" aria-expanded="false">
+              <span class="rate-chip-value">30.0 Hz</span>
+              <span class="rate-chip-source">global</span>
+            </button>
+          </div>
           <div class="joint-sync-row">
             <label class="joint-control">
               <span>Sync</span>
@@ -429,7 +429,14 @@
               <label>Dataset FPS
                 <input id="rec-action-fps" type="number" value="15" min="1" step="1"/>
               </label>
-              <button type="button" class="ghost mode-rate-link" data-rate-mode="record" id="record-rate">Arm — Hz</button>
+              <div class="rate-field">
+                <span>Arm rate</span>
+                <button type="button" class="rate-chip" data-rate-mode="record" id="record-rate" aria-haspopup="dialog" aria-controls="rate-panel" aria-expanded="false">
+                  <span class="rate-chip-value">30.0 Hz</span>
+                  <span class="rate-chip-source">global</span>
+                </button>
+                <p class="rate-hint">Dataset FPS stays independent of the arm output rate.</p>
+              </div>
               <input id="rec-video-fps" type="hidden" value="15"/>
               <input id="rec-format" type="hidden" value="mp4"/>
               <input id="rec-root" type="hidden"/>
@@ -449,7 +456,13 @@
             </div>
             <div class="task-block">
               <label>Teleop</label>
-              <button type="button" class="ghost mode-rate-link" data-rate-mode="teleop" id="teleop-rate">Arm — Hz</button>
+              <div class="rate-field">
+                <span>Arm rate</span>
+                <button type="button" class="rate-chip" data-rate-mode="teleop" id="teleop-rate" aria-haspopup="dialog" aria-controls="rate-panel" aria-expanded="false">
+                  <span class="rate-chip-value">30.0 Hz</span>
+                  <span class="rate-chip-source">global</span>
+                </button>
+              </div>
               <details class="task-info">
                 <summary>Command preview</summary>
                 <pre id="info-teleop"></pre>
@@ -475,8 +488,14 @@
                   <input id="pol-fps" type="number" value="15" min="1" step="1"/>
                 </label>
               </div>
-              <label><input id="pol-interpolation" type="checkbox" checked/> Interpolate between policy actions</label>
-              <button type="button" class="ghost mode-rate-link" data-rate-mode="rollout" id="rollout-rate">Arm — Hz</button>
+              <div class="rate-field">
+                <span>Arm rate</span>
+                <button type="button" class="rate-chip" data-rate-mode="rollout" id="rollout-rate" aria-haspopup="dialog" aria-controls="rate-panel" aria-expanded="false">
+                  <span class="rate-chip-value">30.0 Hz</span>
+                  <span class="rate-chip-source">global</span>
+                </button>
+              </div>
+              <label class="check"><input id="pol-interpolation" type="checkbox" checked/> Interpolate between policy actions</label>
               <label>Device
                 <input id="pol-dev" type="text" value="cuda"/>
               </label>
@@ -652,6 +671,49 @@
     </section>
   </main>
 
+  <div id="rate-panel" class="rate-popover hidden" role="dialog" tabindex="-1" aria-labelledby="rate-panel-title">
+    <header class="rate-panel-head">
+      <h2 id="rate-panel-title">Arm output rate</h2>
+      <span id="rate-live" class="rate-live">— / — Hz</span>
+      <button type="button" id="rate-close" class="rate-close" aria-label="Close rate settings" title="Close">×</button>
+    </header>
+    <div class="rate-section">
+      <div class="rate-row">
+        <label for="rate-mode">Mode</label>
+        <select id="rate-mode" aria-label="Control mode"><option value="joints">Joints</option><option value="teleop">Teleop</option><option value="record">Record</option><option value="playback">Playback</option><option value="rollout">Rollout</option></select>
+      </div>
+      <div class="rate-row">
+        <label for="rate-kind">Output</label>
+        <select id="rate-kind" aria-label="Output rate type"><option value="inherit">Inherit global</option><option value="multiplier:1">1× source</option><option value="multiplier:2">2× source</option><option value="multiplier:4">4× source</option><option value="multiplier:6">6× source</option><option value="multiplier:8">8× source</option><option value="hz">Custom Hz</option></select>
+      </div>
+      <div class="rate-row" id="rate-hz-row">
+        <label for="rate-hz">Custom Hz</label>
+        <span class="rate-entry"><input id="rate-hz" aria-label="Custom output Hz" type="number" min="1" max="240" step="1" value="30"/><span class="rate-unit">Hz</span></span>
+      </div>
+      <div class="rate-row">
+        <label for="rate-default">Global default</label>
+        <span class="rate-entry"><input id="rate-default" aria-label="Global default Hz" type="number" min="1" max="240" step="1" value="30"/><span class="rate-unit">Hz</span></span>
+      </div>
+      <label class="rate-check"><input id="rate-trace" aria-label="Save every send" type="checkbox"/> Save every send (CSV trace)</label>
+    </div>
+    <dl id="rate-detail" class="rate-stats">
+      <div class="rate-stat" data-stat="output"><dt>Output</dt><dd id="rate-stat-output">—</dd></div>
+      <div class="rate-stat" data-stat="read"><dt>Read</dt><dd id="rate-stat-read">—</dd></div>
+      <div class="rate-stat" data-stat="source"><dt>Source</dt><dd id="rate-stat-source">—</dd></div>
+      <div class="rate-stat" data-stat="sent"><dt>Sent</dt><dd id="rate-stat-sent">—</dd></div>
+      <div class="rate-stat" data-stat="jitter"><dt>P95 / max</dt><dd id="rate-stat-jitter">—</dd></div>
+      <div class="rate-stat" data-stat="missed"><dt>Missed / holds</dt><dd id="rate-stat-missed">—</dd></div>
+      <div class="rate-stat" data-stat="policy" hidden><dt>Policy</dt><dd id="rate-stat-policy">—</dd></div>
+      <div class="rate-stat" data-stat="dataset" hidden><dt>Dataset</dt><dd id="rate-stat-dataset">—</dd></div>
+    </dl>
+    <p id="rate-notes" class="rate-notes" hidden></p>
+    <p id="rate-error" class="rate-error" role="status" aria-live="polite"></p>
+    <footer class="rate-panel-foot">
+      <div id="rate-exports" class="rate-exports"></div>
+      <div class="rate-actions"><button type="button" id="rate-apply">Apply rate</button></div>
+    </footer>
+  </div>
+
   <div id="library-modal" class="library-modal hidden" role="dialog" aria-modal="true" aria-labelledby="library-modal-title">
     <div class="library-modal-card">
       <header class="library-modal-head">
@@ -664,7 +726,7 @@
     </div>
   </div>
 
-  <script src="/lerobot/static/app.js?v=20260924-header-library-log"></script>
+  <script src="/lerobot/static/app.js?v=20260925-rate-panel"></script>
   <script type="module" src="/lerobot/static/robot-preview.js?v=20260923-arm-preview-2"></script>
 </body>
 </html>

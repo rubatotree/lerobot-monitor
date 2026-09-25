@@ -123,6 +123,11 @@ h3 {
   gap: 8px;
   justify-content: flex-end;
   min-width: 0;
+  /* Safety net: a crowded single-row header must scroll its own buttons rather
+     than paint them over the status summary and the rate trigger. */
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
 }
 .header-action-group, .header-safety {
   display: flex;
@@ -148,26 +153,228 @@ h3 {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-.rate-settings { position: relative; color: var(--text); min-width: 180px; }
-.rate-settings > summary { cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.rate-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 24px;
+  padding: 2px 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.rate-trigger:hover,
+.rate-trigger[aria-expanded="true"] {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.rate-trigger[aria-expanded="true"] { background: var(--surface); }
+.rate-chevron {
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.15s ease;
+}
+.rate-trigger[aria-expanded="true"] .rate-chevron { transform: rotate(180deg); }
+/* One shared editor for every entry point. It is a body-level fixed panel so no
+   ancestor clip (notably .topbar's overflow on wide screens) can crop it;
+   app.js anchors it to the trigger that opened it. */
 .rate-popover {
-  position: absolute;
-  z-index: 100;
-  right: 0;
-  top: calc(100% + 12px);
-  width: min(340px, calc(100vw - 24px));
-  padding: 14px;
+  position: fixed;
+  z-index: 300;
+  left: 8px;
+  top: 8px;
+  width: min(360px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px;
   display: grid;
-  gap: 8px;
+  gap: 10px;
   background: var(--surface);
   border: 1px solid var(--line);
-  box-shadow: 0 12px 30px #0005;
+  border-radius: 6px;
+  box-shadow: 0 16px 40px #0008;
   white-space: normal;
 }
-.rate-popover > label { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; text-align: left; }
-.rate-popover input[type="number"], .rate-popover select { width: 126px; max-width: 50%; }
-#rate-detail { line-height: 1.5; overflow-wrap: anywhere; }
-.mode-rate-link { font: 11px "IBM Plex Mono", ui-monospace, monospace; color: var(--muted); text-align: left; white-space: nowrap; }
+.rate-popover.hidden { display: none; }
+.rate-panel-head { display: flex; align-items: center; gap: 8px; }
+.rate-panel-head h2 {
+  flex: 1 1 auto;
+  margin: 0;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.rate-live {
+  flex: 0 0 auto;
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.rate-close {
+  flex: 0 0 auto;
+  width: 26px;
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.rate-close:hover { color: var(--err); border-color: var(--line); }
+.rate-section {
+  display: grid;
+  gap: 7px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+.rate-row { display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: center; gap: 8px; }
+.rate-row > label { color: var(--muted); font-size: 11px; }
+.rate-row.disabled > label { opacity: 0.45; }
+.rate-row select { width: 100%; min-height: 28px; padding: 3px 6px; font-size: 11px; }
+.rate-entry { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.rate-entry input {
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  padding: 3px 6px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.rate-unit {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10px;
+}
+#rate-hz:disabled {
+  color: var(--faint);
+  background: #07080e;
+  border-color: #1c2030;
+  cursor: not-allowed;
+}
+.rate-check {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  margin: 1px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.rate-check input { accent-color: var(--accent); }
+.rate-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 12px; margin: 0; }
+.rate-stat { display: grid; gap: 1px; min-width: 0; }
+.rate-stat[hidden] { display: none; }
+.rate-stat dt { color: var(--faint); font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; }
+.rate-stat dd {
+  margin: 0;
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.rate-notes {
+  margin: 0;
+  color: var(--faint);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.rate-notes[hidden] { display: none; }
+.rate-error { min-height: 13px; margin: 0; color: #f29aa6; font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
+.rate-error.ok { color: var(--ok); }
+.rate-error.pending { color: var(--faint); }
+.rate-panel-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.rate-exports { min-width: 0; color: var(--faint); font-size: 10px; }
+.rate-exports a { color: var(--blue); }
+.rate-actions { flex: 0 0 auto; }
+.rate-actions button {
+  min-height: 28px;
+  padding: 4px 12px;
+  border-color: var(--accent-dim);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+.rate-actions button:disabled { opacity: 0.5; }
+/* In-panel entry: the label column matches .joint-control so the chip lines up
+   with neighbouring fields instead of overflowing a shared grid cell. */
+.rate-field {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.rate-hint { grid-column: 2; margin: 0; color: var(--faint); font-size: 10px; line-height: 1.4; }
+.rate-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  min-height: 30px;
+  padding: 3px 8px;
+  background: #090a12;
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.rate-field > .rate-chip { width: 100%; }
+.rate-chip:hover,
+.rate-chip:focus-visible,
+.rate-chip[aria-expanded="true"] {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+  background: var(--surface-2);
+}
+.rate-chip-value { font-variant-numeric: tabular-nums; }
+.rate-chip-source {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.rate-chip-inline { flex: 0 0 auto; }
+.replay-source {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .hdr-icon {
   display: flex;
   flex-direction: column;
@@ -259,8 +466,8 @@ h3 {
 #st-env.warn { color: var(--warn); }
 #fps {
   display: inline-block;
-  width: 8ch;
-  text-align: right;
+  min-width: 0;
+  text-align: left;
   font-variant-numeric: tabular-nums;
 }
 #clock {
@@ -3123,7 +3330,9 @@ body.dragging-row { cursor: row-resize; user-select: none; }
 #log .error { color: var(--err); }
 #sessions li { color: var(--faint); }
 
-@media (max-width: 1400px) {
+/* A single-row header only fits above this width; below it the summary and the
+   action groups overlap and the rate trigger becomes unclickable. */
+@media (max-width: 1700px) {
   #st-env, #st-elapsed, #clock { display: none; }
   .header-meta { display: flex; font-size: 10px; }
   .topbar { flex-wrap: wrap; overflow: visible; }
@@ -3150,6 +3359,9 @@ body.dragging-row { cursor: row-resize; user-select: none; }
   .preset-name-line button { width: 38px; min-width: 38px; min-height: 38px; }
   .device-row { grid-template-columns: 44px minmax(0, 1fr) 38px; }
   .port-toggle { width: 38px; min-width: 38px; min-height: 38px; }
+  .rate-chip { min-height: 40px; }
+  .rate-close { width: 40px; min-width: 40px; min-height: 40px; }
+  .rate-actions button { min-height: 40px; }
 }
 
 @media (max-width: 1180px) {
@@ -3265,6 +3477,8 @@ body.dragging-row { cursor: row-resize; user-select: none; }
   .replay-transport { gap: 3px; }
   #viz-t { min-width: 12.5ch; font-size: 9px; }
   .replay-exit { padding-inline: 8px; }
+  .rate-popover { width: calc(100vw - 16px); }
+  .rate-stats { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 420px) and (pointer: coarse) {

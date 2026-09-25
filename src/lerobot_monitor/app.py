@@ -15,7 +15,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 import cv2
 import numpy as np
@@ -39,6 +39,7 @@ from .pathutil import ensure_lerobot_on_path
 from .session import safe_cam_name
 from .metrics import evaluate_action_chunk
 from .model_hub import ModelHubError, search_hf_models
+from .policy_residency import PolicyBusyError
 from .robot_models import RobotModelError, search_hf_robot_models
 from .preview import (
     find_lerobot_video,
@@ -269,6 +270,15 @@ class ModelSaveBody(BaseModel):
     revision: str | None = None
 
 
+class ModelLoadBody(BaseModel):
+    device: str | None = None
+    extra: dict[str, str] = Field(default_factory=dict)
+
+
+class ModelUnloadBody(BaseModel):
+    instance_id: str | None = None
+
+
 class RobotModelInstallBody(BaseModel):
     remote: str
     name: str = ""
@@ -490,7 +500,10 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         timeout: float = 8.0,
     ) -> dict[str, Any]:
         data = dict(payload or {})
-        token = hub.loop.note_pending(kind, message)
+        try:
+            token = hub.loop.note_pending(kind, message)
+        except RuntimeError as exc:
+            raise HTTPException(400, str(exc)) from exc
         data["_start_generation"] = token
         try:
             return await _submit(kind, data, timeout=timeout)
@@ -499,7 +512,10 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
     def _enqueue(kind: str, message: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         data = dict(payload or {})
-        token = hub.loop.note_pending(kind, message)
+        try:
+            token = hub.loop.note_pending(kind, message)
+        except RuntimeError as exc:
+            raise HTTPException(400, str(exc)) from exc
         data["_start_generation"] = token
         hub.loop.submit_nowait(kind, data)
         return {"ok": True, "accepted": True, "kind": kind}
@@ -655,6 +671,10 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         hub.cameras.sync_remote_cameras()
         cameras = hub.cameras.rescan()
         return {"cameras": cameras, "ports": list_serial_ports()}
+
+    @router.post("/api/memory/clean")
+    async def clean_memory() -> dict[str, Any]:
+        return await _submit("memory_clean")
 
     @router.post("/api/joints/read_leader")
     async def read_leader_pose() -> dict[str, Any]:
@@ -913,6 +933,30 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         if kind == "snapshot":
             return _merge_snapshot_metadata(hub.snapshots.get(source_id))
         raise ValueError(f"unknown library kind '{kind}'")
+
+    @asynccontextmanager
+    async def _model_weight_mutation(path: str) -> AsyncIterator[None]:
+        """Keep new users off the source until an edit or deletion completes."""
+        async with library_mutation_lock:
+            try:
+                source = hub.policy_residency.block_source(path)
+            except PolicyBusyError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            try:
+                if path:
+                    try:
+                        count = hub.policy_residency.unload(path)
+                    except PolicyBusyError as exc:
+                        raise HTTPException(409, str(exc)) from exc
+                    if count:
+                        deadline = time.monotonic() + 15.0
+                        while hub.policy_residency.status(path)["state"] != "unloaded":
+                            if time.monotonic() >= deadline:
+                                raise HTTPException(409, "model is still unloading")
+                            await asyncio.sleep(0.05)
+                yield
+            finally:
+                hub.policy_residency.unblock_source(source)
 
     def _open_library_folder(kind: str, source_id: str) -> None:
         # Resolve the ID on the server; a browser-supplied path must never launch a local process.
@@ -1269,7 +1313,12 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                     if key in {"name", "remote", "revision", "path"}
                 }
                 if source_payload:
-                    await asyncio.to_thread(hub.model_registry.save, body.id, source_payload)
+                    if any(key in source_payload for key in ("remote", "revision", "path")):
+                        current = _resolve_library_row("model", body.id)
+                        async with _model_weight_mutation(str(current.get("path") or "")):
+                            await asyncio.to_thread(hub.model_registry.save, body.id, source_payload)
+                    else:
+                        await asyncio.to_thread(hub.model_registry.save, body.id, source_payload)
                 metadata_payload = {
                     key: value
                     for key, value in payload.items()
@@ -1313,13 +1362,14 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 )
                 if row is None:
                     raise FileNotFoundError(id)
-                target = hub_cache_repo_dir(row.get("path"), str(row.get("repo_id") or ""), kind="model") or row.get("path")
-                try:
-                    await _delete_library_path(target)
-                except OSError as exc:
-                    raise HTTPException(400, f"could not delete {target}: {exc}") from exc
-                await asyncio.to_thread(hub.model_registry.delete, id)
-                await asyncio.to_thread(hub.store.delete_library_override, "model", id)
+                async with _model_weight_mutation(str(row.get("path") or "")):
+                    target = hub_cache_repo_dir(row.get("path"), str(row.get("repo_id") or ""), kind="model") or row.get("path")
+                    try:
+                        await _delete_library_path(target)
+                    except OSError as exc:
+                        raise HTTPException(400, f"could not delete {target}: {exc}") from exc
+                    await asyncio.to_thread(hub.model_registry.delete, id)
+                    await asyncio.to_thread(hub.store.delete_library_override, "model", id)
             elif kind == "dataset":
                 async with library_mutation_lock:
                     if hub.loop.recording_mutation_lock.locked():
@@ -1528,10 +1578,49 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @router.get("/api/models")
     async def list_models() -> list[dict[str, Any]]:
         rows = await asyncio.to_thread(hub.models)
-        return [
-            _merge_library_override("model", str(row.get("id") or row.get("name") or ""), row)
-            for row in rows
-        ]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            merged = _merge_library_override("model", str(row.get("id") or row.get("name") or ""), row)
+            residency = hub.policy_residency.status(str(merged.get("path") or ""))
+            merged["residency"] = residency
+            merged["metadata"]["gpu_memory"] = f"{residency['gpu_bytes'] / 1048576:.1f} MiB" if residency["gpu_bytes"] else "—"
+            merged["metadata"]["resident_device"] = ", ".join(
+                sorted({item["device"] for item in residency["instances"]})
+            ) or "—"
+            result.append(merged)
+        return result
+
+    @router.post("/api/models/{model_id:path}/load", status_code=202)
+    async def load_model(model_id: str, body: ModelLoadBody) -> dict[str, Any]:
+        row = next((item for item in await asyncio.to_thread(hub.models) if str(item.get("id")) == model_id), None)
+        if row is None:
+            raise HTTPException(404, f"unknown model '{model_id}'")
+        path = str(row.get("path") or "")
+        if not path or not row.get("playable"):
+            raise HTTPException(400, "model weights are unavailable; download or update this model first")
+        try:
+            entry = await asyncio.to_thread(
+                hub.policy_residency.request, path, body.device or hub.config.rollout.device,
+                {str(key): str(value) for key, value in body.extra.items()},
+            )
+        except PolicyBusyError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"ok": True, "accepted": True, "instance_id": entry.instance_id}
+
+    @router.post("/api/models/{model_id:path}/unload", status_code=202)
+    async def unload_model(model_id: str, body: ModelUnloadBody = ModelUnloadBody()) -> dict[str, Any]:
+        row = next((item for item in await asyncio.to_thread(hub.models) if str(item.get("id")) == model_id), None)
+        if row is None:
+            raise HTTPException(404, f"unknown model '{model_id}'")
+        try:
+            count = await asyncio.to_thread(
+                hub.policy_residency.unload, str(row.get("path") or ""), body.instance_id
+            )
+        except PolicyBusyError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown resident instance '{body.instance_id}'") from exc
+        return {"ok": True, "accepted": True, "instances": count}
 
     @router.get("/api/models/search")
     async def search_models(q: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -1560,15 +1649,16 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         except ModelHubError as exc:
             raise HTTPException(400, str(exc)) from exc
 
-    @router.put("/api/models/{model_id}")
+    @router.put("/api/models/{model_id:path}")
     async def save_model(model_id: str, body: ModelSaveBody) -> dict[str, Any]:
         payload = body.model_dump(exclude_unset=True)
         try:
-            row = await asyncio.to_thread(
-                hub.model_registry.save,
-                model_id,
-                payload,
-            )
+            if any(key in payload for key in ("remote", "path", "revision")):
+                current = _resolve_library_row("model", model_id)
+                async with _model_weight_mutation(str(current.get("path") or "")):
+                    row = await asyncio.to_thread(hub.model_registry.save, model_id, payload)
+            else:
+                row = await asyncio.to_thread(hub.model_registry.save, model_id, payload)
             override: dict[str, Any] = {}
             if "name" in payload and payload["name"] is not None:
                 override["name"] = str(payload["name"])
@@ -1583,20 +1673,22 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         except ModelHubError as exc:
             raise HTTPException(400, str(exc)) from exc
 
-    @router.post("/api/models/{model_id}/update")
+    @router.post("/api/models/{model_id:path}/update")
     async def update_model(model_id: str) -> dict[str, Any]:
         try:
-            return await asyncio.to_thread(hub.model_registry.update, model_id)
+            current = _resolve_library_row("model", model_id)
+            async with _model_weight_mutation(str(current.get("path") or "")):
+                return await asyncio.to_thread(hub.model_registry.update, model_id)
         except KeyError as exc:
             raise HTTPException(404, f"unknown model '{model_id}'") from exc
         except ModelHubError as exc:
             raise HTTPException(400, str(exc)) from exc
 
-    @router.post("/api/models/{model_id}/download")
+    @router.post("/api/models/{model_id:path}/download")
     async def download_model(model_id: str) -> dict[str, Any]:
         return await update_model(model_id)
 
-    @router.post("/api/models/{model_id}/upload")
+    @router.post("/api/models/{model_id:path}/upload")
     async def upload_model(model_id: str) -> dict[str, Any]:
         try:
             return await asyncio.to_thread(hub.model_registry.upload, model_id)
@@ -1605,11 +1697,13 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         except ModelHubError as exc:
             raise HTTPException(400, str(exc)) from exc
 
-    @router.delete("/api/models/{model_id}")
+    @router.delete("/api/models/{model_id:path}")
     async def delete_model(model_id: str) -> dict[str, Any]:
         try:
-            await asyncio.to_thread(hub.model_registry.delete, model_id)
-            await asyncio.to_thread(hub.store.delete_library_override, "model", model_id)
+            current = _resolve_library_row("model", model_id)
+            async with _model_weight_mutation(str(current.get("path") or "")):
+                await asyncio.to_thread(hub.model_registry.delete, model_id)
+                await asyncio.to_thread(hub.store.delete_library_override, "model", model_id)
         except KeyError as exc:
             raise HTTPException(404, f"unknown model '{model_id}'") from exc
         return {"ok": True}
@@ -1777,6 +1871,10 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             "degraded": chunk.degraded,
             "fps": body.fps,
             "latency_ms": round(latency_ms, 3),
+            "cache_hit": chunk.cache_hit,
+            "model_wait_ms": round(chunk.model_wait_ms, 3),
+            "model_load_ms": round(chunk.model_load_ms, 3),
+            "compute_ms": round(chunk.compute_ms, 3),
             "actions": actions,
             "evaluation": evaluation,
             "warnings": chunk.warnings,

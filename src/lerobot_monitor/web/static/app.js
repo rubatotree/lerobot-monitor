@@ -67,7 +67,7 @@ const librarySearch = {
   ...loadJsonStorage(LIBRARY_SEARCH_KEY),
 };
 const LIBRARY_META_DEFAULTS = {
-  models: ["saved_at", "source", "repo_id", "policy_type"],
+  models: ["source", "policy_type", "resident_device", "gpu_memory"],
   datasets: ["saved_at", "source", "repo_id", "episodes", "fps", "task"],
   videos: ["saved_at", "source", "path", "episodes", "fps"],
   snapshots: ["saved_at", "origin", "cameras", "task"],
@@ -287,12 +287,12 @@ function exitReplayForControl() {
   if (episodeSource || replayActive || armReplay) closeEpisodeSelection();
 }
 
-function isSlowStopActive(mode, pending) {
-  return SLOW_STOP_MODES.has(mode) || SLOW_START_PENDING.has(pending);
+function isSlowStopActive(mode, pending, rolloutStopping = false) {
+  return SLOW_STOP_MODES.has(mode) || SLOW_START_PENDING.has(pending) || rolloutStopping;
 }
 
-function syncStopButton(mode, pending) {
-  const active = isSlowStopActive(mode, pending);
+function syncStopButton(mode, pending, rolloutStopping = false) {
+  const active = isSlowStopActive(mode, pending, rolloutStopping);
   if (!active) stopRequested = false;
   const button = $("btn-hdr-stop");
   if (!button) return;
@@ -304,14 +304,19 @@ function requestStop() {
   const mode = (last && last.mode) || "";
   if (mode === "record" && liveRecord) return recordControl("stop");
   const pending = last && last.task && last.task.pending;
+  const rolloutStopping = !!(last && last.rollout_stopping);
   if (stopRequested) {
     localLog("force stop requested", "error");
-    return api("/api/task/force_stop").catch(toastError);
+    return api("/api/task/force_stop").then((result) => {
+      stopRequested = false;
+      syncStopButton(mode, pending, rolloutStopping);
+      if (result.inference_stopping) localLog("control stopped; in-flight inference is still finishing");
+    }).catch(toastError);
   }
   if (replayActive || episodeSource) closeEpisodeSelection();
-  if (isSlowStopActive(mode, pending)) {
+  if (isSlowStopActive(mode, pending, rolloutStopping)) {
     stopRequested = true;
-    syncStopButton(mode, pending);
+    syncStopButton(mode, pending, rolloutStopping);
     localLog("stop requested — press Stop again to force");
   } else {
     localLog("stop requested");
@@ -3226,7 +3231,15 @@ function applyStatus(d) {
   setTaskButton("btn-hdr-teleop", mode === "teleop" || pending === "teleop_start", "teleop");
   setTaskButton("btn-hdr-record", mode === "record" || pending === "record_start", "record");
   setTaskButton("btn-hdr-rollout", mode === "rollout" || pending === "rollout_start", "rollout");
-  syncStopButton(mode, pending);
+  syncStopButton(mode, pending, !!d.rollout_stopping);
+  const cleanButton = $("btn-hdr-clean");
+  if (cleanButton) {
+    cleanButton.classList.toggle("pending", !!d.memory_cleaning);
+    cleanButton.setAttribute("aria-busy", String(!!d.memory_cleaning));
+    cleanButton.title = d.memory_cleaning
+      ? "Cleaning unused memory…"
+      : "Release unused policy memory and CUDA cache";
+  }
   ["btn-hdr-teleop", "btn-hdr-record", "btn-hdr-rollout", "btn-hdr-capture", "btn-hdr-relax"].forEach((id) => {
     const el = $(id);
     if (!el) return;
@@ -3301,6 +3314,7 @@ function applyStatus(d) {
   }
   if (!replayActive) syncLiveChartChrome(liveNowS);
   syncDatasetTransfers(d.dataset_transfers || []);
+  syncModelResidency(d.model_residency || {}, d.model_gpu_process || []);
   if (armReplay && (!robot.connected || mode === "estop")) {
     armReplay = false;
     syncArmToggle();
@@ -4462,6 +4476,7 @@ bind("btn-hdr-scan", () => runAction("btn-hdr-scan", "scan requested", async () 
   await refreshPorts();
   await refreshLibrary();
 }));
+bind("btn-hdr-clean", () => runAction("btn-hdr-clean", "memory clean requested", () => api("/api/memory/clean")));
 bind("btn-hdr-relax", () => {
   exitReplayForControl();
   return runAction("btn-hdr-relax", "relax requested", () => api("/api/joints/preset", { name: "relax", duration_s: 2.5 }));
@@ -4869,6 +4884,8 @@ const LIBRARY_META_LABELS = {
   repo_id: "Upstream",
   visibility: "New repo visibility",
   policy_type: "Policy",
+  resident_device: "Device",
+  gpu_memory: "GPU tensors",
   revision: "Revision",
   weights: "Weights",
   episodes: "Episodes",
@@ -4906,6 +4923,7 @@ function renderLibraryMetadata(li, kind, row) {
   visible.forEach(([key, value]) => {
     const line = document.createElement("div");
     line.className = "lib-meta-row";
+    line.dataset.key = key;
     const label = document.createElement("strong");
     label.textContent = LIBRARY_META_LABELS[key] || key;
     const text = document.createElement("span");
@@ -8406,6 +8424,258 @@ async function deleteEpisode(kind, sourceId, index) {
   finally { setEpisodeMutationPending(false); }
 }
 
+const MODEL_RESIDENCY_LABELS = {
+  unloaded: "Not loaded", queued: "Queued", loading: "Loading", ready: "Ready",
+  in_use: "In use", stopping: "Stopping", unloading: "Unloading", error: "Load failed",
+};
+
+const MODEL_LOAD_PHASES = {
+  queued: "Waiting for load slot", config: "Reading configuration", weights: "Loading weights",
+  device: "Moving to device", processors: "Preparing processors", ready: "Ready",
+};
+
+function modelResidencyOrEmpty(model) {
+  return model.residency || { state: "unloaded", instances: [], gpu_bytes: 0, can_unload: false };
+}
+
+function modelSettingsFor(mode, model) {
+  if (mode === "rollout") {
+    const fields = rolloutFields();
+    return { device: fields.device, extra: fields.extra };
+  }
+  if (mode === "debug") {
+    const fields = debugFields();
+    return { device: fields.device, extra: fields.extra };
+  }
+  return { device: model.default_device || "cuda", extra: {} };
+}
+
+function openModelLoadDialog(model) {
+  document.getElementById("model-load-dialog")?.remove();
+  const dialog = document.createElement("dialog");
+  dialog.id = "model-load-dialog";
+  dialog.className = "model-load-dialog";
+  const form = document.createElement("form");
+  form.method = "dialog";
+  const heading = document.createElement("h3");
+  heading.textContent = `Load ${libraryDisplayName("model", model)}`;
+  const sourceLabel = document.createElement("label");
+  sourceLabel.textContent = "Settings";
+  const source = document.createElement("select");
+  source.setAttribute("aria-label", "Model load settings source");
+  [["rollout", "Current Rollout"], ["debug", "Current Inference"], ["default", "Model defaults"]]
+    .forEach(([value, label]) => source.add(new Option(label, value)));
+  sourceLabel.appendChild(source);
+  const deviceLabel = document.createElement("label");
+  deviceLabel.textContent = "Device";
+  const device = document.createElement("input");
+  device.type = "text";
+  device.setAttribute("aria-label", "Model load device");
+  deviceLabel.appendChild(device);
+  const extraLabel = document.createElement("label");
+  extraLabel.textContent = "Model and inference settings (JSON)";
+  const extra = document.createElement("textarea");
+  extra.rows = 5;
+  extra.spellcheck = false;
+  extra.setAttribute("aria-label", "Model load settings JSON");
+  extraLabel.appendChild(extra);
+  const note = document.createElement("p");
+  const updateNote = () => {
+    let settings = {};
+    try { settings = JSON.parse(extra.value || "{}"); } catch (_) { /* Submit reports invalid JSON. */ }
+    const modelKeys = Object.keys(settings || {}).filter((rawKey) => {
+      const key = rawKey.replace(/^--/, "").replace(/^policy\./, "");
+      return !["task", "fps", "interpolation_multiplier", "control_rate"].includes(key)
+        && !["inference.", "robot.", "dataset.", "teleop.", "strategy.", "record."].some((prefix) => key.startsWith(prefix));
+    });
+    note.textContent = modelKeys.length
+      ? `Model overrides: ${modelKeys.join(", ")}. Different effective values create another instance; matching settings reuse the resident model.`
+      : "These settings only affect runtime behavior. A matching resident model on this device is reused without loading again.";
+  };
+  const actions = document.createElement("div");
+  actions.className = "model-load-actions";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => dialog.close());
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.textContent = "Load into memory";
+  actions.append(cancel, submit);
+  const sync = () => {
+    const settings = modelSettingsFor(source.value, model);
+    device.value = settings.device;
+    extra.value = JSON.stringify(settings.extra || {}, null, 2);
+    updateNote();
+  };
+  source.addEventListener("change", sync);
+  extra.addEventListener("input", updateNote);
+  device.addEventListener("input", updateNote);
+  sync();
+  form.append(heading, sourceLabel, deviceLabel, extraLabel, note, actions);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    let settings;
+    try {
+      settings = JSON.parse(extra.value || "{}");
+      if (!settings || Array.isArray(settings) || typeof settings !== "object") throw new Error("Settings must be a JSON object");
+      if (!device.value.trim()) throw new Error("Choose a device");
+    } catch (err) {
+      toastError(err);
+      return;
+    }
+    submit.disabled = true;
+    try {
+      await api(`/api/models/${encodeURIComponent(model.id)}/load`, { device: device.value.trim(), extra: settings });
+      dialog.close();
+      localLog(`model load requested: ${libraryDisplayName("model", model)}`);
+    } catch (err) {
+      toastError(err);
+      submit.disabled = false;
+    }
+  });
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  dialog.appendChild(form);
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  source.focus();
+}
+
+function renderModelResidency(host, model, processGpu = []) {
+  const status = modelResidencyOrEmpty(model);
+  const selected = isLibrarySelected("model", String(model.id));
+  const processSummary = selected
+    ? processGpu.map((item) => [item.device_index, Math.round(item.allocated_bytes / 1048576), Math.round(item.reserved_bytes / 1048576)])
+    : [];
+  const fingerprint = JSON.stringify([status, processSummary, selected]);
+  if (host.dataset.fingerprint === fingerprint) return;
+  const focusedAction = host.contains(document.activeElement) ? document.activeElement.dataset.residencyAction : "";
+  host.dataset.fingerprint = fingerprint;
+  const line = document.createElement("div");
+  line.className = "model-residency-line";
+  const badge = document.createElement("span");
+  badge.className = `model-residency-badge ${status.state}`;
+  badge.textContent = MODEL_RESIDENCY_LABELS[status.state] || status.state;
+  const memory = document.createElement("span");
+  memory.className = "model-residency-memory";
+  const devices = [...new Set((status.instances || []).map((item) => item.device))].join(", ");
+  const cpuResident = (status.instances || []).some((item) => item.device?.startsWith("cpu") && ["ready", "in_use", "stopping"].includes(item.state));
+  memory.textContent = status.gpu_bytes
+    ? `${fmtBytes(status.gpu_bytes)} GPU tensors${devices ? ` · ${devices}` : ""}`
+    : (cpuResident ? "CPU RAM resident" : (devices || ""));
+  memory.title = "Persistent model tensor storage; excludes temporary inference memory and CUDA context.";
+  const load = document.createElement("button");
+  load.type = "button";
+  load.dataset.residencyAction = "load";
+  load.textContent = status.state === "error" ? "Retry" : "Load";
+  load.disabled = !model.path || !model.playable;
+  load.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openModelLoadDialog(model);
+  });
+  const unload = document.createElement("button");
+  unload.type = "button";
+  unload.dataset.residencyAction = "unload";
+  unload.textContent = "Unload";
+  unload.disabled = !status.can_unload;
+  unload.title = unload.disabled && status.instances?.length ? "Stop inference or wait for loading to finish" : "Release this model's idle instances";
+  unload.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    unload.disabled = true;
+    try {
+      await api(`/api/models/${encodeURIComponent(model.id)}/unload`, {});
+    } catch (err) {
+      toastError(err);
+      unload.disabled = false;
+    }
+  });
+  line.append(badge, memory, load, unload);
+  const children = [line];
+  const working = (status.instances || []).find((item) => ["loading", "queued"].includes(item.state));
+  if (working) {
+    const progress = document.createElement("div");
+    progress.className = "model-residency-progress";
+    const bar = document.createElement("progress");
+    // Individual stages do not expose byte-level progress, so keep the bar
+    // indeterminate and report only stages that have actually completed.
+    bar.setAttribute("aria-label", "Model loading in progress");
+    const label = document.createElement("span");
+    label.textContent = `${MODEL_LOAD_PHASES[working.phase] || working.phase} · ${working.completed_steps}/${working.total_steps} stages`;
+    progress.append(bar, label);
+    children.push(progress);
+  }
+  const error = (status.instances || []).find((item) => item.error);
+  if (error) {
+    const message = document.createElement("div");
+    message.className = "model-residency-error";
+    message.textContent = error.error;
+    children.push(message);
+  }
+  if (isLibrarySelected("model", String(model.id)) && status.instances?.length) {
+    const details = document.createElement("div");
+    details.className = "model-residency-instances";
+    status.instances.forEach((item) => {
+      const row = document.createElement("div");
+      row.className = "model-residency-instance";
+      const summary = document.createElement("span");
+      const overrides = Object.entries(item.overrides || {}).map(([key, value]) => `${key}=${value}`).join(", ");
+      const memoryLabel = item.device?.startsWith("cpu") ? "CPU RAM resident" : fmtBytes(item.gpu_bytes);
+      summary.textContent = `${item.device} · ${MODEL_RESIDENCY_LABELS[item.state] || item.state} · ${memoryLabel}${overrides ? ` · ${overrides}` : " · model defaults"}`;
+      summary.title = summary.textContent;
+      row.appendChild(summary);
+      if (item.state === "ready" || item.state === "error") {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.dataset.residencyAction = `unload-${item.id}`;
+        remove.textContent = "Unload";
+        remove.setAttribute("aria-label", `Unload ${item.device} instance`);
+        remove.addEventListener("click", async (event) => {
+          event.stopPropagation();
+          remove.disabled = true;
+          try {
+            await api(`/api/models/${encodeURIComponent(model.id)}/unload`, { instance_id: item.id });
+          } catch (err) {
+            toastError(err);
+            remove.disabled = false;
+          }
+        });
+        row.appendChild(remove);
+      }
+      details.appendChild(row);
+    });
+    if (processGpu.length) {
+      const process = document.createElement("small");
+      process.textContent = processGpu.map((item) => `GPU ${item.device_index}: ${fmtBytes(item.allocated_bytes)} allocated / ${fmtBytes(item.reserved_bytes)} reserved by this process`).join(" · ");
+      details.appendChild(process);
+    }
+    children.push(details);
+  }
+  host.replaceChildren(...children);
+  if (focusedAction) host.querySelector(`[data-residency-action="${focusedAction}"]`)?.focus();
+}
+
+function syncModelResidency(statuses, processGpu = []) {
+  const visibleRows = new Map(
+    [...document.querySelectorAll("#md-list .library-item[data-model-id]")]
+      .map((row) => [row.dataset.modelId, row]),
+  );
+  modelsCache.forEach((model) => {
+    const status = statuses[model.path] || { state: "unloaded", instances: [], gpu_bytes: 0, can_unload: false };
+    model.residency = status;
+    model.metadata ||= {};
+    model.metadata.gpu_memory = status.gpu_bytes ? `${(status.gpu_bytes / 1048576).toFixed(1)} MiB` : "—";
+    model.metadata.resident_device = [...new Set(status.instances.map((item) => item.device))].join(", ") || "—";
+    const item = visibleRows.get(String(model.id));
+    if (!item) return;
+    ["gpu_memory", "resident_device"].forEach((key) => {
+      const value = item.querySelector(`.lib-meta-row[data-key="${key}"] span`);
+      if (value) value.textContent = model.metadata[key];
+    });
+    const host = item.querySelector(".model-residency");
+    if (host) renderModelResidency(host, model, processGpu);
+  });
+}
+
 function renderModels() {
   const ol = $("md-list");
   if (!ol) return;
@@ -8438,6 +8708,11 @@ function renderModels() {
       persistUi();
       renderModels();
     }, tools);
+    li.dataset.modelId = String(m.id);
+    const residency = document.createElement("div");
+    residency.className = "model-residency";
+    li.appendChild(residency);
+    renderModelResidency(residency, m, latestStatus?.model_gpu_process || []);
     ol.appendChild(li);
   });
   populateModelSelects();

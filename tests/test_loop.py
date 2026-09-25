@@ -1,6 +1,7 @@
 import io
 import logging
 import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -13,6 +14,7 @@ import pytest
 from lerobot_monitor import loop as loop_module
 from lerobot_monitor.config import CamerasConfig, LibraryConfig, MonitorConfig, RecordingConfig, RobotConfig
 from lerobot_monitor.loop import Command, ControlLoop
+from lerobot_monitor.policy_worker import PolicyWorker
 from lerobot_monitor.types import JOINT_ORDER
 
 
@@ -174,11 +176,139 @@ def test_rtc_changes_reuse_loaded_policy_but_model_changes_do_not(
         "inference.queue_threshold": "20",
     }
 
-    assert loop._get_or_load_policy("same", "cuda", "task", first_extra) is loaded
+    first_lease = loop.policy_residency.acquire("same", "cuda", first_extra)
+    assert first_lease.loaded is loaded
+    first_lease.release()
     assert loop._cached_policy("same", "cuda", changed_rtc) is loaded
-    assert loop._get_or_load_policy("same", "cuda", "task", changed_rtc) is loaded
+    next_lease = loop.policy_residency.acquire("same", "cuda", changed_rtc)
+    assert next_lease.loaded is loaded
+    next_lease.release()
     load.assert_called_once()
     assert loop._cached_policy("same", "cuda", {**changed_rtc, "policy.n_action_steps": "16"}) is None
+
+
+def test_sync_rollout_reuses_policy_after_async_worker_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = _loop(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    stopped = threading.Event()
+
+    class BlockingEngine:
+        def get_action(self, _observation: dict[str, object]) -> dict[str, float]:
+            started.set()
+            release.wait(2)
+            return {"gripper": 1.0}
+
+        def stop(self) -> None:
+            stopped.set()
+
+    loaded = SimpleNamespace(path="same", task="", policy=MagicMock(), reset=MagicMock())
+    loop.policy_residency.loader = lambda path, **kwargs: loaded
+    lease = loop.policy_residency.acquire("same", "cpu", {})
+    engine = BlockingEngine()
+    worker = PolicyWorker(engine, loop_module._POLICY_INFER_LOCK)
+    loop._inference_engine = engine
+    loop._inference_worker = worker
+    loop._active_policy_owner = loaded
+    loop._active_policy_lease = lease
+    assert worker.submit({}, {})
+    assert started.wait(2)
+
+    before = time.perf_counter()
+    loop._end_rollout()
+    assert time.perf_counter() - before < 0.2
+    assert loop._cached_policy("same", "cpu", {}) is None
+    assert loop.snapshot()["rollout_stopping"] is True
+
+    monkeypatch.setattr(loop_module, "load_policy", MagicMock(side_effect=AssertionError("reloaded")))
+    job = loop_module._PolicyLoadJob(generation=1, payload={})
+    loader = threading.Thread(target=loop._policy_worker, args=(job, "same", "cpu", "", {}), daemon=True)
+    loader.start()
+    assert loader.is_alive()
+
+    release.set()
+    loader.join(timeout=2)
+    assert not loader.is_alive()
+    assert stopped.is_set()
+    assert job.error is None
+    assert job.result is loaded
+    job.lease.release()
+    assert loop._cached_policy("same", "cpu", {}) is loaded
+    assert loop.snapshot()["rollout_stopping"] is False
+    assert loop.policy_residency.status("same")["instances"][0]["state"] == "ready"
+
+
+def test_memory_clean_evicts_cached_policies_and_releases_cuda_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    loop.policy_residency.loader = lambda path, **kwargs: SimpleNamespace(path=path, policy=None)
+    loop.policy_residency.acquire("model", "cuda", {}).release()
+    reserved = [12 * 1024 * 1024]
+
+    def empty_cache() -> None:
+        reserved[0] = 4 * 1024 * 1024
+
+    cuda = SimpleNamespace(
+        is_initialized=lambda: True,
+        device_count=lambda: 1,
+        memory_reserved=lambda _device: reserved[0],
+        empty_cache=empty_cache,
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    result = _dispatch(loop, "memory_clean")
+    assert result == {"ok": True, "accepted": True}
+    deadline = time.monotonic() + 2
+    while loop._memory_cleaning.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not loop._memory_cleaning.is_set()
+    assert loop.policy_residency.status("model")["state"] == "unloaded"
+    assert loop.snapshot()["memory_clean_result"]["policies_evicted"] == 1
+    assert loop.snapshot()["memory_clean_result"]["cuda_reserved_released_mb"] == 8
+
+
+def test_memory_clean_rejects_active_rollout(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "rollout"
+    loop.policy_residency.loader = lambda path, **kwargs: SimpleNamespace(path=path, policy=None)
+    loop.policy_residency.acquire("model", "cuda", {}).release()
+    with pytest.raises(RuntimeError, match="stop the active task"):
+        loop._handle(Command("memory_clean", {}))
+    assert loop.policy_residency.status("model")["state"] == "ready"
+
+
+def test_memory_clean_reports_pending_policy_load(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    loop.pending = "rollout_start"
+    with pytest.raises(RuntimeError, match="wait for rollout_start to finish or stop it"):
+        loop._handle(Command("memory_clean", {}))
+
+
+def test_memory_clean_blocks_new_rollout_without_leaving_pending_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    release = threading.Event()
+
+    def delayed_clean() -> None:
+        release.wait(2)
+        loop._memory_cleaning.clear()
+
+    monkeypatch.setattr(loop, "_clean_memory_worker", delayed_clean)
+    assert _dispatch(loop, "memory_clean")["accepted"] is True
+    try:
+        with pytest.raises(RuntimeError, match="wait for memory clean"):
+            loop.note_pending("rollout_start", "rollout requested")
+        with pytest.raises(RuntimeError, match="wait for memory clean"):
+            loop._handle(Command("rollout_start", {"policy_path": "model"}))
+        assert loop.pending is None
+    finally:
+        release.set()
 
 
 @pytest.mark.parametrize("kind", ["teleop_start", "record_start"])
@@ -482,7 +612,7 @@ def test_force_stop_detaches_engine_without_waiting(tmp_path: Path) -> None:
 
     result = _dispatch(loop, "force_stop")
 
-    assert result == {"ok": True, "stopped": "rollout"}
+    assert result == {"ok": True, "stopped": "rollout", "inference_stopping": False}
     assert loop._inference_engine is None
     assert loop.loaded_policy is None
     assert loop.mode == "idle"

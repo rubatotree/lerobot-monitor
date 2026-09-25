@@ -237,6 +237,8 @@ class PolicyResidencyManager:
                 raise PolicyBusyError("model weights are being updated or deleted")
             entry = self._entries.get(key)
             if entry is not None:
+                if entry.state == "unloading":
+                    raise PolicyBusyError("model instance is unloading; retry loading after it is released")
                 if entry.state == "error":
                     entry.state, entry.phase, entry.error = "queued", "queued", ""
                     entry.completed_steps = 0

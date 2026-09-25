@@ -108,6 +108,7 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
     )
     app = create_app(cfg)
     with TestClient(app) as client:
+        hub = app.state.hub
         assert client.get("/").status_code in (200, 307)
         res = client.get("/lerobot/api/status")
         assert res.status_code == 200
@@ -147,12 +148,25 @@ def test_status_without_hardware(tmp_path: Path, monkeypatch) -> None:
         assert b'id="split-preview"' in html
         assert b"info-roll" in html
         assert b"btn-hdr-scan" in html
+        assert html.index(b'btn-hdr-scan') < html.index(b'btn-hdr-clean') < html.index(b'btn-hdr-relax')
+        script = client.get("/lerobot/static/app.js").text
+        assert 'bind("btn-hdr-clean"' in script
+        assert "cleanButton.disabled" not in script
         assert b"btn-hdr-stop" in html
         assert b"btn-hdr-relax" in html
         assert b'id="btn-hdr-resume"' in html
         assert b"btn-hdr-capture" in html
         assert b"btn-hdr-auto" in html
         assert b'class="side-footer"' not in html
+
+        clean = client.post("/lerobot/api/memory/clean")
+        assert clean.status_code == 200, clean.text
+        assert clean.json()["accepted"] is True
+        deadline = time.monotonic() + 2
+        while hub.loop._memory_cleaning.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not hub.loop._memory_cleaning.is_set()
+
         assert b'id="btn-resume"' not in html
         assert b'id="btn-preset-dup"' in html
         assert b"rec-num" in html
@@ -665,6 +679,70 @@ def test_library_delete_model_keeps_registration_if_cache_removal_fails(tmp_path
         assert client.get("/lerobot/api/models").json()[0]["id"] == "registered-policy"
 
     assert app.state.hub.store.model("registered-policy") is not None
+
+
+def test_model_residency_api_load_reuse_busy_and_unload(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    model = tmp_path / "policy"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"type":"act","device":"cuda","input_features":{"observation.state":{"type":"STATE","shape":[6]}},'
+        '"output_features":{"action":{"type":"ACTION","shape":[6]}}}',
+        encoding="utf-8",
+    )
+    (model / "model.safetensors").write_bytes(b"weights")
+    JsonStore(tmp_path / "store.json").put_model({"id": "owner/policy", "name": "Policy", "path": str(model)})
+    app = create_app(_debug_config(tmp_path))
+    calls: list[str] = []
+
+    def fake_load(path: str, **kwargs: object) -> SimpleNamespace:
+        calls.append(path)
+        kwargs["progress"]("processors", 3)
+        return SimpleNamespace(path=path, policy=None, preprocessor=None, postprocessor=None, task="")
+
+    app.state.hub.policy_residency.loader = fake_load
+    with TestClient(app) as client:
+        before = client.get("/lerobot/api/models").json()[0]
+        assert before["residency"]["state"] == "unloaded"
+        first = client.post("/lerobot/api/models/owner/policy/load", json={"device": "cuda", "extra": {}})
+        second = client.post("/lerobot/api/models/owner/policy/load", json={"device": "cuda", "extra": {}})
+        assert first.status_code == second.status_code == 202
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            listed = client.get("/lerobot/api/models").json()[0]
+            if listed["residency"]["state"] == "ready":
+                break
+            time.sleep(0.01)
+        assert listed["residency"]["state"] == "ready"
+        assert len(calls) == 1
+        assert listed["metadata"]["resident_device"] == "cuda"
+        lease = app.state.hub.policy_residency.acquire_ready(str(model), "cuda", {})
+        assert lease is not None
+        try:
+            assert client.post("/lerobot/api/models/owner/policy/unload", json={}).status_code == 409
+            assert client.delete("/lerobot/api/library", params={"kind": "model", "id": "owner/policy"}).status_code == 409
+            renamed = client.put("/lerobot/api/models/owner/policy", json={"name": "Renamed"})
+            assert renamed.status_code == 200
+        finally:
+            lease.release()
+        assert client.post("/lerobot/api/models/owner/policy/unload", json={}).status_code == 202
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if client.get("/lerobot/api/models").json()[0]["residency"]["state"] == "unloaded":
+                break
+            time.sleep(0.01)
+        assert client.get("/lerobot/api/models").json()[0]["residency"]["state"] == "unloaded"
+        repeated = client.post("/lerobot/api/models/owner/policy/unload", json={})
+        assert repeated.status_code == 202 and repeated.json()["instances"] == 0
+        assert client.post("/lerobot/api/models/owner/policy/load", json={"device": "cuda"}).status_code == 202
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if app.state.hub.policy_residency.status(str(model))["state"] == "ready":
+                break
+            time.sleep(0.01)
+        deleted = client.delete("/lerobot/api/library", params={"kind": "model", "id": "owner/policy"})
+        assert deleted.status_code == 200
+        assert app.state.hub.policy_residency.status(str(model))["state"] == "unloaded"
 
 
 @pytest.mark.parametrize("winerror", [5, 32])
@@ -1329,6 +1407,10 @@ def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatc
             strategy="policy_chunk",
             degraded=False,
             warnings=[],
+            cache_hit=True,
+            model_wait_ms=0.8,
+            model_load_ms=0.0,
+            compute_ms=12.3,
         )
     )
 
@@ -1355,6 +1437,10 @@ def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatc
     assert body["strategy"] == "policy_chunk"
     assert body["degraded"] is False
     assert body["fps"] == 10.0
+    assert body["cache_hit"] is True
+    assert body["model_wait_ms"] == 0.8
+    assert body["model_load_ms"] == 0.0
+    assert body["compute_ms"] == 12.3
     assert [row["t_s"] for row in body["actions"]] == [0.1, 0.2]
     assert body["actions"][1]["joints"] == {"gripper": 2.0}
     assert body["source"]["id"] == "v1"

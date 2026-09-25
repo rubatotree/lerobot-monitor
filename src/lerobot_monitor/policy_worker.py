@@ -22,6 +22,7 @@ class PolicyWorker:
         self._requests: queue.Queue[tuple[dict[str, Any], dict[str, float]]] = queue.Queue(maxsize=1)
         self._results: queue.Queue[tuple[float, Any, str | None, list[dict[str, float]]]] = queue.Queue(maxsize=1)
         self._stop = threading.Event()
+        self.stopped = threading.Event()
         self._thread = threading.Thread(target=self._run, name="monitor-policy-inference", daemon=True)
         self._thread.start()
 
@@ -40,9 +41,10 @@ class PolicyWorker:
         except queue.Empty:
             return None
 
-    def stop_async(self) -> None:
+    def stop_async(self) -> threading.Event:
         self._stop.set()
         threading.Thread(target=self._finish, name="stop-monitor-policy", daemon=True).start()
+        return self.stopped
 
     def _finish(self) -> None:
         self._thread.join()
@@ -50,6 +52,8 @@ class PolicyWorker:
             self.engine.stop()
         except Exception:
             pass
+        finally:
+            self.stopped.set()
 
     def _run(self) -> None:
         while not self._stop.is_set():

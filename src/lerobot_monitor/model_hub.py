@@ -176,6 +176,7 @@ def describe_path(path: str) -> dict[str, Any]:
     return {
         "playable": is_policy_dir(root),
         "policy_type": str(config.get("type") or ""),
+        "default_device": str(config.get("device") or "cuda"),
         "mtime": int(root.stat().st_mtime),
         "missing": False,
     }
@@ -348,6 +349,7 @@ class ModelRegistry:
         )
         row["playable"] = facts["playable"]
         row["policy_type"] = row.get("policy_type") or facts["policy_type"]
+        row["default_device"] = facts.get("default_device") or "cuda"
         row["mtime"] = facts["mtime"]
         row["missing"] = facts["missing"]
         return row
@@ -367,6 +369,7 @@ def merge_models(scanned: list[dict[str, Any]], registered: list[dict[str, Any]]
             facts = describe_path(path)
             row["playable"] = facts["playable"]
             row["policy_type"] = row.get("policy_type") or facts["policy_type"]
+            row["default_device"] = facts.get("default_device") or "cuda"
             row["mtime"] = facts["mtime"]
             row["missing"] = facts["missing"]
         else:
@@ -388,5 +391,6 @@ def merge_models(scanned: list[dict[str, Any]], registered: list[dict[str, Any]]
         row = dict(entry)
         row["managed"] = False
         row["playable"] = True
+        row["default_device"] = str(policy_config(Path(path)).get("device") or "cuda")
         rows.append(row)
     return rows

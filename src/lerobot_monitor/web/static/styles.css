@@ -932,6 +932,35 @@ main.episodes-closed {
   overflow-wrap: anywhere;
 }
 .lib-description.empty { color: var(--faint); font-style: italic; }
+.model-residency {
+  padding: 7px 10px 9px;
+  border-top: 1px dashed var(--line);
+  color: var(--muted);
+  font-size: 10px;
+}
+.model-residency-line { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; min-width: 0; }
+.model-residency-badge { padding: 2px 5px; border-radius: 3px; background: var(--surface-2); color: var(--faint); white-space: nowrap; }
+.model-residency-badge.ready, .model-residency-badge.in_use { color: var(--accent); }
+.model-residency-badge.error { color: var(--err); }
+.model-residency-memory { flex: 1 1 80px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-residency button, .model-load-dialog button { min-height: 26px; padding: 3px 7px; font-size: 10px; }
+.model-residency-progress { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.model-residency-progress progress { flex: 1 1 auto; min-width: 0; height: 7px; accent-color: var(--accent); }
+.model-residency-progress span { flex: 0 0 auto; color: var(--faint); font-variant-numeric: tabular-nums; }
+.model-residency-error { margin-top: 6px; color: var(--err); overflow-wrap: anywhere; }
+.model-residency-instances { display: grid; gap: 3px; margin-top: 7px; }
+.model-residency-instance { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.model-residency-instance span { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-residency-instances small { color: var(--faint); line-height: 1.4; }
+.model-load-dialog { width: min(420px, calc(100vw - 24px)); max-height: min(640px, calc(100vh - 24px)); overflow: auto; border: 1px solid var(--line); background: var(--surface); color: var(--text); box-shadow: 0 16px 48px rgba(0, 0, 0, .45); }
+.model-load-dialog::backdrop { background: rgba(0, 0, 0, .6); }
+.model-load-dialog form { display: grid; gap: 10px; }
+.model-load-dialog h3 { margin: 0; font-size: 15px; }
+.model-load-dialog label { display: grid; gap: 4px; font-size: 11px; color: var(--muted); }
+.model-load-dialog select, .model-load-dialog input, .model-load-dialog textarea { width: 100%; min-width: 0; padding: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+.model-load-dialog textarea { resize: vertical; font-family: ui-monospace, monospace; font-size: 11px; }
+.model-load-dialog p { margin: 0; color: var(--faint); font-size: 11px; line-height: 1.45; }
+.model-load-actions { display: flex; justify-content: flex-end; gap: 6px; }
 .lib-progress {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

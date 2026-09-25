@@ -27,8 +27,10 @@ def test_slow_inference_does_not_block_submit_or_stop() -> None:
     assert started.wait(2)
     before = time.perf_counter()
     assert worker.latest() is None
-    worker.stop_async()
+    fully_stopped = worker.stop_async()
     assert time.perf_counter() - before < 0.2
+    assert not fully_stopped.is_set()
     release.set()
     assert stopped.wait(2)
+    assert fully_stopped.wait(2)
     assert worker.latest() is None

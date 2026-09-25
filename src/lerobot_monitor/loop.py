@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import gc
 import json
 import logging
 import math
@@ -34,6 +35,7 @@ from .policy import (
     predict_action_chunk,
 )
 from .policy_worker import PolicyWorker
+from .policy_residency import PolicyLease, PolicyResidencyManager
 from .recording_worker import RecordingWorker
 from .record_dataset import RecordDatasetSession, RecordSample, recover_record_publish
 from .robot import FollowerArm
@@ -59,12 +61,8 @@ _LOG_QUIET_PREFIXES = (
     "hf_xet",
     "datasets",
 )
-# Policy construction mutates process-global stdout, environment, and HF/torch
-# caches. Serializing only output capture still lets two loaders corrupt those
-# globals, including when separate ControlLoop instances exist in one process.
-_POLICY_LOAD_LOCK = threading.Lock()
-# Inference can retain policy state and mutate process-global torch/HF state just
-# like loading. The order is always inference -> load to avoid a lock inversion.
+# Inference operations sharing one process still serialize mutable policy state;
+# cold construction has its own lock in PolicyResidencyManager.
 _POLICY_INFER_LOCK = threading.Lock()
 _UI_LOG_LOCK = threading.Lock()
 _UI_LOG_HANDLERS: set[logging.Handler] = set()
@@ -170,6 +168,7 @@ class _PolicyLoadJob:
     thread: threading.Thread | None = None
     result: LoadedPolicy | None = None
     error: str | None = None
+    lease: PolicyLease | None = None
 
 
 class ControlLoop:
@@ -181,6 +180,7 @@ class ControlLoop:
         leader: LeaderArm,
         on_snapshot: Callable[[dict[str, Any]], None] | None = None,
         store: JsonStore | None = None,
+        policy_residency: PolicyResidencyManager | None = None,
     ) -> None:
         self.config = config
         self.cameras = cameras
@@ -188,6 +188,11 @@ class ControlLoop:
         self.leader = leader
         self.on_snapshot = on_snapshot
         self.store = store
+        self.policy_residency = policy_residency or PolicyResidencyManager(
+            lambda path, **kwargs: load_policy(path, **kwargs),
+            robot_type=config.robot.type,
+            rename_map=config.rollout.rename_map,
+        )
 
         self.mode = "offline"
         self.hold_when_idle = config.control.hold_when_idle
@@ -260,6 +265,7 @@ class ControlLoop:
         self._inference_engine: Any | None = None
         self._inference_worker: PolicyWorker | None = None
         self._active_policy_owner: LoadedPolicy | None = None
+        self._active_policy_lease: PolicyLease | None = None
         self._rollout_from: dict[str, float] | None = None
         self._rollout_goal: dict[str, float] | None = None
         self._rollout_segment_t = 0.0
@@ -270,7 +276,8 @@ class ControlLoop:
         self._rollout_hw_feature_spec: dict = {}
         self._next_prediction_t = 0.0
         self._prediction_interval = 0.5
-        self._policy_cache: dict[tuple[Any, ...], LoadedPolicy] = {}
+        self._memory_cleaning = threading.Event()
+        self._memory_clean_result: dict[str, int] | None = None
         self._debug_lease_token: str | None = None
         self._policy_generation = 0
         self._policy_job: _PolicyLoadJob | None = None
@@ -777,34 +784,46 @@ class ControlLoop:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             yield
 
-    def _policy_key(self, path: str, device: str, extra: dict[str, str]) -> tuple[Any, ...]:
-        # Inference settings configure each engine, not the model weights held in this cache.
-        model_extra = tuple(
-            sorted((key, value) for key, value in extra.items() if not key.removeprefix("--").startswith("inference."))
-        )
-        return (path, device, model_extra)
-
-    def _get_or_load_policy(self, path: str, device: str, task: str, extra: dict[str, str]) -> LoadedPolicy:
-        with _POLICY_LOAD_LOCK:
-            key = self._policy_key(path, device, extra)
-            cached = self._policy_cache.get(key)
-            if cached is not None:
-                cached.task = task or cached.task
-                return cached
-            loaded = load_policy(
-                path,
-                device=device,
-                task=task,
-                robot_type=self.config.robot.type,
-                rename_map=self.config.rollout.rename_map,
-                extra=extra,
-            )
-            self._policy_cache[key] = loaded
-            return loaded
-
     def _cached_policy(self, path: str, device: str, extra: dict[str, str]) -> LoadedPolicy | None:
-        with _POLICY_LOAD_LOCK:
-            return self._policy_cache.get(self._policy_key(path, device, extra))
+        return self.policy_residency.ready(path, device, extra)
+
+    def _clean_memory_worker(self) -> None:
+        try:
+            torch_module = sys.modules.get("torch")
+            cuda = getattr(torch_module, "cuda", None)
+            cuda_ready = bool(cuda is not None and cuda.is_initialized())
+            reserved_before = (
+                sum(cuda.memory_reserved(device) for device in range(cuda.device_count()))
+                if cuda_ready
+                else 0
+            )
+            evicted = self.policy_residency.clear_all()
+            collected = gc.collect()
+            if cuda_ready:
+                cuda.empty_cache()
+            reserved_after = (
+                sum(cuda.memory_reserved(device) for device in range(cuda.device_count()))
+                if cuda_ready
+                else 0
+            )
+            released_mb = max(0, (reserved_before - reserved_after) // (1024 * 1024))
+            self._memory_clean_result = {
+                "policies_evicted": evicted,
+                "objects_collected": collected,
+                "cuda_reserved_released_mb": released_mb,
+            }
+            self.log(
+                "info",
+                f"memory clean complete: {evicted} policies evicted, "
+                f"{collected} objects collected, {released_mb} MiB CUDA cache released",
+            )
+        except Exception as exc:  # noqa: BLE001 - report cleanup failures without stopping control
+            self.last_error = f"memory clean failed: {type(exc).__name__}: {exc}"
+            self.log("error", self.last_error)
+        finally:
+            self._memory_cleaning.clear()
+            if self.on_snapshot is not None:
+                self.on_snapshot(self.snapshot())
 
     def infer_action_chunk(
         self,
@@ -818,9 +837,23 @@ class ControlLoop:
         chunk_size: int,
     ) -> ActionChunk:
         """Load or reuse a policy and infer without touching the follower bus."""
-        with _POLICY_INFER_LOCK, self._capture_task_output():
-            loaded = self._get_or_load_policy(path, device, task, extra)
-            return predict_action_chunk(loaded, joints, images_rgb, chunk_size)
+        wait_started = time.perf_counter()
+        lease = self.policy_residency.acquire(path, device, extra)
+        model_wait_ms = (time.perf_counter() - wait_started) * 1000.0
+        try:
+            assert lease.loaded is not None
+            lease.loaded.task = task
+            with _POLICY_INFER_LOCK:
+                compute_started = time.perf_counter()
+                result = predict_action_chunk(lease.loaded, joints, images_rgb, chunk_size)
+                compute_ms = (time.perf_counter() - compute_started) * 1000.0
+            result.cache_hit = lease.cache_hit
+            result.model_wait_ms = model_wait_ms
+            result.model_load_ms = 0.0 if lease.cache_hit else float(lease.entry.load_ms or 0.0)
+            result.compute_ms = compute_ms
+            return result
+        finally:
+            lease.release()
 
     def _invalidate_policy_load(self, *, blocking: bool = True) -> bool:
         """Permanently detach the current loader without waiting for its thread."""
@@ -829,6 +862,8 @@ class ControlLoop:
             return False
         try:
             self._policy_generation += 1
+            if self._policy_job is not None and self._policy_job.lease is not None:
+                self._policy_job.lease.release()
             self._policy_job = None
         finally:
             self._policy_job_lock.release()
@@ -839,6 +874,8 @@ class ControlLoop:
         self._cancel.set()
         with self._policy_job_lock:
             self._policy_generation += 1
+            if self._policy_job is not None and self._policy_job.lease is not None:
+                self._policy_job.lease.release()
             self._policy_job = None
 
     def _policy_worker(
@@ -850,19 +887,34 @@ class ControlLoop:
         extra: dict[str, str],
     ) -> None:
         try:
-            with _POLICY_INFER_LOCK, self._capture_task_output():
-                loaded = self._get_or_load_policy(path, device, task, extra)
-            job.result = loaded
+            lease = self.policy_residency.acquire(path, device, extra)
+            with self._policy_job_lock:
+                generation_stale = self._policy_generation != 0 and job.generation != self._policy_generation
+                replaced = self._policy_job is not None and self._policy_job is not job
+                if generation_stale or replaced:
+                    lease.release()
+                    return
+            job.lease = lease
+            job.result = lease.loaded
+            if lease.cache_hit:
+                self.log("info", f"policy {path}: reused resident model")
+            elif lease.entry.load_ms is not None:
+                self.log("info", f"policy {path}: model ready in {lease.entry.load_ms / 1000:.1f}s")
         except Exception as exc:  # noqa: BLE001
             job.error = str(exc)
 
-    def _begin_rollout(self, loaded: LoadedPolicy, payload: dict[str, Any], path: str) -> bool:
+    def _begin_rollout(
+        self, loaded: LoadedPolicy, payload: dict[str, Any], path: str, lease: PolicyLease | None = None
+    ) -> bool:
         start_token = self._start_token(payload)
         if self._start_cancelled(start_token):
+            if lease is not None:
+                lease.release()
             self.pending = None
             self.log("info", "rollout cancelled")
             return False
         self._end_rollout()
+        self._active_policy_lease = lease
         loaded.reset()
         loaded.task = str(payload.get("task") or loaded.task)
         self.loaded_policy = loaded
@@ -900,12 +952,18 @@ class ControlLoop:
                 self._task_rate_mode = "rollout" if task_rate is not None else None
                 self._task_rate = task_rate
         if cancelled:
+            if self._active_policy_lease is not None:
+                self._active_policy_lease.release()
+                self._active_policy_lease = None
             if recorder is not None:
                 recorder.close()
             self.pending = None
             self.log("info", "rollout cancelled")
             return False
         if not self._start_inference_engine(loaded):
+            if self._active_policy_lease is not None:
+                self._active_policy_lease.release()
+                self._active_policy_lease = None
             return False
         self._touch_bus()
         self.log("info", f"rollout started ({loaded.policy.__class__.__name__})")
@@ -917,27 +975,44 @@ class ControlLoop:
             if job is None or job.thread is None or job.thread.is_alive():
                 return
             if job.generation != self._policy_generation:
+                if job.lease is not None:
+                    job.lease.release()
                 self._policy_job = None
                 return
             self._policy_job = None
         if self._cancel.is_set() or self._estop.is_set():
+            if job.lease is not None:
+                job.lease.release()
             self.pending = None
             self.log("info", "rollout cancelled")
             return
         if job.error:
+            if job.lease is not None:
+                job.lease.release()
             self.pending = None
             self.last_error = job.error
             self.log("error", f"policy load failed: {job.error}")
             return
         if job.result is None:
+            if job.lease is not None:
+                job.lease.release()
             self.pending = None
             return
         path = str(job.payload.get("policy_path") or "")
-        self._begin_rollout(job.result, job.payload, path)
+        try:
+            self._begin_rollout(job.result, job.payload, path, job.lease)
+        except BaseException:
+            self.loaded_policy = None
+            self._end_rollout()
+            if job.lease is not None:
+                job.lease.release()
+            raise
 
     def note_pending(self, kind: str, message: str) -> int:
         """Log and mark a task requested before the control thread picks it up."""
         with self._start_lock:
+            if self._memory_cleaning.is_set():
+                raise RuntimeError("wait for memory clean to finish before starting control")
             self._start_generation += 1
             token = self._start_generation
             self._cancel.clear()
@@ -991,6 +1066,13 @@ class ControlLoop:
             "playback": self._playback_snapshot(),
             "rollout_inference_ms": self._rollout_infer_ms if self.mode == "rollout" else None,
             "rollout_waiting": self._rollout_waiting if self.mode == "rollout" else False,
+            "rollout_stopping": any(
+                item["state"] == "stopping"
+                for status in self.policy_residency.all_statuses().values()
+                for item in status["instances"]
+            ),
+            "memory_cleaning": self._memory_cleaning.is_set(),
+            "memory_clean_result": self._memory_clean_result,
             "robot": self.follower.snapshot(),
             "leader": self.leader.snapshot(),
             "cameras": self.cameras.snapshots(),
@@ -1623,7 +1705,28 @@ class ControlLoop:
     def _handle(self, cmd: Command) -> None:
         kind = cmd.kind
         p = cmd.payload
-        if kind == "playback_start":
+        if self._memory_cleaning.is_set() and kind in {
+            "playback_start", "debug_lease_acquire", "jog", "preset", "resume",
+            "teleop_start", "record_start", "rollout_start", "capture_start",
+        }:
+            raise RuntimeError("wait for memory clean to finish before starting control")
+        if kind == "memory_clean":
+            with self._start_lock:
+                if self._memory_cleaning.is_set():
+                    raise RuntimeError("memory clean is already running")
+                if self.pending is not None:
+                    raise RuntimeError(f"wait for {self.pending} to finish or stop it before cleaning memory")
+                if self.mode not in {"idle", "offline", "estop"}:
+                    raise RuntimeError("stop the active task before cleaning memory")
+                if self.policy_residency.has_active_inference():
+                    raise RuntimeError("wait for the previous inference worker to stop before cleaning memory")
+                self._require_no_debug_lease("clean memory")
+                self._memory_clean_result = None
+                self._memory_cleaning.set()
+            self.log("info", "memory clean started")
+            threading.Thread(target=self._clean_memory_worker, name="clean-monitor-memory", daemon=True).start()
+            self._reply(cmd, ok=True, accepted=True)
+        elif kind == "playback_start":
             self._require_no_debug_lease("start playback")
             self._require_follower_connected("start playback")
             if self.mode not in {"idle", "playback"} or self.pending:
@@ -2025,9 +2128,17 @@ class ControlLoop:
                 self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
         elif kind == "force_stop":
             stopped = self.mode
+            worker = self._inference_worker
             self._force_abort_active_task()
             self.log("info", f"force stop completed ({stopped})")
-            self._reply(cmd, ok=True, stopped=stopped)
+            inference_stopping = (
+                isinstance(worker, PolicyWorker) and not worker.stopped.is_set()
+            ) or any(
+                item["state"] == "stopping"
+                for status in self.policy_residency.all_statuses().values()
+                for item in status["instances"]
+            )
+            self._reply(cmd, ok=True, stopped=stopped, inference_stopping=inference_stopping)
         elif kind == "resume":
             self._require_no_debug_lease("resume")
             self._clear_live_control()
@@ -2257,13 +2368,19 @@ class ControlLoop:
             self.rollout_extra = {str(k): str(v) for k, v in extra.items() if str(k).strip()}
             device = str(p.get("device") or self.config.rollout.device)
             task = str(p.get("task") or "")
-            cached = self._cached_policy(path, device, self.rollout_extra)
-            if cached is not None:
+            lease = self.policy_residency.acquire_ready(path, device, self.rollout_extra)
+            if lease is not None and lease.loaded is not None:
                 self.log("info", f"using cached policy {path}")
                 with self._policy_job_lock:
                     self._policy_generation += 1
                     self._policy_job = None
-                started = self._begin_rollout(cached, p, path)
+                try:
+                    started = self._begin_rollout(lease.loaded, p, path, lease)
+                except BaseException:
+                    self.loaded_policy = None
+                    self._end_rollout()
+                    lease.release()
+                    raise
                 self._reply(
                     cmd,
                     ok=True,
@@ -2390,6 +2507,7 @@ class ControlLoop:
             elif self.mode in {"rollout", "record", "teleop", "playback"}:
                 if self.mode == "rollout":
                     self._end_rollout()
+                    self.loaded_policy = None
                 elif self.mode == "playback":
                     self._end_playback()
                 self._close_writer()
@@ -2417,37 +2535,12 @@ class ControlLoop:
         self._end_playback()
         self.pending = None
         self._invalidate_policy_load()
-        engine = self._inference_engine
-        worker = self._inference_worker
-        owner = self._active_policy_owner
-        self._inference_worker = None
-        self._active_policy_owner = None
-        self._inference_engine = None
-        self._rollout_hw_feature_spec = {}
-        self._clear_rollout_prediction()
-        if worker is not None:
-            worker.stop_async()
-            if owner is not None:
-                self._policy_cache = {key: cached for key, cached in self._policy_cache.items() if cached is not owner}
-        elif engine is not None:
-            threading.Thread(
-                target=self._stop_inference_engine_safely,
-                args=(engine,),
-                daemon=True,
-                name="force-stop-inference",
-            ).start()
+        self._end_rollout()
         self.loaded_policy = None
         self._close_writer()
         self._slew_goal = None
         self._pending_release = None
         self.mode = "idle" if self.follower.connected else "offline"
-
-    @staticmethod
-    def _stop_inference_engine_safely(engine: Any) -> None:
-        try:
-            engine.stop()
-        except Exception:
-            pass
 
     def _tick_jog(self) -> None:
         if not self._output_due:
@@ -2588,6 +2681,7 @@ class ControlLoop:
     def _tick_rollout(self) -> None:
         if self._cancel.is_set() or self.loaded_policy is None:
             self._end_rollout()
+            self.loaded_policy = None
             self.mode = "idle"
             return
         now = time.perf_counter()
@@ -2740,7 +2834,6 @@ class ControlLoop:
 
     def _start_inference_engine(self, loaded: LoadedPolicy) -> bool:
         """Build and start LeRobot's sync or RTC inference engine."""
-        self._end_rollout()
         try:
             config = inference_config_from_extra(self.rollout_extra)
             rtc = getattr(config, "rtc", None)
@@ -2757,6 +2850,7 @@ class ControlLoop:
                 task=loaded.task,
                 fps=self.effective_policy_fps,
             )
+            self._inference_engine = engine
             engine.reset()
             engine.start()
             engine.resume()
@@ -2764,11 +2858,11 @@ class ControlLoop:
             self.last_error = f"{type(exc).__name__}: {exc}"
             self.log("error", f"inference engine setup failed: {self.last_error}")
             self.log("error", traceback.format_exc())
+            self._end_rollout()
             self._close_writer()
             self.loaded_policy = None
             self.mode = "idle" if self.follower.connected else "offline"
             return False
-        self._inference_engine = engine
         self._active_policy_owner = loaded
         if getattr(config, "type", "") == "sync":
             self._inference_worker = PolicyWorker(
@@ -2784,9 +2878,10 @@ class ControlLoop:
         """Stop background inference and clear chart state for the current rollout."""
         engine = self._inference_engine
         worker = self._inference_worker
-        owner = self._active_policy_owner
+        lease = self._active_policy_lease
         self._inference_worker = None
         self._active_policy_owner = None
+        self._active_policy_lease = None
         self._inference_engine = None
         self._rollout_hw_feature_spec = {}
         self._rollout_from = None
@@ -2794,13 +2889,26 @@ class ControlLoop:
         self._rollout_waiting = False
         self._rollout_last_action_t = 0.0
         if isinstance(worker, PolicyWorker):
-            worker.stop_async()
-            if owner is not None:
-                self._policy_cache = {
-                    key: cached for key, cached in self._policy_cache.items() if cached is not owner
-                }
+            stopped = worker.stop_async()
+            if lease is not None:
+                lease.retire(stopped)
         elif engine is not None:
-            engine.stop()
+            stopped = threading.Event()
+
+            def finish_engine() -> None:
+                try:
+                    while engine.stop() is False:
+                        time.sleep(0.05)
+                except Exception as exc:  # noqa: BLE001 - retain ownership if stop is unconfirmed
+                    self.log("error", f"inference engine stop failed: {exc}")
+                else:
+                    stopped.set()
+
+            threading.Thread(target=finish_engine, name="stop-monitor-rtc", daemon=True).start()
+            if lease is not None:
+                lease.retire(stopped)
+        elif lease is not None:
+            lease.release()
         self._clear_rollout_prediction()
 
     def _clear_rollout_prediction(self) -> None:

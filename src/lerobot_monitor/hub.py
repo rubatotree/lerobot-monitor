@@ -14,6 +14,8 @@ from .leader import LeaderArm
 from .library import VideoLibrary
 from .loop import ControlLoop
 from .model_hub import ModelRegistry
+from .policy import load_policy
+from .policy_residency import PolicyResidencyManager
 from .robot import FollowerArm
 from .robot_models import RobotModelRegistry
 from .runtime import format_runtime, probe_runtime
@@ -53,6 +55,11 @@ class RuntimeHub:
         self._snapshot: dict[str, Any] = {}
         self._lock = threading.Lock()
         self.runtime = probe_runtime()
+        self.policy_residency = PolicyResidencyManager(
+            load_policy,
+            robot_type=config.robot.type,
+            rename_map=config.rollout.rename_map,
+        )
         self.loop = ControlLoop(
             config,
             self.cameras,
@@ -60,6 +67,7 @@ class RuntimeHub:
             self.leader,
             on_snapshot=self._store_snapshot,
             store=self.store,
+            policy_residency=self.policy_residency,
         )
 
     def _store_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -105,6 +113,8 @@ class RuntimeHub:
             raise
         else:
             self.cameras.stop()
+        finally:
+            self.policy_residency.close()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -115,6 +125,8 @@ class RuntimeHub:
         data["runtime"] = dict(self.runtime)
         data["runtime_label"] = format_runtime(self.runtime)
         data["dataset_transfers"] = self.dataset_transfers()
+        data["model_residency"] = self.policy_residency.all_statuses()
+        data["model_gpu_process"] = self.policy_residency.process_gpu_memory()
         return data
 
     def dataset_transfers(self) -> list[dict[str, Any]]:
@@ -193,4 +205,7 @@ class RuntimeHub:
         return self.dataset_registry.get(repo_id)
 
     def models(self) -> list[dict[str, Any]]:
-        return self.model_registry.list()
+        return [
+            {**row, "residency": self.policy_residency.status(str(row.get("path") or ""))}
+            for row in self.model_registry.list()
+        ]

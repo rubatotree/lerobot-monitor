@@ -9,6 +9,7 @@ def _hub_without_runtime_setup() -> RuntimeHub:
     hub = object.__new__(RuntimeHub)
     hub.loop = MagicMock()
     hub.cameras = MagicMock()
+    hub.policy_residency = MagicMock()
     return hub
 
 
@@ -23,6 +24,7 @@ def test_stop_always_stops_cameras_and_preserves_loop_error() -> None:
     assert raised.value is loop_error
     hub.loop.stop.assert_called_once_with()
     hub.cameras.stop.assert_called_once_with()
+    hub.policy_residency.close.assert_called_once_with()
 
 
 def test_stop_keeps_loop_error_if_camera_shutdown_also_fails() -> None:
@@ -37,6 +39,7 @@ def test_stop_keeps_loop_error_if_camera_shutdown_also_fails() -> None:
     assert raised.value is loop_error
     assert any("camera shutdown also failed" in note for note in loop_error.__notes__)
     hub.cameras.stop.assert_called_once_with()
+    hub.policy_residency.close.assert_called_once_with()
 
 
 def test_hardware_restore_queues_only_explicit_active_preset() -> None:

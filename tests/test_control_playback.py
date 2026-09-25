@@ -105,6 +105,27 @@ def test_live_rate_changes_do_not_change_playback_clock(tmp_path: Path, monkeypa
     assert loop._playback_elapsed(100.25) == before
 
 
+def test_slow_playback_changes_effective_source_rate_only(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "idle"
+    trajectory = JointTrajectory((0.0, 1.0), ({"gripper": 0.0}, {"gripper": 20.0}), 15.0)
+    started = _dispatch(loop, "playback_start", {
+        "kind": "video", "source_id": "demo", "episode": 0,
+        "source": "command", "trajectory": trajectory, "speed": 0.5,
+    })["playback"]
+    _dispatch(loop, "control_rates", {"mode": "playback", "setting": {"kind": "multiplier", "value": 4}})
+    assert started["source_hz"] == 15.0
+    assert started["effective_source_hz"] == 7.5
+    assert loop._control_hz() == 60.0
+
+    changed = _dispatch(loop, "playback_control", {
+        "id": started["id"], "version": started["version"],
+        "operation": "speed", "speed": 2.0,
+    })["playback"]
+    assert changed["effective_source_hz"] == 30.0
+    assert loop._control_hz() == 60.0
+
+
 def test_dataset_fps_cannot_be_used_as_record_control_multiplier(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
     with pytest.raises(ValueError, match="no stable action source"):

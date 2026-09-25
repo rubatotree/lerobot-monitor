@@ -397,6 +397,9 @@ class ControlLoop:
             "elapsed_s": round(elapsed, 4),
             "duration_s": trajectory.duration_s,
             "source_hz": trajectory.source_hz,
+            "effective_source_hz": (
+                trajectory.source_hz * state["speed"] if trajectory.source_hz is not None else None
+            ),
             "playing": state["playing"],
             "aligning": state["aligning"],
         }

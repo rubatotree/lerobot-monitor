@@ -2826,10 +2826,13 @@ function updateRateDisplay(d) {
   if (!details?.open && $("rate-trace")) $("rate-trace").checked = !!rates.trace;
   if (!details?.open) syncRateEditor(rates);
   const events = (d.run_events || []).slice(-3).map((event) => event.type).join(", ");
+  const sourceDetail = rates.mode === "playback" && d.playback?.effective_source_hz
+    ? `source ${rates.source_hz} Hz · effective ${Number(d.playback.effective_source_hz).toFixed(1)} Hz`
+    : `source ${rates.source_hz || "—"} Hz`;
   const rateDetail = $("rate-detail");
   if (rateDetail) rateDetail.textContent = [
     `${rates.mode || "joints"} · ${rates.source || "global"}`,
-    `source ${rates.source_hz || "—"} Hz · read ${cadence.read_hz || 0} Hz`,
+    `${sourceDetail} · read ${cadence.read_hz || 0} Hz`,
     `P95 ${cadence.interval_p95_ms ?? "—"} ms · max ${cadence.interval_max_ms ?? "—"} ms`,
     `missed ${cadence.missed_slots || 0} · holds ${cadence.hold_sends || 0}`,
     rates.policy_hz ? `policy ${rates.policy_hz} Hz · inference ${d.rollout_inference_ms?.toFixed(1) || "—"} ms${d.rollout_waiting ? " · waiting" : ""}` : "",
@@ -2856,8 +2859,13 @@ function updateRateDisplay(d) {
   });
   const replayRate = $("playback-rate");
   if (replayRate) {
-    const sourceHz = d.playback?.source_hz || vizState.sourceHz || "—";
-    replayRate.textContent = `Source ${sourceHz} Hz · Arm ${rates.mode === "playback" ? target.toFixed(1) : "—"} Hz · ${vizState.speed}× speed`;
+    const sourceHz = Number(d.playback?.source_hz || vizState.sourceHz);
+    const speed = Number(d.playback?.speed ?? vizState.speed) || 1;
+    const effectiveSourceHz = Number(d.playback?.effective_source_hz || sourceHz * speed);
+    const sourceLabel = Number.isFinite(sourceHz) && sourceHz > 0
+      ? `Source ${sourceHz.toFixed(1)} Hz · effective ${effectiveSourceHz.toFixed(1)} Hz @${speed}×`
+      : "Source — Hz";
+    replayRate.textContent = `${sourceLabel} · Arm ${rates.mode === "playback" ? target.toFixed(1) : "—"} Hz`;
   }
 }
 

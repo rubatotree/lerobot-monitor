@@ -94,6 +94,9 @@ let replayScrubPointerId = null;
 let armReplay = false;
 let playbackSession = null;
 let playbackRequest = Promise.resolve();
+let playbackTransition = Promise.resolve();
+let playbackIntent = 0;
+let playbackStartStatusTs = 0;
 let playbackHeartbeat = 0;
 let playbackStoppingId = null;
 let episodeRequestGeneration = 0;
@@ -2146,7 +2149,8 @@ function syncJointControls() {
   const outputReady = jointSerialOutputReady();
   if (sendButton) sendButton.disabled = !outputReady;
   if (controlButton) {
-    controlButton.disabled = !outputReady;
+    controlButton.disabled = !outputReady
+      && !(jointControlEnabled && replayActive && (armReplay || jointAutoSyncEnabled));
     controlButton.classList.toggle("on", jointControlEnabled);
     controlButton.setAttribute("aria-pressed", String(jointControlEnabled));
   }
@@ -2167,6 +2171,8 @@ function syncJointControls() {
   } else if (jointSyncSource === "leader") {
     if (!leader.connected) status += " · leader required";
     else status += jointHardwareEnabled() ? " · relay" : " · read only";
+  } else if (jointSyncSource === "state" || jointSyncSource === "command" || jointSyncSource === "prediction") {
+    status += armReplay ? " · arm playback" : jointHardwareEnabled() ? " · arm output" : " · UI only";
   } else {
     status += " · read only";
   }
@@ -2221,9 +2227,16 @@ function applyJointUi(config) {
 function setJointSyncSource(value) {
   if (!JOINT_SYNC_SOURCES.has(value)) return;
   jointSyncSource = value;
-  if (armReplay && replayActive) {
+  if (replayActive && (armReplay || (jointControlEnabled && jointAutoSyncEnabled))) {
     if (value === "state" || value === "command") {
-      stopBackendPlayback().then(() => startBackendPlayback(value)).catch(toastError);
+      const stopped = stopBackendPlayback();
+      const sourceIntent = playbackIntent;
+      stopped.then(() => {
+        if (sourceIntent === playbackIntent && replayActive && jointSyncSource === value) {
+          return startBackendPlayback(value);
+        }
+        return undefined;
+      }).catch(toastError);
     } else {
       stopBackendPlayback().catch(toastError);
     }
@@ -2271,10 +2284,18 @@ function sendCurrentCommandOnce() {
 }
 
 function toggleJointControl() {
-  if (!jointSerialOutputReady()) return;
+  if (!jointSerialOutputReady()
+      && !(jointControlEnabled && replayActive && (armReplay || jointAutoSyncEnabled))) return;
   jointControlEnabled = !jointControlEnabled;
   syncJointControls();
-  if (jointControlEnabled) sendCurrentCommandOnce();
+  if (!jointControlEnabled && replayActive && (armReplay || jointAutoSyncEnabled)) {
+    stopBackendPlayback().catch(toastError);
+  } else if (jointControlEnabled && jointAutoSyncEnabled && replayActive && vizState.previewReady
+      && (jointSyncSource === "state" || jointSyncSource === "command")) {
+    startBackendPlayback(jointSyncSource).catch(toastError);
+  } else if (jointControlEnabled) {
+    sendCurrentCommandOnce();
+  }
 }
 
 async function setJointSerial(enabled) {
@@ -2855,6 +2876,7 @@ function syncRateEditor(rates = (last && last.rates) || {}) {
 function syncBackendPlayback(d) {
   const state = d.playback;
   if (!state) {
+    if (playbackSession && Number(d.ts) <= playbackStartStatusTs) return;
     if (playbackSession) {
       playbackSession = null;
       armReplay = false;
@@ -2862,6 +2884,7 @@ function syncBackendPlayback(d) {
       playbackHeartbeat = 0;
       syncArmToggle();
     }
+    playbackStartStatusTs = 0;
     playbackStoppingId = null;
     return;
   }
@@ -4148,9 +4171,10 @@ function syncJointTargetFromSource() {
 
 function toggleJointAutoSync() {
   jointAutoSyncEnabled = !jointAutoSyncEnabled;
-  if (replayActive && jointControlEnabled && (jointSyncSource === "state" || jointSyncSource === "command")) {
+  if (replayActive && vizState.previewReady && jointControlEnabled
+      && (jointSyncSource === "state" || jointSyncSource === "command")) {
     if (jointAutoSyncEnabled && !armReplay) startBackendPlayback(jointSyncSource).catch(toastError);
-    if (!jointAutoSyncEnabled && armReplay) stopBackendPlayback().catch(toastError);
+    if (!jointAutoSyncEnabled) stopBackendPlayback().catch(toastError);
   }
   if (jointAutoSyncEnabled) {
     syncJointTargetFromSource();
@@ -7615,7 +7639,18 @@ function stopArmReplayLoop() {
   stopBackendPlayback().catch(toastError);
 }
 
-async function stopBackendPlayback() {
+function queuePlaybackTransition(work) {
+  const next = playbackTransition.catch(() => {}).then(work);
+  playbackTransition = next;
+  return next;
+}
+
+function stopBackendPlayback() {
+  playbackIntent += 1;
+  return queuePlaybackTransition(stopBackendPlaybackNow);
+}
+
+async function stopBackendPlaybackNow() {
   const id = playbackSession?.id;
   if (!id) return;
   playbackStoppingId = id;
@@ -7638,6 +7673,7 @@ async function stopBackendPlayback() {
     stopped = true;
   } finally {
     if (playbackSession?.id === id && stopped) playbackSession = null;
+    if (stopped) playbackStartStatusTs = 0;
     playbackStoppingId = null;
     if (!stopped && playbackSession?.id === id) armReplay = true;
     syncArmToggle();
@@ -7658,20 +7694,28 @@ async function playbackOperation(operation, values = {}) {
   return playbackRequest;
 }
 
-async function startBackendPlayback(source = "command") {
-  if (playbackSession) await stopBackendPlayback();
-  const reply = await api("/api/control/playback", {
+function startBackendPlayback(source = "command") {
+  const intent = ++playbackIntent;
+  const request = {
     kind: vizState.kind, id: vizState.id, episode: vizState.episode,
     source, interpolation: "linear", speed: Math.max(0.1, vizState.speed), playing: vizState.playing,
     max_speed: jointMaxSpeed || 720,
+  };
+  return queuePlaybackTransition(async () => {
+    if (intent !== playbackIntent) return;
+    if (playbackSession) await stopBackendPlaybackNow();
+    if (intent !== playbackIntent) return;
+    const reply = await api("/api/control/playback", request);
+    playbackSession = reply.playback;
+    if (intent !== playbackIntent) return;
+    playbackStartStatusTs = Number(last?.ts) || 0;
+    armReplay = true;
+    syncArmToggle();
+    if (playbackHeartbeat) clearInterval(playbackHeartbeat);
+    playbackHeartbeat = setInterval(() => {
+      if (playbackSession) playbackOperation("heartbeat").catch(toastError);
+    }, 1000);
   });
-  playbackSession = reply.playback;
-  armReplay = true;
-  syncArmToggle();
-  if (playbackHeartbeat) clearInterval(playbackHeartbeat);
-  playbackHeartbeat = setInterval(() => {
-    if (playbackSession) playbackOperation("heartbeat").catch(toastError);
-  }, 1000);
 }
 
 function sampleArmJoints(elapsed) {

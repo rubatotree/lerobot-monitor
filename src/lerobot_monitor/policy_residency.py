@@ -393,17 +393,16 @@ class PolicyResidencyManager:
                 item for item in self._entries.values()
                 if item.key[0] == source and (instance_id is None or item.instance_id == instance_id)
             ]
-            if instance_id is not None and not candidates:
-                raise KeyError(instance_id)
-            if any(item.busy or item.state in {"queued", "loading", "stopping", "unloading"} for item in candidates):
+            if any(item.busy or item.state in {"queued", "loading", "stopping"} for item in candidates):
                 raise PolicyBusyError("stop the active inference or wait for model loading to finish before unloading")
-            for item in candidates:
+            pending = [item for item in candidates if item.state != "unloading"]
+            for item in pending:
                 item.invalidated = True
                 item.state = "unloading"
-            if candidates:
+            if pending:
                 self._changed()
-        if candidates:
-            threading.Thread(target=self._finish_unload, args=(candidates,), daemon=True).start()
+        if pending:
+            threading.Thread(target=self._finish_unload, args=(pending,), daemon=True).start()
         return len(candidates)
 
     def block_source(self, path: str) -> str:

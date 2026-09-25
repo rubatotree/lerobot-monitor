@@ -134,7 +134,9 @@ def test_busy_and_stopping_instances_cannot_unload(tmp_path: Path) -> None:
         stopped.set()
         _wait_for_state(manager, path, "ready")
         assert manager.unload(str(path)) == 1
+        assert manager.unload(str(path)) in {0, 1}
         _wait_for_state(manager, path, "unloaded")
+        assert manager.unload(str(path)) == 0
     finally:
         manager.close()
 

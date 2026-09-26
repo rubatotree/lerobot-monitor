@@ -1,24 +1,28 @@
 # LeRobot Monitor
 
-## 设计完成：Bug 审核与异步 Rollout（2026-09-26）
+## 实施中：Bug 审核与异步 Rollout（2026-09-26）
 
-状态：设计与基线审核完成，以下功能里程碑尚未实现。审计基线为 monitor `c75aa41` / LeRobot `8f1d64cd`。
+实施调整（用户要求优先复用 LeRobot）：以现有 `RTCInferenceEngine`、`ActionQueue`、处理器、延迟补偿与停止协议为主体，先消除 Monitor 接入侧的同步工作，并将通用并发修复放回 LeRobot。远程 `async_inference` 的 RobotClient 自行持有硬件，不能与 Monitor 总线所有者直接并用；独立进程/自定义 IPC 暂不作为本轮前置要求。旧设计中的进程迁移部分保留为候选，非本轮已承诺实现。先完成 M1，再逐项验证可复用引擎的观测、队列和遥测边界。
 
-结论：现有 RTC 已有后台推理线程，但总线线程仍负责相机复制/转换、动作转换及预测展开，并与推理共享张量队列锁。目标是推理进程发布已完成的 CPU 动作块，由 ControlLoop 按独立时钟执行；观测和诊断通过有界后台通道，Stop 先撤销执行 epoch，再异步收尾。
+状态：已完成首批修复与原生 RTC 接入隔离，功能状态以下方里程碑为准。原始审计基线为 monitor `c75aa41` / LeRobot `8f1d64cd`；当前 RTC 扩展依赖 LeRobot `79f1e10d`。
 
-架构选型：Windows spawn 推理服务 + 父进程缓存代理 + 带版本的观测快照 + 控制端独占的 CPU 动作时间线。复用 LeRobot RTC 算法与相对动作处理，明确 bootstrap、冻结前缀、delay 越界、队列缺货与进程故障语义。
+原始问题：RTC 已有后台推理线程，但 Monitor 总线线程仍负责相机复制/转换、动作转换及预测展开，并与推理共享张量队列锁。本轮让现有推理线程发布已完成的 CPU 动作，由 ControlLoop 按既有独立 deadline 消费；Stop 先撤销当前引擎所有权，再异步收尾。
 
-核心模块：观测 worker、消息协议、动作时间线、推理 adapter、IPC transport、常驻缓存代理、显式 chunk 事件。技术难点是进程间帧所有权、控制/推理时间对齐、guided/trained 约束、同权重运行配置事务及保持缓存单一所有者。
+当前架构：复用 LeRobot `RTCInferenceEngine` 后台线程、`ActionQueue` 和原生处理器/延迟补偿。新增通用 observation provider 和 chunk observer；Monitor 在 provider 中准备新鲜图像，控制侧只发布关节快照、非阻塞消费已完成的 CPU 动作。常驻缓存及模型租约继续沿用现有实现。
+
+本轮模块：`policy.py` 配置事务；`cameras.py` 路由与新鲜度；`PolicyWorker` 同步输入/结果后台适配；LeRobot RTC 队列 CPU 发布、统一前缀快照和串行 reset；`loop.py` / `rollout_timeline.py` 显式 chunk 事件。后续技术难点仍包括控制 deadline 跳步与策略逻辑时间对齐、实机 I/O 延迟及进程级故障恢复。
 
 - [x] M0 核对历史记录与当前源码，120 项现有定向测试通过；相机显示影响输入、时间轴误标、清空覆盖不恢复三个内存复现。
-- [ ] M1 修复相机路由和运行配置事务。
-- [ ] M2 观测/CPU 动作契约、有界时间线与 fake worker，验证控制隔离和缺货策略。
-- [ ] M3 spawn 推理服务、模型缓存代理、RTC adapter、reset/stop 协议。
-- [ ] M4 显式 chunk 生命周期、诊断与界面状态。
+- [x] M1 修复相机路由和运行配置事务。
+- [x] M2 改用原生引擎观测回调、现有有界 worker；相机/关节新鲜度和无可用动作超时；总线线程不做图像处理。
+- [x] M3 改用原生队列的 CPU 发布与非阻塞消费、同索引前缀快照、首块不按冷启动延迟裁空、运行中 reset 串行化。进程/IPC 方案不在本轮实现。
+- [x] M4 RTC 显式 start/ready/accepted/discarded/failed 事件，只有真实发送后标记 active；预览转换移至生产线程，每次运行独立时间轴。
 - [ ] M5 GPU、虚拟臂与实机发送节拍/停止延迟验收，再决定默认模式。
 - [ ] M6 独立处理录制暂存跨重启重试入口。
 
 来源限制、优先级和逐项验收见 [Bug 审核](docs/bug_audit_2026-09-26.md)，详细协议和时序见 [异步设计](docs/async_rollout_design.md)。未定位用户所指的独立 bug list；本地已核对 ROADMAP/dev_log，GitHub Issues 查询为空。
+
+验证：Monitor 全量阶段 346 passed / 1 skipped；新增真实引擎跨层测试与末次配置/启动修改定向 76 passed。LeRobot 队列、RTC、interactive rollout 和相对动作 197 passed；修改的 LeRobot 文件 Ruff 通过，Monitor 修改相较基线无新增 lint 诊断；前端 CI 脚本全部通过。未移动真实机械臂或重启运行中的服务。
 
 ## 当前里程碑：GPU 模型常驻缓存与 Library 管理（2026-09-25）
 

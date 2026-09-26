@@ -1,4 +1,5 @@
 import time
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -15,6 +16,27 @@ from lerobot_monitor.cameras import (
 from lerobot_monitor.config import CamerasConfig
 
 
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("show_main", [False, True])
+@pytest.mark.parametrize("feed_robot", [False, True])
+def test_robot_camera_routing_is_independent_of_display(
+    remote: bool, enabled: bool, show_main: bool, feed_robot: bool,
+) -> None:
+    hub = CameraHub(CamerasConfig(probe=False))
+    frame = np.zeros((2, 3, 3), dtype=np.uint8)
+    device = SimpleNamespace(
+        enabled=enabled, show_main=show_main, feed_robot=feed_robot,
+        latest_rgb=lambda: frame, latest_bgr=lambda: frame,
+    )
+    (hub.remote_streams if remote else hub.streams)["front"] = device
+    expected = {"front"} if enabled and feed_robot else set()
+    assert set(hub.latest_rgb_map()) == expected
+    # Recording may include display-only feeds; only policy routing changes.
+    recorded = {"front"} if enabled and (show_main or feed_robot) else set()
+    assert set(hub.latest_bgr_map()) == recorded
+
+
 def test_focus_is_latched_without_opening_device() -> None:
     cam = DeviceCamera(0, width=640, height=480, jpeg_quality=80, port=5000)
     cam.set_focus(autofocus=False, focus=40)
@@ -26,6 +48,28 @@ def test_focus_is_latched_without_opening_device() -> None:
     assert cam._focus_dirty.is_set()
     cam.set_focus(focus=300)
     assert cam.focus == 255.0
+
+
+def test_rollout_rejects_missing_stale_and_unsynchronized_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    hub = CameraHub(CamerasConfig(probe=False))
+    first = DeviceCamera(0, width=2, height=2, jpeg_quality=80, port=5000)
+    second = DeviceCamera(1, width=2, height=2, jpeg_quality=80, port=5001)
+    for camera in (first, second):
+        camera.enabled, camera.feed_robot, camera.show_main = True, True, False
+    hub.streams = {"front": first, "side": second}
+    monkeypatch.setattr("lerobot_monitor.cameras.time.perf_counter", lambda: 10.0)
+    with pytest.raises(RuntimeError, match="no frame"):
+        hub.rollout_rgb_map(max_age_s=1, max_skew_s=0.25)
+    for camera in (first, second):
+        camera._bgr = np.full((2, 2, 3), [1, 2, 3], dtype=np.uint8)
+        camera.frame_received_at = 9.9
+    assert hub.rollout_rgb_map(max_age_s=1, max_skew_s=0.25)["front"][0, 0].tolist() == [3, 2, 1]
+    first.frame_received_at = 9.5
+    with pytest.raises(RuntimeError, match="time skew"):
+        hub.rollout_rgb_map(max_age_s=1, max_skew_s=0.25)
+    first.frame_received_at = 8.0
+    with pytest.raises(RuntimeError, match="stale"):
+        hub.rollout_rgb_map(max_age_s=1, max_skew_s=0.25)
 
 
 def test_extract_jpeg_frames_handles_multipart_noise() -> None:

@@ -32,7 +32,6 @@ from .policy import (
     create_monitor_inference_engine,
     inference_config_from_extra,
     inference_leftover_poses,
-    install_inference_timeline,
     load_policy,
     pose_from_action_tensor,
     predict_action_chunk,
@@ -277,6 +276,9 @@ class ControlLoop:
         self._prediction_sequence = 0
         self._inference_engine: Any | None = None
         self._inference_worker: PolicyWorker | None = None
+        self._rtc_native_events = False
+        self._rtc_preview: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        self._rtc_goal_chunk: int | None = None
         self._active_policy_owner: LoadedPolicy | None = None
         self._active_policy_lease: PolicyLease | None = None
         self._rollout_from: dict[str, float] | None = None
@@ -931,7 +933,6 @@ class ControlLoop:
             return False
         self._end_rollout()
         self._active_policy_lease = lease
-        loaded.reset()
         loaded.task = str(payload.get("task") or loaded.task)
         self.loaded_policy = loaded
         self.rollout_task = loaded.task
@@ -2737,7 +2738,13 @@ class ControlLoop:
             self.mode = "idle"
             return
         now = time.perf_counter()
-        self._observe_rollout_queue()
+        if not self._rtc_native_events:
+            self._observe_rollout_queue()
+        else:
+            try:
+                self._rollout_prediction = self._rtc_preview.get_nowait()
+            except queue.Empty:
+                pass
         if self.task_deadline is not None and now >= self.task_deadline:
             self.log("info", "rollout duration reached")
             self._close_writer()
@@ -2767,19 +2774,21 @@ class ControlLoop:
         if now >= self._next_policy_t:
             self._next_policy_t = self._advance_deadline(self._next_policy_t, self._policy_interval, now)
             observation = dict(self.joints or {})
-            observation.update(self.cameras.latest_rgb_map())
+            observation["_monitor_observed_at"] = self._read_at
             engine.notify_observation(observation)
-            obs_frame = self._build_rollout_obs_frame(observation)
             if worker is None:
                 started = time.perf_counter()
-                action = engine.get_action(obs_frame)
-                self._observe_rollout_queue()
+                action = engine.get_action(None)
+                if self._rtc_native_events and action is not None:
+                    self._rtc_goal_chunk = engine.dispatched_chunk_id
+                elif not self._rtc_native_events:
+                    self._observe_rollout_queue()
                 measured_infer_ms = (time.perf_counter() - started) * 1000.0
                 self._rollout_infer_ms = self._timeline_latency_ms(measured_infer_ms)
-            elif not worker.submit(obs_frame, dict(self.joints)):
+            elif not worker.submit(observation, dict(self.joints)):
                 self._note_control_event("policy_request_skipped", now)
         if action is not None:
-            pose = pose_from_action_tensor(self.loaded_policy, action, self.joints)
+            pose = action if worker is not None else pose_from_action_tensor(self.loaded_policy, action, self.joints)
             self._rollout_from = dict(self.action or self.joints or pose)
             self._rollout_goal = dict(pose)
             self._rollout_segment_t = now
@@ -2793,6 +2802,8 @@ class ControlLoop:
         ):
             self._rollout_waiting = True
             self._note_control_event("policy_waiting", now)
+        if now - max(self.task_t0, self._rollout_last_action_t) > self.config.rollout.inference_timeout_s:
+            raise RuntimeError("rollout inference timed out without a usable action")
         if self._output_due and self._rollout_goal is not None:
             if self._rollout_interpolation and self._control_hz() > self.policy_fps and self._rollout_from is not None:
                 alpha = min(1.0, max(0.0, (now - self._rollout_segment_t) / self._policy_interval))
@@ -2803,7 +2814,12 @@ class ControlLoop:
                 }
             else:
                 pose = dict(self._rollout_goal)
-            self._send_pose(pose, hold=self._rollout_waiting)
+            sent = self._send_pose(pose, hold=self._rollout_waiting)
+            if sent and self._rtc_native_events:
+                try:
+                    self._rollout_timeline.note_dispatched(self._rtc_goal_chunk)
+                except Exception as exc:  # noqa: BLE001 - charts cannot stop a rollout
+                    self._rollout_telemetry_error(exc)
             self.action = dict(pose)
             self.latched = dict(pose)
         elif self._output_due:
@@ -2811,7 +2827,7 @@ class ControlLoop:
             if hold_pose:
                 self._send_pose(dict(hold_pose), hold=True)
         self._maybe_record("rollout")
-        if worker is None and now >= self._next_prediction_t:
+        if worker is None and not self._rtc_native_events and now >= self._next_prediction_t:
             queued = inference_leftover_poses(engine, self.loaded_policy, self.joints)
             if queued:
                 self._record_rollout_prediction(queued)
@@ -2889,18 +2905,71 @@ class ControlLoop:
 
         return build_dataset_frame(self._rollout_hw_feature_spec, observation, prefix=OBS_STR)
 
+    def _prepare_rollout_observation(self, joints: dict[str, Any]) -> dict[str, Any]:
+        """Assemble [H,W,3] RGB images on the engine/worker thread, never the bus thread."""
+        observation = dict(joints)
+        observed_at = observation.pop("_monitor_observed_at", None)
+        settings = self.config.rollout
+        images = self.cameras.rollout_rgb_map(
+            max_age_s=settings.observation_max_age_s, max_skew_s=settings.camera_max_skew_s,
+        )
+        if observed_at is not None and time.perf_counter() - observed_at > settings.observation_max_age_s:
+            raise RuntimeError("rollout joint observation is stale")
+        observation.update(images)
+        return observation
+
+    def _bind_rtc_events(self, engine: Any, loaded: LoadedPolicy) -> None:
+        """Adapt LeRobot producer events to charts without inspecting its private queues."""
+        if not hasattr(engine, "observation_provider") or not hasattr(engine, "chunk_observer"):
+            raise RuntimeError("RTC requires the updated sibling LeRobot inference engine")
+        engine.observation_provider = self._prepare_rollout_observation
+        preview: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        self._rtc_preview = preview
+        self._rtc_native_events = True
+        timeline = self._rollout_timeline
+        step_s, origin = self._prediction_step_s(), self.task_t0
+        fallback = dict(self.joints)
+
+        def observe(event: Any) -> None:
+            if self._inference_engine is not engine:
+                return
+            if event.kind == "started":
+                timeline.note_inference_start(kind="rtc", step_s=step_s, chunk_id=event.chunk_id)
+            elif event.kind in {"ready", "failed", "discarded"}:
+                timeline.note_inference_end(
+                    event.chunk_id, ok=event.kind == "ready", steps=event.steps or None,
+                )
+            elif event.kind == "accepted":
+                timeline.note_chunk_accepted(event.chunk_id, steps=event.steps)
+                payload = {
+                    "id": event.chunk_id, "t_s": round(time.perf_counter() - origin, 3),
+                    "step_s": round(step_s, 6), "strategy": "policy_queue", "degraded": False,
+                    "latency_ms": 0.0,
+                    "actions": [pose_from_action_tensor(loaded, action, fallback) for action in event.actions],
+                }
+                try:
+                    preview.get_nowait()
+                except queue.Empty:
+                    pass
+                preview.put_nowait(payload)
+
+        engine.chunk_observer = observe
+
     def _start_inference_engine(self, loaded: LoadedPolicy) -> bool:
         """Build and start LeRobot's sync or RTC inference engine."""
         try:
             config = inference_config_from_extra(self.rollout_extra)
             self._rollout_timeline_debugged = False
-            self._rollout_timeline.clear()
+            # Retired workers can still finish callbacks. Give each run its own
+            # timeline so they cannot attach events to a subsequent model/run.
+            self._rollout_timeline.set_enabled(False)
+            self._rollout_timeline = RolloutTimeline()
             self._rollout_timeline.set_enabled(True)
-            install_inference_timeline(
-                loaded.policy,
-                self._rollout_timeline,
-                step_s=self._prediction_step_s(),
-            )
+            # RTC now reports its own producer lifecycle. The synchronous worker
+            # already times calls; neither path needs to monkey-patch the policy.
+            state = getattr(loaded.policy, "_monitor_timeline_state", None)
+            if isinstance(state, dict):
+                state["timeline"] = None
             rtc = getattr(config, "rtc", None)
             self.log(
                 "info",
@@ -2922,6 +2991,8 @@ class ControlLoop:
                 fps=self.effective_policy_fps,
             )
             self._inference_engine = engine
+            if config.type == "rtc":
+                self._bind_rtc_events(engine, loaded)
             engine.reset()
             engine.start()
             engine.resume()
@@ -2936,12 +3007,18 @@ class ControlLoop:
             return False
         self._active_policy_owner = loaded
         if getattr(config, "type", "") == "sync":
+            from lerobot.utils.feature_utils import build_dataset_frame
+
             self._inference_worker = PolicyWorker(
                 engine, _POLICY_INFER_LOCK,
                 preview=lambda joints: inference_leftover_poses(engine, loaded, joints),
                 timeline=self._rollout_timeline,
                 step_s=self._prediction_step_s(),
                 kind="sync",
+                prepare=lambda obs: build_dataset_frame(
+                    hw_features, self._prepare_rollout_observation(obs), prefix="observation",
+                ),
+                convert=lambda action, joints: pose_from_action_tensor(loaded, action, joints),
             )
         self._rollout_hw_feature_spec = hw_features
         self._next_prediction_t = self.task_t0
@@ -2955,6 +3032,8 @@ class ControlLoop:
         worker = self._inference_worker
         lease = self._active_policy_lease
         self._inference_worker = None
+        self._rtc_native_events = False
+        self._rtc_goal_chunk = None
         self._active_policy_owner = None
         self._active_policy_lease = None
         self._inference_engine = None

@@ -73,5 +73,9 @@ rollout:
   device: cpu
   default_duration_s: 60
   default_fps: 15
+  # Receive-time checks, not camera exposure timestamps; tune for the task.
+  observation_max_age_s: 1.0
+  camera_max_skew_s: 0.25
+  inference_timeout_s: 30.0
   rename_map:
     "observation.images.0": "observation.images.front"

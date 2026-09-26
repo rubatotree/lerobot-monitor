@@ -43,6 +43,10 @@ Windows 也可以运行 `.\run.ps1`。它优先读取本地 `config.yaml`，否�
 
 ## 开发与验证
 
+RTC rollout 使用 LeRobot 自带的 `RTCInferenceEngine` 与 `ActionQueue`。当前后台观测准备和 chunk 事件接入需要本地 LeRobot 分支提交 `79f1e10d`（或包含相同接口的后续版本）；旧版本会在启动 RTC 时明确提示不兼容。通过原有 `inference.type=rtc` 开启，不需要另起 RobotClient 或 PolicyServer。
+
+`rollout.observation_max_age_s`、`camera_max_skew_s` 和 `inference_timeout_s` 分别控制输入最大接收年龄、多相机时间差以及无可用动作超时，默认 1、0.25、30 秒；需按任务调整。陈旧输入会让原生引擎报错退出，超时停止 rollout 并保持当前目标。这些接收时间不是相机曝光时间，也不是实机安全时延保证。
+
 ```powershell
 uv run pytest -q
 node --check src/lerobot_monitor/web/static/app.js

@@ -1,6 +1,14 @@
 # Monitor 异步 Rollout 设计
 
-状态：设计提案，2026-09-26。尚未实现。关联 [Bug 审核与修复计划](bug_audit_2026-09-26.md)。
+初始设计提案：2026-09-26。实现方案已按下述复用约束修订。关联 [Bug 审核与修复计划](bug_audit_2026-09-26.md)。
+
+当前实施状态：首批原生引擎适配已实现；本文件下方独立进程与完整时间线方案仍为设计候选。具体完成范围以 Bug 审核的“实施更新”和 ROADMAP 为准。
+
+实施修订：用户要求尽量复用 LeRobot。当前优先扩展已有 `RTCInferenceEngine` / `ActionQueue` 的观测提供、CPU 发布及显式事件边界，Monitor 只提供适配；同步模式继续复用 `SyncInferenceEngine` 与现有 `PolicyWorker`。下文 spawn 服务、IPC 与独立时间线为后续候选，不是本轮前置要求。已有 `async_inference.RobotClient` 自行连接机器人，不直接接入 Monitor；若后续需要进程隔离，应先适配已有 PolicyServer/transport，而不是另写协议。
+
+已实现的复用接口（LeRobot `79f1e10d`）：`RTCInferenceEngine.observation_provider` 在生产线程组装输入；`chunk_observer` 报告带 chunk ID 的生命周期；`ActionQueue.get_prefix_snapshot()` 返回同一消费索引的 raw/absolute 尾部；`get_with_metadata(blocking=False)` 避免控制侧等待队列锁。处理器完整 CPU 拷贝后才发布动作；reset 状态由推理所有者串行修改。Monitor 仅在命令成功发送后记录该 chunk 的 active，并使用每次运行独立的 timeline。
+
+实际 CPU 边界：RTC 控制端拿到已完成 CPU tensor，六关节映射继续复用 LeRobot `make_robot_action`；sync worker 在后台完成这一步。没有新增常驻缓存服务，没有重写 guided/trained、相对动作重锚定和 ACT 融合算法。
 
 ## 1. 当前实现的准确判断
 

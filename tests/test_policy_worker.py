@@ -8,6 +8,50 @@ import time
 from lerobot_monitor.policy_worker import PolicyWorker
 
 
+def test_camera_preparation_and_conversion_run_off_the_submitter_thread() -> None:
+    from typing import Any
+
+    entered, release = threading.Event(), threading.Event()
+    threads: list[int] = []
+
+    def prepare(observation: dict[str, Any]) -> dict[str, Any]:
+        threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(2)
+        return observation
+
+    def convert(action: Any, joints: dict[str, float]) -> dict[str, float]:
+        threads.append(threading.get_ident())
+        return {"gripper": float(action)}
+
+    class Engine:
+        def get_action(self, observation: dict[str, Any]) -> float:
+            return 1.0
+
+        def stop(self) -> None:
+            pass
+
+    worker = PolicyWorker(Engine(), threading.Lock(), prepare=prepare, convert=convert)
+    try:
+        assert worker.submit({}, {})
+        assert entered.wait(2)
+        assert worker.latest() is None
+        # The blocked camera does not block the caller or create an unbounded backlog.
+        assert worker.submit({}, {})
+        assert not worker.submit({}, {})
+        release.set()
+        deadline = time.perf_counter() + 2
+        result = None
+        while result is None and time.perf_counter() < deadline:
+            result = worker.latest()
+            time.sleep(0.005)
+        assert result is not None and result[1] == {"gripper": 1.0}
+        assert all(identifier != threading.get_ident() for identifier in threads)
+    finally:
+        release.set()
+        assert worker.stop_async().wait(2)
+
+
 def test_slow_inference_does_not_block_submit_or_stop() -> None:
     started = threading.Event()
     release = threading.Event()

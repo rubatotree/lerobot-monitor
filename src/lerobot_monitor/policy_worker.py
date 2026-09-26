@@ -20,6 +20,8 @@ class PolicyWorker:
         timeline: RolloutTimeline | None = None,
         step_s: float = 1.0 / 30.0,
         kind: str = "sync",
+        prepare: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        convert: Callable[[Any, dict[str, float]], dict[str, float]] | None = None,
     ) -> None:
         self.engine = engine
         self.inference_lock = inference_lock
@@ -27,6 +29,8 @@ class PolicyWorker:
         self.timeline = timeline
         self.step_s = float(step_s)
         self.kind = str(kind)
+        self.prepare = prepare
+        self.convert = convert
         self._requests: queue.Queue[tuple[dict[str, Any], dict[str, float]]] = queue.Queue(maxsize=1)
         self._results: queue.Queue[tuple[float, Any, str | None, list[dict[str, float]]]] = queue.Queue(maxsize=1)
         self._stop = threading.Event()
@@ -89,7 +93,13 @@ class PolicyWorker:
             token = self._note_start()
             try:
                 with self.inference_lock:
+                    if self.prepare is not None:
+                        observation = self.prepare(observation)
+                    if self._stop.is_set():
+                        break
                     action = self.engine.get_action(observation)
+                    if action is not None and self.convert is not None:
+                        action = self.convert(action, fallback)
                     preview = self.preview(fallback) if self.preview is not None else []
                 error = None
             except Exception as exc:  # noqa: BLE001 - report on the bus thread

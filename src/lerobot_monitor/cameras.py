@@ -209,7 +209,14 @@ class DeviceCamera:
 
     def latest_bgr(self) -> np.ndarray | None:
         with self._lock:
-            return None if self._bgr is None else self._bgr.copy()
+            frame = self._bgr
+        return None if frame is None else frame.copy()
+
+    def latest_bgr_capture(self) -> tuple[np.ndarray | None, float | None]:
+        """Copy an immutable published frame [H,W,3] with its receive time."""
+        with self._lock:
+            frame, received_at = self._bgr, self.frame_received_at
+        return (None if frame is None else frame.copy()), received_at
 
     def latest_rgb(self) -> np.ndarray | None:
         bgr = self.latest_bgr()
@@ -543,7 +550,14 @@ class RemoteMjpegCamera:
 
     def latest_bgr(self) -> np.ndarray | None:
         with self._lock:
-            return None if self._bgr is None else self._bgr.copy()
+            frame = self._bgr
+        return None if frame is None else frame.copy()
+
+    def latest_bgr_capture(self) -> tuple[np.ndarray | None, float | None]:
+        """Copy an immutable published frame [H,W,3] with its receive time."""
+        with self._lock:
+            frame, received_at = self._bgr, self.frame_received_at
+        return (None if frame is None else frame.copy()), received_at
 
     def latest_rgb(self) -> np.ndarray | None:
         bgr = self.latest_bgr()
@@ -1016,6 +1030,27 @@ class CameraHub:
                 out[name] = jpeg
         return out
 
+    def rollout_rgb_map(self, *, max_age_s: float, max_skew_s: float) -> dict[str, np.ndarray]:
+        """Build fresh policy images [H,W,3] off the bus thread; fail on stale feeds."""
+        with self._lock:
+            devices = list(self.streams.items()) + list(self.remote_streams.items())
+        frames: dict[str, np.ndarray] = {}
+        timestamps: list[float] = []
+        for name, device in devices:
+            if not (device.enabled and device.feed_robot):
+                continue
+            frame, received_at = device.latest_bgr_capture()
+            if frame is None or received_at is None:
+                raise RuntimeError(f"rollout camera {name!r} has no frame")
+            timestamps.append(received_at)
+            frames[name] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        now = time.perf_counter()
+        if timestamps and now - min(timestamps) > max_age_s:
+            raise RuntimeError("rollout camera frame is stale")
+        if timestamps and max(timestamps) - min(timestamps) > max_skew_s:
+            raise RuntimeError("rollout camera frames exceed maximum time skew")
+        return frames
+
     def _image_map(self, color: str, *, robot: bool) -> dict[str, np.ndarray]:
         out: dict[str, np.ndarray] = {}
         with self._lock:
@@ -1023,7 +1058,7 @@ class CameraHub:
         for name, device in devices:
             if not device.enabled:
                 continue
-            if robot and not (device.show_main and device.feed_robot):
+            if robot and not device.feed_robot:
                 continue
             if not robot and not (device.show_main or device.feed_robot):
                 continue

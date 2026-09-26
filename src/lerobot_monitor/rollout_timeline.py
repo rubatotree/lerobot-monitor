@@ -22,6 +22,7 @@ class _RolloutBlock:
     steps: int | None = None
     step_s: float | None = None
     failed: bool = False
+    accepted: bool = False
 
 
 class RolloutTimeline:
@@ -72,7 +73,7 @@ class RolloutTimeline:
         except Exception as exc:  # noqa: BLE001 - telemetry must not affect control
             logger.debug("could not clear rollout timeline: %s", exc)
 
-    def note_inference_start(self, *, kind: str, step_s: float) -> int | None:
+    def note_inference_start(self, *, kind: str, step_s: float, chunk_id: int | None = None) -> int | None:
         """Open an inference interval and return its block token."""
         try:
             step_s = self._positive_float(step_s)
@@ -84,12 +85,12 @@ class RolloutTimeline:
                 ):
                     return None
                 block = _RolloutBlock(
-                    id=self._next_id,
+                    id=self._next_id if chunk_id is None else chunk_id,
                     kind=str(kind or "unknown"),
                     start=time.perf_counter(),
                     step_s=step_s,
                 )
-                self._next_id += 1
+                self._next_id = max(self._next_id, block.id) + 1
                 self._blocks.append(block)
                 self._trim_locked()
                 return block.id
@@ -145,6 +146,21 @@ class RolloutTimeline:
                 self._trim_locked()
         except Exception as exc:  # noqa: BLE001 - telemetry must not affect control
             logger.debug("could not mark rollout chunk ready: %s", exc)
+
+    def note_chunk_accepted(self, token: int, *, steps: int) -> None:
+        """Accept a specific producer chunk; it has not been sent to hardware yet."""
+        with self._lock:
+            block = self._find_locked(token)
+            if block is not None and not block.failed:
+                block.accepted = True
+                block.steps = steps
+
+    def note_dispatched(self, token: int | None) -> None:
+        """Mark only the accepted chunk whose action was successfully sent."""
+        with self._lock:
+            block = self._find_locked(token) if token is not None else None
+            if block is not None and block.accepted and not block.failed and block.active is None:
+                block.active = time.perf_counter()
 
     def observe(self, *, qsize: int | None, index: int | None) -> None:
         """Detect an RTC queue handoff from a consumption or merge transition."""

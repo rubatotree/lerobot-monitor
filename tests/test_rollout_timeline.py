@@ -7,6 +7,23 @@ import threading
 from lerobot_monitor.rollout_timeline import RolloutTimeline
 
 
+def test_explicit_rtc_events_do_not_activate_unpublished_or_discarded_chunks() -> None:
+    timeline = RolloutTimeline()
+    timeline.set_enabled(True)
+    token = timeline.note_inference_start(kind="rtc", step_s=0.05, chunk_id=17)
+    timeline.note_inference_end(token, ok=True, steps=50)
+    timeline.note_dispatched(token)
+    assert timeline.snapshot()["blocks"][0]["active"] is None
+    timeline.note_chunk_accepted(token, steps=42)
+    timeline.note_dispatched(token)
+    assert timeline.snapshot()["blocks"][0]["active"] is not None
+    discarded = timeline.note_inference_start(kind="rtc", step_s=0.05, chunk_id=18)
+    timeline.note_inference_end(discarded, ok=False, steps=50)
+    timeline.note_chunk_accepted(discarded, steps=42)
+    timeline.note_dispatched(discarded)
+    assert timeline.snapshot()["blocks"][1]["active"] is None
+
+
 def test_disabled_timeline_has_no_snapshot_and_clear_resets_state(monkeypatch) -> None:
     clock = [100.0]
     monkeypatch.setattr("lerobot_monitor.rollout_timeline.time.perf_counter", lambda: clock[0])

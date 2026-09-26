@@ -1,5 +1,14 @@
 # Dev log
 
+## 2026-09-26：复用 LeRobot 的异步边界修复
+
+- 按用户新约束调整设计：继续使用 RTCInferenceEngine / SyncInferenceEngine / ActionQueue 及原处理器，不新增 IPC、独立动作调度器或另一套模型缓存。依赖 LeRobot 提交 `79f1e10d`。
+- 相机 `show_main` 与 `feed_robot` 解耦；原子读取帧与接收时刻，图像复制移出相机锁，转换在推理线程完成。新增配置 `observation_max_age_s=1.0`、`camera_max_skew_s=0.25`、`inference_timeout_s=30.0`，示例配置和 README 已说明其为可调整的任务参数。
+- RTC 生产者完成后处理、CPU 拷贝与有限值校验后才发布，raw/absolute prefix 使用同索引快照；控制侧取动作/发布关节不等待生产者锁。reset 撤销 epoch 后在原线程串行清模型状态。首块没有旧动作执行，延迟裁剪为零。
+- Monitor 图表消费原生 chunk 事件，动作真实发送后才标 active；预测姿态在生产线程展开，不再在控制线程读整块张量。每次 rollout 新建独立时间轴，迟到回调不能污染新运行。同步模式的图像准备、frame 构建和动作转换移入既有 PolicyWorker。
+- 验证：Monitor 全量阶段 346 passed / 1 skipped；新增真实引擎集成及最终配置/控制改动定向 76 passed。LeRobot 队列、RTC、interactive rollout、相对动作共 197 passed；含慢观测不阻塞已有动作、reset 不并发改模型、首块完整、非有限动作立即失败。前端 CI 4 项命令通过，LeRobot 修改文件 Ruff 通过；Monitor 历史严格 lint 诊断相较基线无新增，新测试文件 lint 通过。
+- 后续：A06 的 deadline 跳步/限幅与逻辑时间完整对齐、GPU/真机 SLO 与模型热切换验收、H06 跨重启暂存恢复。独立进程只保留为候选；未重启现有服务或移动真实机械臂。
+
 ## 2026-09-26：常驻策略的运行配置事务
 
 - 每次运行从 checkpoint 运行参数基线构建候选配置，先类型转换、正值检查和 LeRobot 配置校验，成功后再应用；失败不会污染常驻模型。清空覆盖恢复 n_action_steps、SmolVLA num_steps、Pi0/Pi05 num_inference_steps 等原值。

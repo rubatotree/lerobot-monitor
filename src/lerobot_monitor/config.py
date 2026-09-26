@@ -113,6 +113,9 @@ class RolloutConfig(BaseModel):
     default_duration_s: float = 60.0
     default_fps: int = 15
     rename_map: dict[str, str] = Field(default_factory=dict)
+    observation_max_age_s: float = Field(default=1.0, gt=0)
+    camera_max_skew_s: float = Field(default=0.25, gt=0)
+    inference_timeout_s: float = Field(default=30.0, gt=0)
 
 
 class MonitorConfig(BaseModel):

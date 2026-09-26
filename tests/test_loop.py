@@ -1145,6 +1145,7 @@ def test_timeline_telemetry_failure_does_not_interrupt_rollout(
 def test_start_inference_engine_uses_hw_features_method(tmp_path: Path, monkeypatch) -> None:
     loop = _loop(tmp_path)
     loaded = SimpleNamespace(task="pick cube", policy=MagicMock())
+    loaded.policy.config = SimpleNamespace()
     engine = MagicMock()
     engine.failed = False
     config = SimpleNamespace(type="rtc")

@@ -6659,10 +6659,13 @@ async function runDebugInference() {
         ? " · no reference command in a snapshot"
         : " · no reference command for this window";
     renderChunkEvaluation(reference.length ? result.evaluation : null);
+    const modelNote = result.cache_hit
+      ? "resident model reused"
+      : `model load ${(Number(result.model_load_ms || 0) / 1000).toFixed(1)} s`;
     setDebugStatus(
-      `${result.strategy}${result.degraded ? " · degraded" : ""} · ${result.actions.length} steps · ${Number(result.latency_ms).toFixed(0)} ms${referenceNote}${warnings ? ` · ${warnings}` : ""}`,
+      `${result.strategy}${result.degraded ? " · degraded" : ""} · ${modelNote} · ${result.actions.length} steps · ${Number(result.latency_ms).toFixed(0)} ms${referenceNote}${warnings ? ` · ${warnings}` : ""}`,
     );
-    localLog(`debug inference: ${result.strategy} · ${result.actions.length} steps · ${Number(result.latency_ms).toFixed(0)} ms`);
+    localLog(`debug inference: ${result.strategy} · ${modelNote} · ${result.actions.length} steps · ${Number(result.latency_ms).toFixed(0)} ms`);
   } catch (err) {
     clearChunkEvaluation();
     setDebugStatus(err.message || String(err), true);
@@ -8671,115 +8674,18 @@ const MODEL_RESIDENCY_LABELS = {
 };
 
 const MODEL_LOAD_PHASES = {
-  queued: "Waiting for load slot", config: "Reading configuration", weights: "Loading weights",
-  device: "Moving to device", processors: "Preparing processors", ready: "Ready",
+  queued: "Waiting for load slot", waiting: "Waiting for load slot", imports: "Importing model libraries",
+  cache: "Resolving local cache", config: "Reading configuration", weights: "Building model and loading weights",
+  device: "Finalizing device", processors: "Preparing processors", finalizing: "Finalizing model", ready: "Ready",
 };
 
 function modelResidencyOrEmpty(model) {
   return model.residency || { state: "unloaded", instances: [], gpu_bytes: 0, can_unload: false };
 }
 
-function modelSettingsFor(mode, model) {
-  if (mode === "rollout") {
-    const fields = rolloutFields();
-    return { device: fields.device, extra: fields.extra };
-  }
-  if (mode === "debug") {
-    const fields = debugFields();
-    return { device: fields.device, extra: fields.extra };
-  }
-  return { device: model.default_device || "cuda", extra: {} };
-}
-
-function openModelLoadDialog(model) {
-  document.getElementById("model-load-dialog")?.remove();
-  const dialog = document.createElement("dialog");
-  dialog.id = "model-load-dialog";
-  dialog.className = "model-load-dialog";
-  const form = document.createElement("form");
-  form.method = "dialog";
-  const heading = document.createElement("h3");
-  heading.textContent = `Load ${libraryDisplayName("model", model)}`;
-  const sourceLabel = document.createElement("label");
-  sourceLabel.textContent = "Settings";
-  const source = document.createElement("select");
-  source.setAttribute("aria-label", "Model load settings source");
-  [["rollout", "Current Rollout"], ["debug", "Current Inference"], ["default", "Model defaults"]]
-    .forEach(([value, label]) => source.add(new Option(label, value)));
-  sourceLabel.appendChild(source);
-  const deviceLabel = document.createElement("label");
-  deviceLabel.textContent = "Device";
-  const device = document.createElement("input");
-  device.type = "text";
-  device.setAttribute("aria-label", "Model load device");
-  deviceLabel.appendChild(device);
-  const extraLabel = document.createElement("label");
-  extraLabel.textContent = "Model and inference settings (JSON)";
-  const extra = document.createElement("textarea");
-  extra.rows = 5;
-  extra.spellcheck = false;
-  extra.setAttribute("aria-label", "Model load settings JSON");
-  extraLabel.appendChild(extra);
-  const note = document.createElement("p");
-  const updateNote = () => {
-    let settings = {};
-    try { settings = JSON.parse(extra.value || "{}"); } catch (_) { /* Submit reports invalid JSON. */ }
-    const modelKeys = Object.keys(settings || {}).filter((rawKey) => {
-      const key = rawKey.replace(/^--/, "").replace(/^policy\./, "");
-      return !["task", "fps", "interpolation_multiplier", "control_rate"].includes(key)
-        && !["inference.", "robot.", "dataset.", "teleop.", "strategy.", "record."].some((prefix) => key.startsWith(prefix));
-    });
-    note.textContent = modelKeys.length
-      ? `Model overrides: ${modelKeys.join(", ")}. Different effective values create another instance; matching settings reuse the resident model.`
-      : "These settings only affect runtime behavior. A matching resident model on this device is reused without loading again.";
-  };
-  const actions = document.createElement("div");
-  actions.className = "model-load-actions";
-  const cancel = document.createElement("button");
-  cancel.type = "button";
-  cancel.textContent = "Cancel";
-  cancel.addEventListener("click", () => dialog.close());
-  const submit = document.createElement("button");
-  submit.type = "submit";
-  submit.textContent = "Load into memory";
-  actions.append(cancel, submit);
-  const sync = () => {
-    const settings = modelSettingsFor(source.value, model);
-    device.value = settings.device;
-    extra.value = JSON.stringify(settings.extra || {}, null, 2);
-    updateNote();
-  };
-  source.addEventListener("change", sync);
-  extra.addEventListener("input", updateNote);
-  device.addEventListener("input", updateNote);
-  sync();
-  form.append(heading, sourceLabel, deviceLabel, extraLabel, note, actions);
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    let settings;
-    try {
-      settings = JSON.parse(extra.value || "{}");
-      if (!settings || Array.isArray(settings) || typeof settings !== "object") throw new Error("Settings must be a JSON object");
-      if (!device.value.trim()) throw new Error("Choose a device");
-    } catch (err) {
-      toastError(err);
-      return;
-    }
-    submit.disabled = true;
-    try {
-      await api(`/api/models/${encodeURIComponent(model.id)}/load`, { device: device.value.trim(), extra: settings });
-      dialog.close();
-      localLog(`model load requested: ${libraryDisplayName("model", model)}`);
-    } catch (err) {
-      toastError(err);
-      submit.disabled = false;
-    }
-  });
-  dialog.addEventListener("close", () => dialog.remove(), { once: true });
-  dialog.appendChild(form);
-  document.body.appendChild(dialog);
-  dialog.showModal();
-  source.focus();
+async function requestModelLoad(model) {
+  await api(`/api/models/${encodeURIComponent(model.id)}/load`, {});
+  localLog(`model load requested: ${libraryDisplayName("model", model)}`);
 }
 
 function renderModelResidency(host, model, processGpu = []) {
@@ -8810,9 +8716,16 @@ function renderModelResidency(host, model, processGpu = []) {
   load.dataset.residencyAction = "load";
   load.textContent = status.state === "error" ? "Retry" : "Load";
   load.disabled = !model.path || !model.playable;
-  load.addEventListener("click", (event) => {
+  load.addEventListener("click", async (event) => {
     event.stopPropagation();
-    openModelLoadDialog(model);
+    load.disabled = true;
+    try {
+      await requestModelLoad(model);
+    } catch (err) {
+      toastError(err);
+    } finally {
+      load.disabled = !model.path || !model.playable;
+    }
   });
   const unload = document.createElement("button");
   unload.type = "button";
@@ -8842,6 +8755,12 @@ function renderModelResidency(host, model, processGpu = []) {
     bar.setAttribute("aria-label", "Model loading in progress");
     const label = document.createElement("span");
     label.textContent = `${MODEL_LOAD_PHASES[working.phase] || working.phase} · ${working.completed_steps}/${working.total_steps} stages`;
+    if (Number.isFinite(working.elapsed_ms)) {
+      label.textContent += ` · ${(working.elapsed_ms / 1000).toFixed(1)}s elapsed`;
+    }
+    if (Number.isFinite(working.phase_elapsed_ms)) {
+      label.textContent += ` (${(working.phase_elapsed_ms / 1000).toFixed(1)}s this stage)`;
+    }
     progress.append(bar, label);
     children.push(progress);
   }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import logging
 import queue
 import sys
 import threading
@@ -19,6 +20,7 @@ from .policy import (
 )
 
 _COLD_LOAD_LOCK = threading.Lock()
+logger = logging.getLogger(__name__)
 
 
 class PolicyBusyError(RuntimeError):
@@ -159,6 +161,9 @@ class _Entry:
     condition: threading.Condition = field(default_factory=threading.Condition)
     requested_at: float = field(default_factory=time.monotonic)
     load_ms: float | None = None
+    load_started_at: float | None = None
+    phase_started_at: float | None = None
+    stage_durations_ms: dict[str, float] = field(default_factory=dict)
 
 
 class PolicyLease:
@@ -319,13 +324,24 @@ class PolicyResidencyManager:
             with self._lock:
                 if entry.invalidated or self._closed:
                     continue
-                entry.state, entry.phase = "loading", "config"
+                entry.state, entry.phase = "loading", "waiting"
+                entry.load_started_at = time.perf_counter()
+                entry.phase_started_at = entry.load_started_at
+                entry.stage_durations_ms.clear()
                 self._changed()
             started = time.perf_counter()
 
             def progress(phase: str, completed: int, target: _Entry = entry) -> None:
                 with self._lock:
                     if not target.invalidated:
+                        now = time.perf_counter()
+                        if target.phase_started_at is not None:
+                            elapsed = (now - target.phase_started_at) * 1000.0
+                            target.stage_durations_ms[target.phase] = (
+                                target.stage_durations_ms.get(target.phase, 0.0) + elapsed
+                            )
+                            logger.info("model load %s: %s took %.3fs", target.source_path, target.phase, elapsed / 1000)
+                        target.phase_started_at = now
                         target.phase = phase
                         target.completed_steps = completed
                         self._changed()
@@ -348,9 +364,16 @@ class PolicyResidencyManager:
                 storages = _tensor_storages(loaded)
                 byte_count = sum(storages.values())
                 resolved_key = self.identity(entry.source_path, entry.device, entry.extra)
+                progress("finalizing", entry.total_steps)
             except Exception as exc:  # noqa: BLE001 - failures belong to one entry
                 with self._lock:
                     if not entry.invalidated:
+                        if entry.phase_started_at is not None:
+                            elapsed = (time.perf_counter() - entry.phase_started_at) * 1000.0
+                            entry.stage_durations_ms[entry.phase] = (
+                                entry.stage_durations_ms.get(entry.phase, 0.0) + elapsed
+                            )
+                        logger.exception("model load failed during %s: %s", entry.phase, entry.source_path)
                         entry.state, entry.phase = "error", "error"
                         entry.error = f"{type(exc).__name__}: {exc}"
                         self._changed()
@@ -378,6 +401,7 @@ class PolicyResidencyManager:
                     entry.state, entry.phase = "ready", "ready"
                     entry.completed_steps = entry.total_steps
                     entry.load_ms = (time.perf_counter() - started) * 1000.0
+                    logger.info("model ready in %.3fs: %s", entry.load_ms / 1000, entry.source_path)
                     self._changed()
                     stored = True
             with entry.condition:
@@ -467,6 +491,15 @@ class PolicyResidencyManager:
                     "error": item.error,
                     "gpu_bytes": item.bytes,
                     "load_ms": item.load_ms,
+                    "elapsed_ms": (
+                        (time.perf_counter() - item.load_started_at) * 1000.0
+                        if item.state == "loading" and item.load_started_at is not None else item.load_ms
+                    ),
+                    "phase_elapsed_ms": (
+                        (time.perf_counter() - item.phase_started_at) * 1000.0
+                        if item.state == "loading" and item.phase_started_at is not None else None
+                    ),
+                    "stage_durations_ms": dict(item.stage_durations_ms),
                 }
                 for item in entries
             ]

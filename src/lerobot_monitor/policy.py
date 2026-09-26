@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import re
 import sys
 from collections import deque
 from contextlib import contextmanager
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def _prefer_hub_cache() -> Iterator[None]:
-    """Fail closed against the network if weights are already in the HF cache."""
+    """Hint newly imported Hub modules; existing imports still need local paths/options."""
     key = "HF_HUB_OFFLINE"
     previous = os.environ.get(key)
     os.environ[key] = "1"
@@ -194,13 +195,23 @@ class ActionChunk:
 
 
 def resolve_cached_policy_path(path: str, revision: str = "") -> str | None:
-    """Resolve a repo id to an already-cached local snapshot without touching the Hub."""
+    """Resolve repo IDs and relocated snapshot paths without touching the Hub."""
     local_path = Path(path).expanduser()
     if local_path.is_dir():
         return str(local_path.resolve())
     try:
         from .library import cached_hub_snapshot, is_policy_dir
         from .model_hub import parse_remote
+
+        # Presets can outlive a move of HF_HOME. A missing snapshot can only be
+        # recovered from the same repo and commit, never from its latest revision.
+        snapshot_path = re.search(
+            r"(?:^|/)models--([^/]+)/snapshots/([0-9a-f]{40})/?$", path.replace("\\", "/")
+        )
+        if snapshot_path:
+            repo_id = snapshot_path[1].replace("--", "/")
+            snapshot = cached_hub_snapshot(repo_id, snapshot_path[2])
+            return snapshot if snapshot and is_policy_dir(Path(snapshot)) else None
 
         parsed = parse_remote(path, revision=revision)
     except Exception:
@@ -213,6 +224,33 @@ def resolve_cached_policy_path(path: str, revision: str = "") -> str | None:
     return snapshot
 
 
+def resolve_cached_vlm_path(path: str, *, require_weights: bool) -> str | None:
+    """Resolve a backbone independently of LeRobot policy metadata.
+
+    SmolVLA checkpoints already contain the backbone tensors, so their VLM
+    dependency can consist only of configuration and processor/tokenizer files.
+    Let Transformers validate those files when loading the local directory.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+    from huggingface_hub.utils import HFValidationError
+
+    from .library import _has_policy_weights
+
+    local_path = Path(path).expanduser()
+    if not local_path.is_dir():
+        try:
+            # Resolve refs with the Hub's own cache rules; never probe the network.
+            local_path = Path(snapshot_download(path, local_files_only=True))
+        except (LocalEntryNotFoundError, HFValidationError):
+            return None
+    if not (local_path / "config.json").is_file():
+        return None
+    if require_weights and not _has_policy_weights(local_path):
+        return None
+    return str(local_path.resolve())
+
+
 def load_policy(
     path: str,
     *,
@@ -223,6 +261,11 @@ def load_policy(
     extra: Mapping[str, str] | None = None,
     progress: Callable[[str, int], None] | None = None,
 ) -> LoadedPolicy:
+    def report(phase: str, completed: int) -> None:
+        if progress is not None:
+            progress(phase, completed)
+
+    report("imports", 0)
     ensure_lerobot_on_path()
     import torch
 
@@ -230,6 +273,7 @@ def load_policy(
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
     from lerobot.utils.constants import ACTION
 
+    report("cache", 0)
     requested_revision = str((extra or {}).get("policy.pretrained_revision", "")).strip()
     cached_path = resolve_cached_policy_path(path, requested_revision)
     load_path = cached_path or path
@@ -245,10 +289,6 @@ def load_policy(
             f"or set device=cpu."
         )
 
-    def report(phase: str, completed: int) -> None:
-        if progress is not None:
-            progress(phase, completed)
-
     def _load(*, local_only: bool) -> LoadedPolicy:
         kwargs = {"local_files_only": local_only}
         report("config", 0)
@@ -259,10 +299,21 @@ def load_policy(
         apply_policy_overrides(cfg, extra)
         vlm_model_name = getattr(cfg, "vlm_model_name", None)
         if isinstance(vlm_model_name, str) and vlm_model_name:
-            cached_vlm = resolve_cached_policy_path(vlm_model_name)
+            cached_vlm = resolve_cached_vlm_path(
+                vlm_model_name, require_weights=getattr(cfg, "load_vlm_weights", True),
+            )
             if cached_vlm is not None:
                 logger.info("using cached VLM snapshot for %s: %s", vlm_model_name, cached_vlm)
                 cfg.vlm_model_name = cached_vlm
+            elif local_only and cfg.type == "smolvla":
+                # The policy's local_files_only flag is not forwarded into its
+                # backbone constructor. Fail before that constructor can use HTTP.
+                raise FileNotFoundError(
+                    f"VLM dependency {vlm_model_name!r} is not cached for this configuration. "
+                    "Cache its config and processor/tokenizer files"
+                    + (" and model weights" if cfg.load_vlm_weights else "")
+                    + ", or set policy.vlm_model_name to a complete local directory."
+                )
         report("weights", 1)
         policy_cls = get_policy_class(cfg.type)
         policy = policy_cls.from_pretrained(load_path, config=cfg, local_files_only=local_only)

@@ -1,5 +1,31 @@
 # LeRobot Monitor
 
+## 2026-09-26：简化加载与 Rollout / Debug 模型复用
+
+架构：继续共享 `PolicyResidencyManager` 和 LeRobot 加载器；Library 一键加载权重，运行参数仅由推理入口应用。
+
+证据与难点：Debug 的 SmolVLA 预设引用已不存在的 C 盘 Hub 快照，Rollout 引用 D 盘的同一提交。仅修复失效的标准 Hub 快照路径，严格保持 repo 与 commit 一致，不能改为最新版本或覆盖仍存在的本地目录。
+
+里程碑：
+1. [x] 核对预设、路径存在性及共享缓存入口。
+2. [x] 删除加载参数弹窗；解析迁移后的同版本缓存；显示 Debug 缓存命中。
+3. [x] 验证 Rollout → Debug 只调用一次加载器，补齐版本隔离测试与开发记录（71 项回归通过）。
+
+## 2026-09-26：SmolVLA512 冷加载停顿
+
+架构：保留 LeRobot 原生模型构造与权重加载，在 Monitor 中分别解析 policy 权重缓存和 VLM 配置/处理器缓存；通过现有加载回调记录真实阶段和耗时。
+
+证据：运行服务记录加载 529.162 秒；本地 policy 是单个 1.20 GB safetensors，`load_vlm_weights=false`。VLM 已缓存配置和 tokenizer，却被 `is_policy_dir` 拒绝；运行期设置 `HF_HUB_OFFLINE` 不会改变已导入 Hub 的离线常量。独立进程拦截到 config、processor 和聊天模板请求；显式指定本地 VLM 后完整 CUDA 加载 41.286 秒且无 HTTP 请求。
+
+难点：VLM 缓存不应要求 LeRobot 的机器人输入/输出字段；需要 backbone 权重的配置仍必须检查权重；等待加载锁、导入和配置读取不能统一显示为配置阶段。保留模型初始化数值行为，不跳过可能未包含在 checkpoint 中的参数或 buffer。
+
+里程碑：
+1. [x] 核对运行环境、实际配置、缓存及网络调用栈。
+2. [x] 修复 VLM 缓存解析和阶段耗时显示。
+3. [x] 回归测试、真实权重离线 CUDA 加载及开发记录。
+
+验证：42 项缓存/策略/常驻生命周期测试通过；同一模型 ID 在独立进程完整 CUDA 加载 39.857 秒，HTTP 拦截计数为零，常驻实例复用成功。运行中的服务仍使用原代码，重启后采用修复；529 秒的原加载没有阶段计时，不能准确分摊当时各阶段耗时。
+
 ## 实施中：Bug 审核与异步 Rollout（2026-09-26）
 
 实施调整（用户要求优先复用 LeRobot）：以现有 `RTCInferenceEngine`、`ActionQueue`、处理器、延迟补偿与停止协议为主体，先消除 Monitor 接入侧的同步工作，并将通用并发修复放回 LeRobot。远程 `async_inference` 的 RobotClient 自行持有硬件，不能与 Monitor 总线所有者直接并用；独立进程/自定义 IPC 暂不作为本轮前置要求。旧设计中的进程迁移部分保留为候选，非本轮已承诺实现。先完成 M1，再逐项验证可复用引擎的观测、队列和遥测边界。

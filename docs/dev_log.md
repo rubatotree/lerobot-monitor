@@ -1,5 +1,26 @@
 # Dev log
 
+## 2026-09-26：移除加载参数并恢复跨入口模型复用
+
+- Library 的 Load 直接发起加载，不再打开 Settings / Device / JSON 参数弹窗；服务端使用配置设备，运行参数留给 Rollout / Debug。加载 API 保留可选 device，忽略旧客户端的 extra，避免预加载改变后续会话的模型配置。
+- 根因证据：`SmolVLA_Test` Debug 预设指向已经不存在的 `C:\Users\Admin\.cache\huggingface`，Rollout 指向 `D:\Cache\huggingface`，两者仓库与提交 `e0202ea0976391e7b7575a897aa575fd5455bef5` 相同。旧路径不能命中当前实例。
+- 在现有 policy 路径解析器内恢复迁移后的标准 Hub 快照，复用已有缓存查找与模型校验。仅对不存在的目录处理；严格按 repo + 40 位 commit 查找，不回退到最新版本，已有本地目录继续保留原义。不改写用户预设。
+- Debug 完成信息和日志显示 `resident model reused` 或模型加载耗时，直接使用后端 cache_hit / model_load_ms。
+- 验证：`test_model_reuse.py`、`test_policy_residency.py`、`test_policy.py`、`test_app.py` 共 71 项通过。新增跨入口回归走真实 Rollout 加载 worker、驻留管理器、Debug API，仅替换模型计算和硬件；验证加载器只调用一次，旧路径命中同一对象。覆盖提交/仓库隔离、已有目录和缺失权重。新测试 Ruff 检查通过；Node 验证一键加载仅发送空参数，JS 语法通过。
+- 使用实际 Debug 旧路径做只读解析，确认解析到 Rollout 当前快照且缓存身份相同。未执行真实模型推理或硬件动作，未重启现有服务；后端修复需要重启 Monitor 生效。
+- 提交建议：`fix(models): simplify loading and reuse relocated snapshots`。工作区同时存在另一项模型加载诊断改动，未将其混入本任务提交。
+
+## 2026-09-26：SmolVLA512 加载缓存与阶段诊断
+
+- 用户反馈模型加载停在 0/4 数分钟。通过运行服务 `/lerobot/api/models` 确认实际模型为 `rubatotree/so101_classify_the_blocks_smolvla_512`，加载记录 529.162 秒，常驻张量 1,197,716,576 字节。权重文件约 1.20 GB，单文件，配置 `load_vlm_weights=false`。
+- Monitor 的 0/4 是四阶段计数，不是四个 checkpoint 分片。旧实现把等待全局加载锁、首次依赖导入等时间也显示成 Reading configuration。单独测量：torch 导入 2.281 秒，configs 2.362 秒，factory 5.669 秒，本地配置解析 0.036 秒；这些是新诊断进程的结果，原始 529 秒没有阶段明细。
+- 确认缓存缺陷：VLM 缓存复用了 `resolve_cached_policy_path`，其 `is_policy_dir` 同时要求完整权重和 LeRobot input/output features，导致普通 SmolVLM 配置/processor/tokenizer 缓存被拒绝。嵌套的 AutoConfig/AutoProcessor 未收到外层的 local_files_only。运行期设置 `HF_HUB_OFFLINE=1` 时，已经导入的 huggingface_hub 1.30.0 的 `constants.is_offline_mode()` 仍为 False。
+- 独立进程将 httpx.Client.send 替换成记录后拒绝请求的函数，确认原加载访问 config.json、processor_config.json 和 additional_chat_templates 列表；后者的调用栈来自 AutoProcessor。通过显式本地 VLM 路径对照，完整 CUDA 加载 41.286 秒，无 HTTP；其中 VLM 构造 20.033 秒、expert 构造 7.915 秒、safetensors 装载 2.427 秒。
+- 修复：新增 VLM 专用缓存解析，使用 Hub 官方 `snapshot_download(local_files_only=True)` 跟随缓存 refs；配置-only backbone 不要求第二套权重，需要 backbone 权重时仍验证文件/分片齐全。向 AutoConfig/AutoProcessor 和 tokenizer 传本地 snapshot 路径；缓存缺失的本地 SmolVLA 加载在构造前报明确错误。没有修改全进程 Hub 常量，也没有跳过模型初始化或改变精度。
+- 可观测性：区分 waiting、imports、cache、config、weights、device、processors；API 提供 elapsed_ms、phase_elapsed_ms、stage_durations_ms，前端显示当前阶段与耗时，后端记录阶段完成和失败时的阶段。修正离线环境变量 helper 的说明，避免将其误认为对已导入 Hub 的联网屏障。其他策略的嵌套联网行为未在本轮全面审计。
+- 验证：42 项针对缓存、策略覆盖和常驻生命周期的测试，以及 1 项加载/复用/卸载 API 回归通过（共 43 项）；Node JS 语法与 git diff 空白检查通过。修复后使用原模型 ID（无 VLM 路径覆盖）的独立进程 CUDA 加载为 39.857 秒：imports 9.058 秒、cache 0.019 秒、config 0.022 秒、模型构造/权重/首次设备迁移 30.511 秒、device 0.005 秒、processors 0.242 秒。HTTP_ATTEMPTS=[]，常驻 acquire_ready 复用同一对象；测试进程退出后释放自身显存。
+- 限制：新测量是文件缓存已存在时的进程冷启动，不是重启操作系统后的冷磁盘基准；没有原始慢加载的逐阶段追踪，不能把全部差值精确归因于网络。运行服务未重启，现有已加载模型继续可用；下次重启 Monitor 后生效。进一步提速可评估避免完整 backbone/expert 的随机初始化，但须先验证 checkpoint 覆盖率、共享参数和非持久 buffer。
+
 ## 2026-09-26：复用 LeRobot 的异步边界修复
 
 - 按用户新约束调整设计：继续使用 RTCInferenceEngine / SyncInferenceEngine / ActionQueue 及原处理器，不新增 IPC、独立动作调度器或另一套模型缓存。依赖 LeRobot 提交 `79f1e10d`。

@@ -272,7 +272,6 @@ class ModelSaveBody(BaseModel):
 
 class ModelLoadBody(BaseModel):
     device: str | None = None
-    extra: dict[str, str] = Field(default_factory=dict)
 
 
 class ModelUnloadBody(BaseModel):
@@ -1601,7 +1600,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         try:
             entry = await asyncio.to_thread(
                 hub.policy_residency.request, path, body.device or hub.config.rollout.device,
-                {str(key): str(value) for key, value in body.extra.items()},
+                {},
             )
         except PolicyBusyError as exc:
             raise HTTPException(409, str(exc)) from exc

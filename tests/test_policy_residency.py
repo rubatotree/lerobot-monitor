@@ -166,6 +166,39 @@ def test_load_is_coalesced_and_ready_model_skips_other_cold_load(tmp_path: Path)
         manager.close()
 
 
+def test_load_status_reports_imports_and_stage_timings(tmp_path: Path) -> None:
+    path = _model(tmp_path / "model")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def loader(source: str, **kwargs: Any) -> Any:
+        kwargs["progress"]("imports", 0)
+        entered.set()
+        assert release.wait(3)
+        kwargs["progress"]("weights", 1)
+        return _loaded(source)
+
+    manager = _manager(loader)
+    try:
+        manager.request(str(path), "cpu", {})
+        assert entered.wait(2)
+        active = manager.status(str(path))["instances"][0]
+        assert active["phase"] == "imports"
+        assert active["completed_steps"] == 0
+        assert active["elapsed_ms"] >= active["phase_elapsed_ms"] >= 0
+        release.set()
+        _wait_for_state(manager, path, "ready")
+        ready = manager.status(str(path))["instances"][0]
+        assert ready["completed_steps"] == 4
+        assert ready["phase_elapsed_ms"] is None
+        assert ready["elapsed_ms"] == ready["load_ms"]
+        assert ready["stage_durations_ms"]["imports"] >= active["phase_elapsed_ms"]
+        assert ready["stage_durations_ms"]["weights"] >= 0
+    finally:
+        release.set()
+        manager.close()
+
+
 def test_busy_and_stopping_instances_cannot_unload(tmp_path: Path) -> None:
     path = _model(tmp_path / "model")
     manager = _manager(lambda path, **kwargs: _loaded(path))

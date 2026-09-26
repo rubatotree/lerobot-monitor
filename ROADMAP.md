@@ -349,6 +349,21 @@ Python compile 与浏览器 smoke 通过。浏览器覆盖固定搜索/工具栏
 状态、内联重命名、显式 Load 日志、刷新恢复、服务重启自动恢复，以及 1024/390px
 无横向溢出。真实串口与相机的换端口连接仍需在硬件现场做最终 soak 验证。
 
+## 已完成（2026-09-25）：Rollout 推理时间轴可视化
+
+目标：在 `Commanded action` 图下方补充 chunk 输入时刻、chunk 执行长度、重叠区间和真实推理耗时，并通过现有图例独立控制、进入 hover tooltip。
+
+实现边界：
+
+- `RolloutTimeline` 只记录 rollout 期间的推理区间与交接，窗口 20 s、最多 256 块；所有公开方法失败安全，异常不进入控制循环。
+- RTC 仅包装 `predict_action_chunk`，保留原签名并在共享策略实例上幂等绑定；sync 由 `PolicyWorker` 逐次打点，结果被消费时确认绿线。
+- `rollout_timeline` 作为纯新增快照键，经现有 WebSocket 路径透传；`mode != "rollout"` 时为 `null`。
+- `rollout-lanes.js` 负责任务相对时间到图表绝对时间的映射、两行贪心分行、重叠检测、窗口裁剪和缺失 steps 回退；渲染层不伪造绿线或长度带。
+- `app.js` 在 action chart 预留 26 px 固定泳道，增加 4 个持久化图例开关和泳道 tooltip；state chart 不增加开销。
+- 不修改上游 `lerobot/`、不新增 HTTP 端点，也不改变 `policy_residency.py` / `model_hub.py` 行为。
+
+验收：后端定向 `93 passed`；Node 纯函数 `6 passed`；Playwright 在 1440×900 与 390×844 共 `38/38` 检查通过并生成截图；完整可选依赖环境 `317 passed, 1 skipped`。
+
 ## 已完成（2026-09-22）：Action 序列图可读性
 
 目标：让底部 `Commanded action` 图在遥操作、录制与 rollout 时保持稳定的时间语义，并在不改变关节控制值的前提下限制视觉范围。

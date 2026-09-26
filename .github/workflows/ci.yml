@@ -19,5 +19,6 @@ jobs:
       - run: uv sync --extra dev
       - run: uv run pytest -q
       - run: node --check src/lerobot_monitor/web/static/app.js
+      - run: node scripts/test-rollout-lanes.mjs
       - run: node scripts/verify-model-delete-id.cjs
       - run: node scripts/verify-dataset-delete-order.cjs

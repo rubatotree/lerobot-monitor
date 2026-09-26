@@ -7,8 +7,10 @@ observation state ``(J,)`` and action chunk ``(B, T, A)``.
 """
 
 import contextlib
+import inspect
 import sys
 import types
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,11 +22,14 @@ import pytest
 from lerobot_monitor import model_hub
 from lerobot_monitor.policy import (
     LoadedPolicy,
+    action_queue_state,
     create_monitor_inference_engine,
     inference_config_from_extra,
     inference_leftover_poses,
+    install_inference_timeline,
     predict_action_chunk,
     resolve_cached_policy_path,
+    tensor_steps,
 )
 
 ACTION = "action"
@@ -427,3 +432,84 @@ def test_create_monitor_engine_installs_rtc_processor(monkeypatch) -> None:
     assert captured["task"] == "pick cube"
     assert captured["fps"] == 15
     assert captured["robot_wrapper"].robot_type == loaded.robot_type
+
+
+def test_install_inference_timeline_is_idempotent_and_preserves_signature(fake_lerobot) -> None:
+    class Timeline:
+        def __init__(self, token: int) -> None:
+            self.token = token
+            self.starts: list[tuple[str, float]] = []
+            self.ends: list[tuple[int | None, bool, int | None]] = []
+
+        def note_inference_start(self, *, kind: str, step_s: float) -> int:
+            self.starts.append((kind, step_s))
+            return self.token
+
+        def note_inference_end(
+            self,
+            token: int | None,
+            *,
+            ok: bool,
+            steps: int | None,
+        ) -> None:
+            self.ends.append((token, ok, steps))
+
+    policy = ChunkPolicy(FakeTensor(np.zeros((1, 4, 6), dtype=np.float32)))
+    first_timeline = Timeline(1)
+    second_timeline = Timeline(2)
+    original = inspect.signature(policy.predict_action_chunk)
+
+    assert install_inference_timeline(policy, first_timeline, step_s=0.05) is True
+    wrapped = policy.predict_action_chunk
+    assert install_inference_timeline(policy, second_timeline, step_s=0.1) is True
+
+    assert policy.predict_action_chunk is wrapped
+    assert inspect.signature(policy.predict_action_chunk) == original
+    policy.predict_action_chunk(None)
+
+    assert first_timeline.starts == []
+    assert second_timeline.starts == [("rtc", 0.1)]
+    assert second_timeline.ends == [(2, True, 4)]
+
+
+def test_inference_timeline_marks_policy_exceptions_failed(fake_lerobot) -> None:
+    class Timeline:
+        def __init__(self) -> None:
+            self.ends: list[tuple[int | None, bool, int | None]] = []
+
+        def note_inference_start(self, *, kind: str, step_s: float) -> int:
+            return 7
+
+        def note_inference_end(
+            self,
+            token: int | None,
+            *,
+            ok: bool,
+            steps: int | None,
+        ) -> None:
+            self.ends.append((token, ok, steps))
+
+    class FailingPolicy:
+        def predict_action_chunk(self, _batch, inference_delay=None, prev_chunk_left_over=None):
+            raise RuntimeError("inference failed")
+
+    policy = FailingPolicy()
+    timeline = Timeline()
+    assert install_inference_timeline(policy, timeline, step_s=0.05) is True
+
+    with pytest.raises(RuntimeError, match="inference failed"):
+        policy.predict_action_chunk(None, inference_delay=2, prev_chunk_left_over=None)
+
+    assert timeline.ends == [(7, False, None)]
+
+
+def test_action_queue_state_supports_rtc_engine_and_sync_policy() -> None:
+    queue = SimpleNamespace(qsize=lambda: 6, get_action_index=lambda: 2)
+    assert action_queue_state(SimpleNamespace(action_queue=queue)) == (6, 2)
+    assert action_queue_state(SimpleNamespace(_action_queue=deque([1, 2, 3]))) == (3, None)
+    assert action_queue_state(SimpleNamespace()) == (None, None)
+
+
+def test_tensor_steps_rejects_malformed_chunks(fake_lerobot) -> None:
+    assert tensor_steps(FakeTensor(np.zeros((1, 5, 6), dtype=np.float32))) == 5
+    assert tensor_steps(np.zeros((6,), dtype=np.float32)) is None

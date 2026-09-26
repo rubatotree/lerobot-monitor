@@ -27,18 +27,21 @@ from .library import DatasetRecorder, VideoLibrary
 from .policy import (
     ActionChunk,
     LoadedPolicy,
+    action_queue_state,
     create_monitor_inference_engine,
-    inference_leftover_poses,
     inference_config_from_extra,
+    inference_leftover_poses,
+    install_inference_timeline,
     load_policy,
     pose_from_action_tensor,
     predict_action_chunk,
 )
-from .policy_worker import PolicyWorker
 from .policy_residency import PolicyLease, PolicyResidencyManager
-from .recording_worker import RecordingWorker
+from .policy_worker import PolicyWorker
 from .record_dataset import RecordDatasetSession, RecordSample, recover_record_publish
+from .recording_worker import RecordingWorker
 from .robot import FollowerArm
+from .rollout_timeline import RolloutTimeline
 from .run_diagnostics import RunDiagnostics
 from .store import JsonStore
 from .thread_priority import set_current_thread_priority
@@ -261,6 +264,8 @@ class ControlLoop:
         self._next_policy_t = 0.0
         # Latest rollout action-chunk preview for the charts (telemetry only).
         self._rollout_prediction: dict[str, Any] | None = None
+        self._rollout_timeline = RolloutTimeline()
+        self._rollout_timeline_debugged = False
         self._prediction_sequence = 0
         self._inference_engine: Any | None = None
         self._inference_worker: PolicyWorker | None = None
@@ -1082,6 +1087,7 @@ class ControlLoop:
             "action": self.action,
             # Dashed overlay for the charts; only meaningful while a rollout runs.
             "prediction": self._rollout_prediction if self.mode == "rollout" else None,
+            "rollout_timeline": self._rollout_timeline.snapshot() if self.mode == "rollout" else None,
             "hold": self.hold_when_idle,
             "task": {
                 "kind": shown,
@@ -2685,6 +2691,7 @@ class ControlLoop:
             self.mode = "idle"
             return
         now = time.perf_counter()
+        self._observe_rollout_queue()
         if self.task_deadline is not None and now >= self.task_deadline:
             self.log("info", "rollout duration reached")
             self._close_writer()
@@ -2703,9 +2710,11 @@ class ControlLoop:
         if worker is not None:
             result = worker.latest()
             if result is not None:
-                self._rollout_infer_ms, action, error, queued = result
+                fallback_infer_ms, action, error, queued = result
                 if error:
                     raise RuntimeError(f"policy inference failed: {error}")
+                self._rollout_infer_ms = self._timeline_latency_ms(fallback_infer_ms)
+                self._note_sync_chunk_ready()
                 if queued and now >= self._next_prediction_t:
                     self._record_rollout_prediction(queued)
                     self._next_prediction_t = now + self._prediction_interval
@@ -2718,7 +2727,9 @@ class ControlLoop:
             if worker is None:
                 started = time.perf_counter()
                 action = engine.get_action(obs_frame)
-                self._rollout_infer_ms = (time.perf_counter() - started) * 1000.0
+                self._observe_rollout_queue()
+                measured_infer_ms = (time.perf_counter() - started) * 1000.0
+                self._rollout_infer_ms = self._timeline_latency_ms(measured_infer_ms)
             elif not worker.submit(obs_frame, dict(self.joints)):
                 self._note_control_event("policy_request_skipped", now)
         if action is not None:
@@ -2836,6 +2847,14 @@ class ControlLoop:
         """Build and start LeRobot's sync or RTC inference engine."""
         try:
             config = inference_config_from_extra(self.rollout_extra)
+            self._rollout_timeline_debugged = False
+            self._rollout_timeline.clear()
+            self._rollout_timeline.set_enabled(True)
+            install_inference_timeline(
+                loaded.policy,
+                self._rollout_timeline,
+                step_s=self._prediction_step_s(),
+            )
             rtc = getattr(config, "rtc", None)
             self.log(
                 "info",
@@ -2868,6 +2887,9 @@ class ControlLoop:
             self._inference_worker = PolicyWorker(
                 engine, _POLICY_INFER_LOCK,
                 preview=lambda joints: inference_leftover_poses(engine, loaded, joints),
+                timeline=self._rollout_timeline,
+                step_s=self._prediction_step_s(),
+                kind="sync",
             )
         self._rollout_hw_feature_spec = hw_features
         self._next_prediction_t = self.task_t0
@@ -2876,6 +2898,7 @@ class ControlLoop:
 
     def _end_rollout(self) -> None:
         """Stop background inference and clear chart state for the current rollout."""
+        self._rollout_timeline.set_enabled(False)
         engine = self._inference_engine
         worker = self._inference_worker
         lease = self._active_policy_lease
@@ -2914,9 +2937,42 @@ class ControlLoop:
     def _clear_rollout_prediction(self) -> None:
         self._rollout_prediction = None
 
+    def _prediction_step_s(self) -> float:
+        return 1.0 / max(1.0, float(self.policy_fps))
+
+    def _rollout_telemetry_error(self, exc: Exception) -> None:
+        if self._rollout_timeline_debugged:
+            return
+        self._rollout_timeline_debugged = True
+        logger.debug("rollout timeline telemetry skipped: %s", exc)
+
+    def _observe_rollout_queue(self) -> None:
+        try:
+            qsize, index = action_queue_state(self._inference_engine)
+            self._rollout_timeline.observe(qsize=qsize, index=index)
+        except Exception as exc:  # noqa: BLE001 - telemetry must not affect control
+            self._rollout_telemetry_error(exc)
+
+    def _note_sync_chunk_ready(self) -> None:
+        try:
+            self._rollout_timeline.note_chunk_ready(
+                steps=1,
+                step_s=self._prediction_step_s(),
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry must not affect control
+            self._rollout_telemetry_error(exc)
+
+    def _timeline_latency_ms(self, fallback_ms: float) -> float:
+        try:
+            latest_ms = self._rollout_timeline.latest_latency_ms()
+        except Exception as exc:  # noqa: BLE001 - telemetry must not affect control
+            self._rollout_telemetry_error(exc)
+            return fallback_ms
+        return fallback_ms if latest_ms is None else latest_ms
+
     def _record_rollout_prediction(self, actions: list[dict[str, float]]) -> None:
         """Publish the future actions already held by LeRobot's RTC action queue."""
-        step_s = 1.0 / max(1.0, float(self.policy_fps))
+        step_s = self._prediction_step_s()
         self._prediction_sequence += 1
         self._rollout_prediction = {
             "id": self._prediction_sequence,

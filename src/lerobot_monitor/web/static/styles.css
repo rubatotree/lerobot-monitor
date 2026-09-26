@@ -3191,6 +3191,7 @@ body.dragging-row { cursor: row-resize; user-select: none; }
 .chart-legend-line.dashed { border-top-style: dashed; }
 .chart-legend-line.now { border-top-color: #f2f0ff; }
 .chart-legend-line.mode { border-top-color: rgba(168, 166, 184, 0.72); }
+.chart-legend-line.chunk { border-top-color: #5dba9a; }
 .chart-legend-line.inference { border-top-color: #58a8ff; }
 .chart-legend-band {
   flex: 0 0 14px;
@@ -3199,6 +3200,18 @@ body.dragging-row { cursor: row-resize; user-select: none; }
   margin-top: 2px;
   background: rgba(224, 107, 122, 0.16);
   border: 1px solid rgba(224, 107, 122, 0.42);
+}
+.chart-legend-band.chunk {
+  background: rgba(93, 186, 154, 0.28);
+  border-color: rgba(93, 186, 154, 0.72);
+}
+.chart-legend-band.overlap {
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(93, 186, 154, 0.14) 0 2px,
+    rgba(93, 186, 154, 0.82) 2px 3px
+  );
+  border-color: rgba(93, 186, 154, 0.72);
 }
 .chart-time-control {
   display: flex;
@@ -3269,6 +3282,17 @@ body.dragging-row { cursor: row-resize; user-select: none; }
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
+.chart-tooltip-lane {
+  margin-bottom: 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+  color: #b9e5d4;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  white-space: normal;
+}
+.chart-tooltip-lane[hidden] { display: none; }
 .chart-tooltip-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;

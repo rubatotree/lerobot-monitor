@@ -1,5 +1,15 @@
 # Dev log
 
+## 2026-09-25（Rollout 推理时间轴可视化）
+
+- 新增线程安全 `RolloutTimeline`：记录 RTC/sync 推理 `[start, end]`、chunk steps/step_s、执行交接 `active` 与失败状态；20 s 输出窗口、最多 256 块，超限优先淘汰未激活旧块。
+- `policy.py` 只包装 `predict_action_chunk` 并对共享策略实例幂等绑定，保留 `__signature__`；RTC 的 chunk 交接由引擎队列 `qsize` 下降或 `index` 归零确认。`PolicyWorker` 对 sync 调用逐次打点，loop 在 worker 结果被消费时记录绿线；嵌套的内部 chunk refill 不重复计数。
+- 快照新增 `rollout_timeline`，非 rollout 为 `null`。`rollout_inference_ms` 优先使用 timeline 的真实 chunk 推理耗时，失败或钩子不可用时回退原实测值，遥测异常不影响控制节拍。
+- 新增 `rollout-lanes.js` 纯函数模块与 action chart 插件：绿线只由有 steps 的有效交接生成；chunk 长度按 `steps × step_s` 绘制为两行带，重叠区叠加 45° 阴影，失败块使用红色描边；推理带独立成行，缺失 steps 只回退 prediction 长度并标记 `chunk:false`。
+- 新增 `chunk input`、`chunk span`、`chunk overlap`、`inference` 四个默认开启图例开关并持久化；action chart 预留固定 26 px 泳道，tooltip 在泳道 hover 时显示 chunk steps、时长、起点、推理耗时和重叠时长。
+
+- 验证：后端遥测定向回归 `93 passed`；Node `scripts/test-rollout-lanes.mjs` 为 `6 passed`；Playwright 临时配置/store 与合成快照在 1440×900、390×844 为 `38/38`，覆盖画布绿/蓝像素、四项图例、开关刷新持久化、lane tooltip、移动端无横向溢出并输出截图。完整 LeRobot 可选依赖环境 `317 passed, 1 skipped`；monitor 自带精简 `.venv` 缺少 `huggingface_hub`，其中 4 项数据集/HF 测试按环境依赖预期失败，其余 `305 passed, 9 skipped`。`node --check`、Python compile、`git diff --check` 与现有 CI 静态脚本通过。
+
 ## 2026-09-25（ACT rollout 预测曲线与配置重载）
 
 - 根因一：ACT 启用 `temporal_ensemble_coeff` 后由 `ACTTemporalEnsembler` 直接输出融合动作，不再维护 `_action_queue`；monitor 的同步预测读取只支持队列，因此曲线始终为空。现改为直接读取 ensembler 中尚未消费的融合动作，不增加第二次 `predict_action_chunk` 推理。

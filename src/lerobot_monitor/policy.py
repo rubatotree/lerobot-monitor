@@ -6,6 +6,7 @@ Cameras live in CameraHub, so this module merges them with the bus observation.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import sys
@@ -13,12 +14,14 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from enum import Enum
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 import numpy as np
 
 from .pathutil import ensure_lerobot_on_path
+from .rollout_timeline import RolloutTimeline
 from .types import JOINT_ORDER, observation_to_pose
 
 logger = logging.getLogger(__name__)
@@ -383,6 +386,96 @@ def _policy_action_queue(policy: Any) -> deque | None:
     return None
 
 
+def action_queue_state(target: Any) -> tuple[int | None, int | None]:
+    """Return ``(remaining, index)`` for a policy or inference-engine queue."""
+    try:
+        queue = getattr(target, "action_queue", None)
+        if queue is None:
+            queue = _policy_action_queue(target)
+        if queue is None:
+            return (None, None)
+        try:
+            qsize_method = getattr(queue, "qsize", None)
+            qsize = int(qsize_method()) if callable(qsize_method) else len(queue)
+        except Exception:  # noqa: BLE001 - telemetry must not affect control
+            qsize = None
+        get_index = getattr(queue, "get_action_index", None)
+        try:
+            index = int(get_index()) if callable(get_index) else None
+        except Exception:  # noqa: BLE001 - telemetry must not affect control
+            index = None
+        return (qsize, index)
+    except Exception as exc:  # noqa: BLE001 - telemetry must not affect control
+        logger.debug("could not read action queue state: %s", exc)
+        return (None, None)
+
+
+def install_inference_timeline(
+    policy: Any,
+    timeline: RolloutTimeline,
+    *,
+    step_s: float,
+) -> bool:
+    """Wrap ``predict_action_chunk`` once and bind it to the active rollout."""
+    try:
+        chunk_method = getattr(policy, "predict_action_chunk", None)
+        if not callable(chunk_method):
+            return False
+        try:
+            normalized_step_s = float(step_s)
+        except (TypeError, ValueError):
+            normalized_step_s = 1.0 / 30.0
+        if normalized_step_s <= 0.0:
+            normalized_step_s = 1.0 / 30.0
+
+        existing = getattr(policy, "_monitor_timeline_state", None)
+        if getattr(policy, "_monitor_timeline_wrapped", False) and isinstance(existing, dict):
+            existing["timeline"] = timeline
+            existing["step_s"] = normalized_step_s
+            return True
+
+        signature = inspect.signature(chunk_method)
+        state: dict[str, Any] = {"timeline": timeline, "step_s": normalized_step_s}
+
+        @wraps(chunk_method)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            active_timeline = state["timeline"]
+            try:
+                token = active_timeline.note_inference_start(
+                    kind="rtc",
+                    step_s=float(state["step_s"]),
+                )
+            except Exception:  # noqa: BLE001 - telemetry must not affect control
+                token = None
+            try:
+                result = chunk_method(*args, **kwargs)
+            except Exception:
+                try:
+                    active_timeline.note_inference_end(token, ok=False, steps=None)
+                except Exception:  # noqa: BLE001, S110 - telemetry must not affect control
+                    pass
+                raise
+            try:
+                active_timeline.note_inference_end(
+                    token,
+                    ok=True,
+                    steps=tensor_steps(result),
+                )
+            except Exception:  # noqa: BLE001, S110 - telemetry must not affect control
+                pass
+            return result
+
+        wrapped.__signature__ = signature  # type: ignore[attr-defined]
+        wrapped._monitor_timeline_wrapped = True  # type: ignore[attr-defined]
+        policy.predict_action_chunk = wrapped
+        policy._monitor_timeline_state = state
+        policy._monitor_timeline_wrapped = True
+        return True
+    except Exception as exc:  # noqa: BLE001 - optional telemetry must not block rollout
+        logger.debug("could not install rollout inference timeline: %s", exc)
+        return False
+
+
 def temporal_ensemble_poses(
     loaded: LoadedPolicy,
     fallback_joints: Mapping[str, float],
@@ -485,6 +578,14 @@ def _as_action_chunk_tensor(value: Any) -> Any:
     if tensor.shape[0] < 1 or tensor.shape[1] < 1 or tensor.shape[2] < 1:
         raise ValueError(f"action chunk must be non-empty, got {tuple(tensor.shape)}")
     return tensor
+
+
+def tensor_steps(value: Any) -> int | None:
+    """Count action steps in a policy chunk without leaking conversion errors."""
+    try:
+        return int(_as_action_chunk_tensor(value).shape[1])
+    except Exception:  # noqa: BLE001 - telemetry must not affect inference
+        return None
 
 
 def predict_action_chunk(

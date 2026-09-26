@@ -53,6 +53,35 @@ class FakeInferenceEngine:
             )
 
 
+class FakeTimeline:
+    """Compact stand-in for RolloutTimeline at the ControlLoop boundary."""
+
+    def __init__(self, latency_ms: float = 62.5) -> None:
+        self.latency_ms = latency_ms
+        self.enabled = False
+        self.observations: list[tuple[int | None, int | None]] = []
+        self.chunk_ready: list[tuple[int, float]] = []
+
+    def clear(self) -> None:
+        self.observations.clear()
+        self.chunk_ready.clear()
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def observe(self, *, qsize: int | None, index: int | None) -> None:
+        self.observations.append((qsize, index))
+
+    def note_chunk_ready(self, *, steps: int, step_s: float) -> None:
+        self.chunk_ready.append((steps, step_s))
+
+    def latest_latency_ms(self) -> float:
+        return self.latency_ms
+
+    def snapshot(self) -> dict | None:
+        return {"t_s": 1.0, "step_s": 0.05, "blocks": []} if self.enabled else None
+
+
 def _dispatch(loop: ControlLoop, kind: str, payload: dict[str, object] | None = None) -> dict:
     """Run one command synchronously and return the handler reply."""
     reply: queue.Queue[dict] = queue.Queue(maxsize=1)
@@ -942,6 +971,117 @@ def test_rollout_prediction_reads_sync_policy_queue(tmp_path: Path, monkeypatch)
     assert loop._rollout_prediction is not None
     assert loop._rollout_prediction["strategy"] == "policy_queue"
     assert loop._rollout_prediction["actions"] == [{"gripper": 1.0}, {"gripper": 2.0}]
+
+
+def test_snapshot_exposes_timeline_only_during_rollout(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    timeline = loop._rollout_timeline
+    loop.mode = "rollout"
+    timeline.set_enabled(True)
+    token = timeline.note_inference_start(kind="rtc", step_s=0.05)
+    timeline.note_inference_end(token, ok=True, steps=4)
+
+    snapshot = loop.snapshot()
+    assert snapshot["rollout_timeline"] is not None
+    assert snapshot["rollout_timeline"]["blocks"][0]["steps"] == 4
+
+    loop.mode = "idle"
+    assert loop.snapshot()["rollout_timeline"] is None
+
+
+def test_rtc_tick_observes_queue_handoff_and_uses_timeline_latency(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    loop = _loop(tmp_path)
+    loop.loaded_policy = SimpleNamespace(policy=SimpleNamespace())
+    loop.mode = "rollout"
+    loop.task_t0 = 10.0
+    loop.policy_fps = 20.0
+    loop._next_policy_t = 0.0
+    loop._next_prediction_t = time.perf_counter() + 1000.0
+    queue_state = SimpleNamespace(remaining=2, index=0)
+    queue_state.qsize = lambda: queue_state.remaining
+    queue_state.get_action_index = lambda: queue_state.index
+    engine = FakeInferenceEngine({"gripper": 1.0})
+    engine.action_queue = queue_state
+
+    def consume(_observation):
+        queue_state.remaining -= 1
+        queue_state.index += 1
+        return {"gripper": 1.0}
+
+    engine.get_action = MagicMock(side_effect=consume)
+    loop._inference_engine = engine
+    timeline = FakeTimeline(latency_ms=62.5)
+    loop._rollout_timeline = timeline
+    monkeypatch.setattr(loop, "_build_rollout_obs_frame", lambda observation: observation)
+
+    loop._tick_rollout()
+
+    assert timeline.observations == [(2, 0), (1, 1)]
+    assert loop._rollout_infer_ms == 62.5
+
+
+def test_sync_tick_marks_chunk_ready_and_uses_timeline_latency(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    loop = _loop(tmp_path)
+    loop.loaded_policy = SimpleNamespace(policy=SimpleNamespace())
+    loop.mode = "rollout"
+    loop.policy_fps = 20.0
+    loop._next_policy_t = 0.0
+    loop._next_prediction_t = time.perf_counter() + 1000.0
+    loop._inference_engine = FakeInferenceEngine({"gripper": 1.0})
+    worker = MagicMock()
+    worker.latest.return_value = (200.0, {"gripper": 1.0}, None, [])
+    worker.submit.return_value = True
+    loop._inference_worker = worker
+    timeline = FakeTimeline(latency_ms=42.0)
+    loop._rollout_timeline = timeline
+    monkeypatch.setattr(loop, "_build_rollout_obs_frame", lambda observation: observation)
+
+    loop._tick_rollout()
+
+    assert timeline.chunk_ready == [(1, 0.05)]
+    assert loop._rollout_infer_ms == 42.0
+    worker.submit.assert_called_once()
+
+
+def test_timeline_telemetry_failure_does_not_interrupt_rollout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class BrokenTimeline(FakeTimeline):
+        def observe(self, *, qsize: int | None, index: int | None) -> None:
+            raise RuntimeError("telemetry unavailable")
+
+        def note_chunk_ready(self, *, steps: int, step_s: float) -> None:
+            raise RuntimeError("telemetry unavailable")
+
+        def latest_latency_ms(self) -> float:
+            raise RuntimeError("telemetry unavailable")
+
+    loop = _loop(tmp_path)
+    loop.loaded_policy = SimpleNamespace(policy=SimpleNamespace())
+    loop.mode = "rollout"
+    loop.policy_fps = 20.0
+    loop._next_policy_t = 0.0
+    loop._next_prediction_t = time.perf_counter() + 1000.0
+    loop._inference_engine = FakeInferenceEngine({"gripper": 1.0})
+    worker = MagicMock()
+    worker.latest.return_value = (200.0, {"gripper": 1.0}, None, [])
+    worker.submit.return_value = True
+    loop._inference_worker = worker
+    loop._rollout_timeline = BrokenTimeline()
+    monkeypatch.setattr(loop, "_build_rollout_obs_frame", lambda observation: observation)
+
+    loop._tick_rollout()
+
+    assert loop._rollout_infer_ms == 200.0
+    assert loop._rollout_timeline_debugged is True
+    worker.submit.assert_called_once()
 
 
 def test_start_inference_engine_uses_hw_features_method(tmp_path: Path, monkeypatch) -> None:

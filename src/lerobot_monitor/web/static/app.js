@@ -178,6 +178,12 @@ const LIVE_MODE_HISTORY_S = 600;
 const CHART_TOOLTIP_TOLERANCE_S = 0.35;
 const CHART_TIME_AXIS_FADE_MS = 140;
 const CHART_TIME_AXIS_PADDING = 18;
+const ROLLOUT_LANE_BAND_PX = 26;
+const ROLLOUT_LANE_ROWS = 2;
+const ROLLOUT_LANE_MAX_BLOCKS = 200;
+const ROLLOUT_OVERLAP_MIN_S = 0.02;
+const ROLLOUT_CHUNK_COLOR = "#5dba9a";
+const ROLLOUT_INFERENCE_COLOR = "#58a8ff";
 const LIVE_RIGHT_PADDING_S = 0.2;
 const LIVE_FRAME_RATE = 30;
 const TIME_LABEL_EDGE_FADE_PX = 24;
@@ -193,8 +199,20 @@ const chartLegendVisibility = {
   gap: true,
   mode: true,
   now: true,
+  chunkIn: true,
+  chunkSpan: true,
+  chunkOverlap: true,
+  inference: true,
   joints: new Map(),
 };
+const CHART_LEGEND_STORAGE_KEY = "lerobot-monitor-chart-legend";
+try {
+  const savedLegend = JSON.parse(localStorage.getItem(CHART_LEGEND_STORAGE_KEY) || "{}");
+  ["command", "prediction", "gap", "mode", "now", "chunkIn", "chunkSpan", "chunkOverlap", "inference"]
+    .forEach((key) => {
+      if (savedLegend && typeof savedLegend[key] === "boolean") chartLegendVisibility[key] = savedLegend[key];
+    });
+} catch { /* ignore */ }
 const CHART_SCALE_OPTIONS = [
   { seconds: 2, label: "2s" },
   { seconds: 10, label: "10s" },
@@ -831,7 +849,55 @@ function animateLiveCharts(frameMs) {
   chartAnimationFrame = requestAnimationFrame(animateLiveCharts);
 }
 
-function chartTooltipModel(chart, seconds) {
+function spanAtTime(spans, seconds) {
+  const target = Number(seconds);
+  if (!Number.isFinite(target)) return null;
+  return (spans || []).find((span) => (
+    target >= Number(span.start) && target <= Number(span.end)
+  )) || null;
+}
+
+function pointerYInRolloutLanes(chart, pointerY) {
+  const lanes = chart && chart.$rolloutLanes;
+  const area = chart && chart.chartArea;
+  const y = Number(pointerY);
+  const laneHeight = Number(chart && chart.$laneHeight) || 0;
+  if (!lanes || !area || !Number.isFinite(y) || laneHeight <= 0) return false;
+  return y >= area.bottom + 3 && y <= area.bottom + laneHeight;
+}
+
+function pointerInRolloutLanes(chart) {
+  return pointerYInRolloutLanes(chart, chart && chart.$pointerPosition && chart.$pointerPosition.y);
+}
+
+function rolloutLaneTooltipModel(chart, seconds) {
+  const lanes = chart && chart.$rolloutLanes;
+  if (!lanes) return null;
+  const chunk = spanAtTime((lanes.chunks || []).filter((span) => span.chunk), seconds);
+  const inference = spanAtTime(lanes.inferences, seconds);
+  const overlap = spanAtTime(lanes.overlaps, seconds);
+  if (!chunk && !inference && !overlap) return null;
+  const parts = [];
+  if (chunk) {
+    parts.push(
+      `chunk #${chunk.id} · ${chunk.steps} steps · ${(chunk.end - chunk.start).toFixed(2)} s`
+      + ` · start ${formatChartTimeValue(chunk.active, chart, true)}`
+      + (chunk.failed ? " · failed" : ""),
+    );
+  }
+  if (inference) {
+    parts.push(`inference ${Math.round((inference.end - inference.start) * 1000)} ms`);
+  }
+  if (overlap) parts.push(`overlap ${overlap.duration.toFixed(2)} s`);
+  return {
+    text: parts.join(" · "),
+    chunk,
+    inference,
+    overlap,
+  };
+}
+
+function chartTooltipModel(chart, seconds, laneHovered = false) {
   const rawTarget = Number(seconds);
   if (!chart || !Number.isFinite(rawTarget)) return null;
   const target = snapChartTimeToFrame(chart, rawTarget);
@@ -883,9 +949,11 @@ function chartTooltipModel(chart, seconds) {
       const rightIndex = known.indexOf(right);
       return (leftIndex < 0 ? known.length : leftIndex) - (rightIndex < 0 ? known.length : rightIndex);
     });
-  if (!names.length) return null;
+  const lane = laneHovered ? rolloutLaneTooltipModel(chart, target) : null;
+  if (!names.length && !lane) return null;
   return {
     gap: !!gap,
+    lane,
     rows: names.map((name) => ({
       name,
       actual: actual.get(name) || null,
@@ -990,6 +1058,14 @@ function buildChartHoverTooltip(chart, model) {
     gap.textContent = "gap";
     header.appendChild(gap);
   }
+  tooltip.appendChild(header);
+  const lane = document.createElement("div");
+  lane.className = "chart-tooltip-lane";
+  lane.hidden = !model.lane;
+  if (model.lane) lane.textContent = model.lane.text;
+  tooltip.appendChild(lane);
+  chart.$tooltipLaneElement = lane;
+  if (!model.rows.length) return;
   const grid = document.createElement("div");
   grid.className = "chart-tooltip-grid";
   ["joint", "actual", "pred"].forEach((label) => {
@@ -1011,19 +1087,20 @@ function buildChartHoverTooltip(chart, model) {
     chart.$tooltipActualCells.push(actual);
     chart.$tooltipPredictionCells.push(predicted);
   });
-  tooltip.append(header, grid);
+  tooltip.appendChild(grid);
 }
 
 function renderChartHoverTooltip(chart, seconds, pointerX, pointerY) {
   const tooltip = chart && chart.$hoverTooltipElement;
   if (!tooltip || chart.$tooltipVisible === false) return;
-  const model = chartTooltipModel(chart, seconds);
+  const model = chartTooltipModel(chart, seconds, pointerInRolloutLanes(chart));
   if (!model) {
     hideChartHoverTooltip(chart);
     return;
   }
   const structure = [
     model.gap ? "gap" : "no-gap",
+    model.lane ? model.lane.text : "no-lane",
     model.rows.map((row) => row.name).join("|"),
   ].join("::");
   if (tooltip.dataset.structure !== structure) {
@@ -1034,6 +1111,11 @@ function renderChartHoverTooltip(chart, seconds, pointerX, pointerY) {
   if (time) time.textContent = formatChartTimeValue(model.time, chart, true);
   const gap = tooltip.querySelector(".chart-tooltip-gap");
   if (gap) gap.hidden = !model.gap;
+  const lane = chart.$tooltipLaneElement;
+  if (lane) {
+    lane.hidden = !model.lane;
+    lane.textContent = model.lane ? model.lane.text : "";
+  }
   model.rows.forEach((row, index) => {
     const actual = chart.$tooltipActualCells && chart.$tooltipActualCells[index];
     const predicted = chart.$tooltipPredictionCells && chart.$tooltipPredictionCells[index];
@@ -1106,7 +1188,13 @@ const chartHoverTooltipPlugin = {
       hideChartHoverTooltip(chart);
       return;
     }
-    if (pointerX < area.left || pointerX > area.right || pointerY < area.top || pointerY > area.bottom) {
+    const inLanes = pointerYInRolloutLanes(chart, pointerY);
+    if (
+      pointerX < area.left
+      || pointerX > area.right
+      || pointerY < area.top
+      || (pointerY > area.bottom && !inLanes)
+    ) {
       chart.$pointerPosition = null;
       hideChartHoverTooltip(chart);
       return;
@@ -1204,6 +1292,108 @@ const modeMarkerPlugin = {
   },
 };
 
+const rolloutLanesPlugin = {
+  id: "rolloutLanes",
+  beforeDatasetsDraw(chart) {
+    const lanes = chart.$rolloutLanes;
+    const area = chart.chartArea;
+    const xScale = chart.scales && chart.scales.x;
+    const laneHeight = Number(chart.$laneHeight) || 0;
+    if (!lanes || !area || !xScale || laneHeight <= 0 || chartLegendVisibility.chunkIn === false) return;
+    const ctx = chart.ctx;
+    const bottom = area.bottom + laneHeight;
+    ctx.save();
+    lanes.inputs.forEach((marker) => {
+      const x = xScale.getPixelForValue(Number(marker.x));
+      if (!Number.isFinite(x) || x < area.left || x > area.right) return;
+      ctx.fillStyle = "rgba(93, 186, 154, 0.10)";
+      ctx.fillRect(x - 1.5, area.top, 3, bottom - area.top);
+      ctx.strokeStyle = "rgba(93, 186, 154, 0.55)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, area.top);
+      ctx.lineTo(x + 0.5, bottom);
+      ctx.stroke();
+    });
+    ctx.restore();
+  },
+  afterDatasetsDraw(chart) {
+    const lanes = chart.$rolloutLanes;
+    const area = chart.chartArea;
+    const xScale = chart.scales && chart.scales.x;
+    const laneHeight = Number(chart.$laneHeight) || 0;
+    if (!lanes || !area || !xScale || laneHeight <= 0) return;
+    const ctx = chart.ctx;
+    const baseTop = area.bottom + 4;
+    const xRange = (span) => {
+      const left = Math.max(area.left, xScale.getPixelForValue(Number(span.start)));
+      const right = Math.min(area.right, xScale.getPixelForValue(Number(span.end)));
+      return Number.isFinite(left) && Number.isFinite(right) && right > left
+        ? { left, right }
+        : null;
+    };
+    ctx.save();
+    const drawStats = { chunks: 0, inferences: 0, overlaps: 0 };
+    if (chartLegendVisibility.inference !== false) {
+      lanes.inferences.forEach((span) => {
+        const range = xRange(span);
+        if (!range) return;
+        drawStats.inferences += 1;
+        ctx.fillStyle = "rgba(88, 168, 255, 0.28)";
+        ctx.strokeStyle = span.failed ? "#e06b7a" : "rgba(88, 168, 255, 0.72)";
+        ctx.lineWidth = 1;
+        ctx.fillRect(range.left, baseTop, range.right - range.left, 8);
+        ctx.strokeRect(range.left + 0.5, baseTop + 0.5, range.right - range.left - 1, 7);
+      });
+    }
+    const chunkTop = baseTop + 10;
+    const rowHeight = 6;
+    const rowGap = 2;
+    if (chartLegendVisibility.chunkSpan !== false) {
+      lanes.chunks.filter((span) => span.chunk).forEach((span) => {
+        const range = xRange(span);
+        if (!range) return;
+        drawStats.chunks += 1;
+        const row = Math.max(0, Math.floor(Number(span.row) || 0));
+        const top = chunkTop + row * (rowHeight + rowGap);
+        ctx.fillStyle = "rgba(93, 186, 154, 0.28)";
+        ctx.strokeStyle = span.failed ? "#e06b7a" : "rgba(93, 186, 154, 0.72)";
+        ctx.lineWidth = 1;
+        ctx.fillRect(range.left, top, range.right - range.left, rowHeight);
+        ctx.strokeRect(range.left + 0.5, top + 0.5, range.right - range.left - 1, rowHeight - 1);
+      });
+    }
+    if (chartLegendVisibility.chunkSpan !== false && chartLegendVisibility.chunkOverlap !== false) {
+      lanes.overlaps.forEach((overlap) => {
+        const range = xRange(overlap);
+        if (!range) return;
+        drawStats.overlaps += 1;
+        const rows = overlap.rows && overlap.rows.length ? overlap.rows : [0, 1];
+        const firstRow = Math.max(0, Math.min(...rows));
+        const lastRow = Math.max(firstRow, Math.max(...rows));
+        const top = chunkTop + firstRow * (rowHeight + rowGap);
+        const bottom = chunkTop + lastRow * (rowHeight + rowGap) + rowHeight;
+        const height = bottom - top;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(range.left, top, range.right - range.left, height);
+        ctx.clip();
+        ctx.strokeStyle = "rgba(93, 186, 154, 0.85)";
+        ctx.lineWidth = 1;
+        for (let x = range.left - height; x <= range.right + height; x += 6) {
+          ctx.beginPath();
+          ctx.moveTo(x, bottom);
+          ctx.lineTo(x + height, top);
+          ctx.stroke();
+        }
+        ctx.restore();
+      });
+    }
+    ctx.restore();
+    chart.$rolloutLaneDrawStats = drawStats;
+  },
+};
+
 const pixelAlignedLinePlugin = {
   id: "pixelAlignedLine",
   beforeDatasetsDraw(chart) {
@@ -1249,6 +1439,8 @@ const timeAxisFadePlugin = {
     const scale = chart.scales && chart.scales.x;
     const area = chart.chartArea;
     if (!scale || !area) return;
+    const laneHeight = Number(chart.$laneHeight) || 0;
+    const labelTop = area.bottom + 7 + laneHeight;
     const ticks = chartTimeTicks(chart, scale);
     if (!ticks.length) return;
     chart.$drawnTimeTicks = ticks;
@@ -1282,13 +1474,13 @@ const timeAxisFadePlugin = {
       const alpha = Math.min(leftAlpha, rightAlpha);
       if (alpha <= 0.01) return;
       ctx.globalAlpha = alpha;
-      ctx.fillText(tick.label, x, area.bottom + 7);
+      ctx.fillText(tick.label, x, labelTop);
     });
     ctx.globalAlpha = 1;
     ctx.textAlign = "left";
-    ctx.fillText(leftLabel, area.left + 2, area.bottom + 7);
+    ctx.fillText(leftLabel, area.left + 2, labelTop);
     ctx.textAlign = "right";
-    ctx.fillText(rightLabel, area.right - 2, area.bottom + 7);
+    ctx.fillText(rightLabel, area.right - 2, labelTop);
     ctx.restore();
   },
 };
@@ -1301,6 +1493,7 @@ const pointerValuePlugin = {
     const yScale = chart.scales && chart.scales.y;
     const area = chart.chartArea;
     if (!pointer || !pointer.inside || !xScale || !yScale || !area) return;
+    if (pointer.y < area.top || pointer.y > area.bottom) return;
     const value = interpolateScaleValueFromTicks(yScale, pointer.y);
     if (!Number.isFinite(value)) return;
     const ctx = chart.ctx;
@@ -1392,6 +1585,7 @@ function mkChart(id) {
   };
   if (!canvas) return null;
   if (typeof window.Chart !== "function") return unavailable("Charts unavailable — live controls are still active.");
+  const laneHeight = id === "chart-action" ? ROLLOUT_LANE_BAND_PX : 0;
   try {
     const chart = new window.Chart(canvas.getContext("2d"), {
     type: "line",
@@ -1401,7 +1595,7 @@ function mkChart(id) {
       responsive: true,
       maintainAspectRatio: false,
       clip: 0,
-      layout: { padding: { bottom: CHART_TIME_AXIS_PADDING } },
+      layout: { padding: { bottom: CHART_TIME_AXIS_PADDING + laneHeight } },
       elements: {
         point: { radius: 0, hoverRadius: 0, hoverBorderWidth: 0 },
         line: {
@@ -1430,12 +1624,15 @@ function mkChart(id) {
     plugins: [
       predictionGapPlugin,
       modeMarkerPlugin,
+      rolloutLanesPlugin,
       timeAxisFadePlugin,
       pixelAlignedLinePlugin,
       pointerValuePlugin,
       chartHoverTooltipPlugin,
     ],
     });
+    chart.$laneHeight = laneHeight;
+    chart.$rolloutLanes = null;
     const cursor = document.createElement("span");
     cursor.className = "chart-replay-cursor";
     cursor.hidden = true;
@@ -1492,9 +1689,19 @@ function legendItemVisible(group, key) {
   return chartLegendVisibility[key] !== false;
 }
 
+function persistChartLegendVisibility() {
+  const saved = {};
+  ["command", "prediction", "gap", "mode", "now", "chunkIn", "chunkSpan", "chunkOverlap", "inference"]
+    .forEach((key) => { saved[key] = chartLegendVisibility[key] !== false; });
+  try { localStorage.setItem(CHART_LEGEND_STORAGE_KEY, JSON.stringify(saved)); } catch { /* ignore */ }
+}
+
 function setLegendItemVisible(group, key, visible) {
   if (group === "joints") chartLegendVisibility.joints.set(key, visible);
-  else chartLegendVisibility[key] = visible;
+  else {
+    chartLegendVisibility[key] = visible;
+    persistChartLegendVisibility();
+  }
 }
 
 function isDatasetLegendVisible(dataset) {
@@ -1659,6 +1866,10 @@ function renderActionLegend(names = actionLegendNames) {
   }
   if (rolloutMode) {
     appendLegendItem(lines, "chart-legend-line now", "current time", "", { group: "style", key: "now" });
+    appendLegendItem(lines, "chart-legend-line chunk", "chunk input", "", { group: "style", key: "chunkIn" });
+    appendLegendItem(lines, "chart-legend-band chunk", "chunk span", "", { group: "style", key: "chunkSpan" });
+    appendLegendItem(lines, "chart-legend-band overlap", "chunk overlap", "", { group: "style", key: "chunkOverlap" });
+    appendLegendItem(lines, "chart-legend-line inference", "inference", "", { group: "style", key: "inference" });
   }
 
   const time = document.createElement("section");
@@ -2031,17 +2242,44 @@ function renderRolloutOverlays(now) {
   applyRolloutOverlay(actionChart, now);
 }
 
+function updateRolloutLanes(timeline, prediction, chartNow, liveNow) {
+  const build = window.RolloutLanes && window.RolloutLanes.buildRolloutLanes;
+  const lanes = typeof build === "function" && timeline
+    ? build({
+      timeline,
+      prediction,
+      chartNow,
+      windowS: 20,
+      lookaheadS: rolloutFutureWindowS(liveNow),
+      maxBlocks: ROLLOUT_LANE_MAX_BLOCKS,
+      overlapMinS: ROLLOUT_OVERLAP_MIN_S,
+      rows: ROLLOUT_LANE_ROWS,
+    })
+    : null;
+  vizState.rolloutLanes = lanes;
+  if (actionChart) actionChart.$rolloutLanes = lanes;
+  if (stateChart) stateChart.$rolloutLanes = null;
+  return lanes;
+}
+
+function clearRolloutLanes() {
+  vizState.rolloutLanes = null;
+  if (actionChart) actionChart.$rolloutLanes = null;
+  if (stateChart) stateChart.$rolloutLanes = null;
+}
+
 function clearRolloutPredictions() {
   const hasOverlay = (chart) => !!(
     chart
     && ((chart.$predictions || []).length || (chart.$predictionGaps || []).length)
   );
   const hasChunks = rolloutPredictionList().length > 0;
-  if (!hasChunks && !hasOverlay(stateChart) && !hasOverlay(actionChart)) return;
+  const hasLanes = !!(vizState.rolloutLanes || (actionChart && actionChart.$rolloutLanes));
+  if (!hasChunks && !hasLanes && !hasOverlay(stateChart) && !hasOverlay(actionChart)) return;
   if (jointSyncSource === "prediction") jointPredictionStale = true;
   vizState.rolloutPredictions = [];
+  clearRolloutLanes();
   [stateChart, actionChart].forEach((chart) => {
-    if (!hasOverlay(chart)) return;
     chart.$predictions = [];
     chart.$predictionGaps = [];
     syncChartDatasets(chart);
@@ -3293,6 +3531,8 @@ function applyStatus(d) {
   const rolloutLive = !replayActive && mode === "rollout";
   const taskElapsedS = Number(task.elapsed_s) || 0;
   const liveNowS = liveTimestamp(d);
+  const chartNow = Number(actionChart && actionChart.$nowTime);
+  const rolloutChartNow = Number.isFinite(chartNow) ? chartNow : liveNowS - 1 / LIVE_FRAME_RATE;
   if (!replayActive) recordModeTransition(mode, liveNowS);
   if (d.joints && Object.keys(d.joints).length) {
     updateJoints(d.joints);
@@ -3302,12 +3542,12 @@ function applyStatus(d) {
     pushChart(actionChart, d.action, liveNowS);
   }
   if (rolloutLive) {
-    const chartNow = Number(actionChart && actionChart.$nowTime);
     recordRolloutPrediction(
       d.prediction,
-      Number.isFinite(chartNow) ? chartNow : liveNowS - 1 / LIVE_FRAME_RATE,
+      rolloutChartNow,
       taskElapsedS,
     );
+    updateRolloutLanes(d.rollout_timeline, d.prediction, rolloutChartNow, liveNowS);
     renderRolloutOverlays(liveNowS);
   } else {
     clearRolloutPredictions();
@@ -6934,6 +7174,7 @@ const vizState = {
   series: {},
   chunk: null,
   rolloutPredictions: [],
+  rolloutLanes: null,
 };
 
 function clearVizChunk() {

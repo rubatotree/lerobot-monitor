@@ -46,6 +46,7 @@ Windows 也可以运行 `.\run.ps1`。它优先读取本地 `config.yaml`，否�
 ```powershell
 uv run pytest -q
 node --check src/lerobot_monitor/web/static/app.js
+node scripts/test-rollout-lanes.mjs
 node scripts/verify-model-delete-id.cjs
 ```
 

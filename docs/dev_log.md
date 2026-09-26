@@ -1,5 +1,11 @@
 # Dev log
 
+## 2026-09-26：常驻策略的运行配置事务
+
+- 每次运行从 checkpoint 运行参数基线构建候选配置，先类型转换、正值检查和 LeRobot 配置校验，成功后再应用；失败不会污染常驻模型。清空覆盖恢复 n_action_steps、SmolVLA num_steps、Pi0/Pi05 num_inference_steps 等原值。
+- ACT temporal ensemble 直接用 LeRobot 的 `ACTTemporalEnsembler` 重建；结构字段不能在已有权重上原位修改，明确报错。配置对象本身保持身份，避免模型持有旧配置引用。
+- 验证：新增覆盖恢复、失败回滚、ACT 融合器开关/系数、SmolVLA 步数测试；Monitor 全量回归阶段 346 passed / 1 skipped，最终配置及 rollout 定向 76 passed。
+
 ## 2026-09-26：Bug 审核与异步 Rollout 设计
 
 - 审计 monitor `c75aa41` / LeRobot `8f1d64cd`。当前 RTC 已在后台线程推理，端到端控制隔离尚不完整：总线线程还有相机复制/颜色转换、动作转换、预测展开及共享张量队列访问。

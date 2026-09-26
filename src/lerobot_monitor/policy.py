@@ -12,6 +12,7 @@ import os
 import sys
 from collections import deque
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, fields
 from enum import Enum
 from functools import wraps
@@ -67,6 +68,9 @@ def _coerce_override(raw: str, current: Any) -> Any:
 
 RUNTIME_POLICY_EXTRA_KEYS = frozenset({"task", "fps", "interpolation_multiplier", "control_rate"})
 RUNTIME_POLICY_EXTRA_PREFIXES = ("inference.", "robot.", "dataset.", "teleop.", "strategy.", "record.")
+SESSION_POLICY_FIELDS = frozenset({
+    "n_action_steps", "num_steps", "num_inference_steps", "temporal_ensemble_coeff", "use_amp",
+})
 
 
 def apply_policy_overrides(cfg: Any, extra: Mapping[str, str] | None) -> list[str]:
@@ -74,6 +78,7 @@ def apply_policy_overrides(cfg: Any, extra: Mapping[str, str] | None) -> list[st
 
     Nested dotted paths walk attributes. Unknown keys are ignored.
     """
+    candidate = deepcopy(cfg)
     applied: list[str] = []
     if not extra:
         return applied
@@ -86,22 +91,31 @@ def apply_policy_overrides(cfg: Any, extra: Mapping[str, str] | None) -> list[st
         if not path or path in RUNTIME_POLICY_EXTRA_KEYS or path.startswith(RUNTIME_POLICY_EXTRA_PREFIXES):
             continue
         try:
-            obj = cfg
+            obj = candidate
             parts = path.split(".")
             for part in parts[:-1]:
                 obj = getattr(obj, part)
             name = parts[-1]
             current = getattr(obj, name)
-            setattr(obj, name, _coerce_override(str(value), current))
-        except Exception:
+        except AttributeError:
             continue
+        try:
+            setattr(obj, name, _coerce_override(str(value), current))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid policy override {key}={value!r}") from exc
         applied.append(key)
     if applied:
+        for name in ("n_action_steps", "num_steps", "num_inference_steps"):
+            if hasattr(candidate, name) and getattr(candidate, name) <= 0:
+                raise ValueError(f"policy.{name} must be positive")
         # ACT couples n_action_steps and temporal_ensemble_coeff in __post_init__.
         # Applying overrides after config construction must not bypass that validation.
-        validate = getattr(cfg, "__post_init__", None)
+        validate = getattr(candidate, "__post_init__", None)
         if callable(validate):
             validate()
+        # Keep the config identity used by the model while committing only a
+        # fully validated candidate. Failed overrides cannot poison the cache.
+        vars(cfg).update(vars(candidate))
     return applied
 
 
@@ -114,7 +128,31 @@ def apply_requested_overrides(loaded: LoadedPolicy, extra: Mapping[str, str] | N
     config = getattr(loaded.policy, "config", None)
     if config is None:
         return []
-    applied = apply_policy_overrides(config, extra)
+    baseline = getattr(loaded, "session_config_baseline", None)
+    if baseline is None:
+        baseline = deepcopy(config)
+        loaded.session_config_baseline = baseline
+    candidate = deepcopy(config)
+    for name in SESSION_POLICY_FIELDS:
+        if hasattr(baseline, name):
+            setattr(candidate, name, deepcopy(getattr(baseline, name)))
+    applied = apply_policy_overrides(candidate, extra)
+    # Weight/processor structure cannot be changed by mutating a resident config.
+    for name, value in vars(candidate).items():
+        if name not in SESSION_POLICY_FIELDS and value != getattr(config, name, None):
+            raise ValueError(f"policy.{name} cannot be changed on a resident model; load compatible weights")
+    ensemble = None
+    rebuild_ensemble = (
+        getattr(config, "type", None) == "act"
+        and getattr(candidate, "temporal_ensemble_coeff", None) is not None
+    )
+    if rebuild_ensemble:
+        from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
+
+        ensemble = ACTTemporalEnsembler(candidate.temporal_ensemble_coeff, candidate.chunk_size)
+    vars(config).update(vars(candidate))
+    if rebuild_ensemble:
+        loaded.policy.temporal_ensembler = ensemble
     if applied:
         logger.info("applied policy overrides to resident %s: %s", loaded.path, ", ".join(applied))
     return applied
@@ -131,6 +169,7 @@ class LoadedPolicy:
     dataset_features: dict[str, Any]
     ordered_action_keys: list[str]
     robot_type: str = "so101_follower"
+    session_config_baseline: Any = None
 
     def reset(self) -> None:
         self.policy.reset()
@@ -216,6 +255,7 @@ def load_policy(
         cfg = PreTrainedConfig.from_pretrained(load_path, **kwargs)
         cfg.pretrained_path = load_path
         cfg.device = device
+        session_config_baseline = deepcopy(cfg)
         apply_policy_overrides(cfg, extra)
         vlm_model_name = getattr(cfg, "vlm_model_name", None)
         if isinstance(vlm_model_name, str) and vlm_model_name:
@@ -262,6 +302,7 @@ def load_policy(
             },
             ordered_action_keys=ordered,
             robot_type=robot_type,
+            session_config_baseline=session_config_baseline,
         )
 
     if cached_path is not None or is_local_source:

@@ -1,5 +1,14 @@
 # Dev log
 
+## 2026-09-26：Bug 审核与异步 Rollout 设计
+
+- 审计 monitor `c75aa41` / LeRobot `8f1d64cd`。当前 RTC 已在后台线程推理，端到端控制隔离尚不完整：总线线程还有相机复制/颜色转换、动作转换、预测展开及共享张量队列访问。
+- 从 ROADMAP/dev_log 核对既有修复与实机待验项。仓库未找到独立 bug list，GitHub Issues 查询为空，未声称覆盖尚未提供位置的外部清单。
+- 内存假对象复现：隐藏主画面使 `feed_robot=True` 相机不再进入输入；旧队列消费可把尚未 merge 的新 chunk 标为 active；清空运行覆盖后 n_action_steps 仍保留上次覆盖值。另登记观测新鲜度、时间对齐和 reset 所有权风险。
+- 新增 `docs/bug_audit_2026-09-26.md` 与 `docs/async_rollout_design.md`，更新 ROADMAP。目标方案为 spawn 推理服务、CPU 动作时间线、完整观测版本、有界 IPC、明确的 RTC 前缀/延迟契约及模型常驻缓存代理。
+- 验证：父目录既有 `.venv` 执行 loop/policy/worker/residency/overrides/timeline/cameras 共 120 passed；一条既有 pytest cache 写权限警告。未运行真实模型或移动机械臂，功能代码未修改。
+- 下一步：先修复相机路由和配置事务；再用 fake worker 验证 CPU 时间线/缺货/epoch 失效，随后迁移真实 RTC 与缓存。完整实施与验收顺序见审核文档 M1–M6。
+
 ## 2026-09-25（Rollout 推理时间轴可视化）
 
 - 新增线程安全 `RolloutTimeline`：记录 RTC/sync 推理 `[start, end]`、chunk steps/step_s、执行交接 `active` 与失败状态；20 s 输出窗口、最多 256 块，超限优先淘汰未激活旧块。

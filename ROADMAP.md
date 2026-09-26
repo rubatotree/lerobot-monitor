@@ -1,5 +1,25 @@
 # LeRobot Monitor
 
+## 设计完成：Bug 审核与异步 Rollout（2026-09-26）
+
+状态：设计与基线审核完成，以下功能里程碑尚未实现。审计基线为 monitor `c75aa41` / LeRobot `8f1d64cd`。
+
+结论：现有 RTC 已有后台推理线程，但总线线程仍负责相机复制/转换、动作转换及预测展开，并与推理共享张量队列锁。目标是推理进程发布已完成的 CPU 动作块，由 ControlLoop 按独立时钟执行；观测和诊断通过有界后台通道，Stop 先撤销执行 epoch，再异步收尾。
+
+架构选型：Windows spawn 推理服务 + 父进程缓存代理 + 带版本的观测快照 + 控制端独占的 CPU 动作时间线。复用 LeRobot RTC 算法与相对动作处理，明确 bootstrap、冻结前缀、delay 越界、队列缺货与进程故障语义。
+
+核心模块：观测 worker、消息协议、动作时间线、推理 adapter、IPC transport、常驻缓存代理、显式 chunk 事件。技术难点是进程间帧所有权、控制/推理时间对齐、guided/trained 约束、同权重运行配置事务及保持缓存单一所有者。
+
+- [x] M0 核对历史记录与当前源码，120 项现有定向测试通过；相机显示影响输入、时间轴误标、清空覆盖不恢复三个内存复现。
+- [ ] M1 修复相机路由和运行配置事务。
+- [ ] M2 观测/CPU 动作契约、有界时间线与 fake worker，验证控制隔离和缺货策略。
+- [ ] M3 spawn 推理服务、模型缓存代理、RTC adapter、reset/stop 协议。
+- [ ] M4 显式 chunk 生命周期、诊断与界面状态。
+- [ ] M5 GPU、虚拟臂与实机发送节拍/停止延迟验收，再决定默认模式。
+- [ ] M6 独立处理录制暂存跨重启重试入口。
+
+来源限制、优先级和逐项验收见 [Bug 审核](docs/bug_audit_2026-09-26.md)，详细协议和时序见 [异步设计](docs/async_rollout_design.md)。未定位用户所指的独立 bug list；本地已核对 ROADMAP/dev_log，GitHub Issues 查询为空。
+
 ## 当前里程碑：GPU 模型常驻缓存与 Library 管理（2026-09-25）
 
 目标：Library 卡片可载入、卸载和查看模型驻留状态、阶段进度及常驻显存；Rollout 与 Debug Inference 自动载入并复用同一模型实例，缓存命中不等待其他模型载入。

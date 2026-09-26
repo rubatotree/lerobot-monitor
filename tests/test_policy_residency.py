@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -55,10 +56,12 @@ def test_runtime_overrides_and_path_alias_share_identity(tmp_path: Path) -> None
         robot_type="so101_follower", rename_map={},
     )
     assert original == alias
-    assert changed != original
+    # Nothing on the command line can change the tensors a checkpoint holds, so an
+    # override must reuse the resident instance instead of loading a second copy.
+    assert changed == original
 
 
-def test_implicit_config_defaults_still_invalidate_policy_identity(tmp_path: Path) -> None:
+def test_policy_overrides_never_split_the_weights_identity(tmp_path: Path) -> None:
     path = tmp_path / "implicit-defaults"
     path.mkdir()
     (path / "config.json").write_text('{"type": "act", "fps": 30}', encoding="utf-8")
@@ -78,10 +81,28 @@ def test_implicit_config_defaults_still_invalidate_policy_identity(tmp_path: Pat
         robot_type="so101_follower",
         rename_map={},
     )
+    other_device = policy_identity(str(path), "cuda:1", {}, robot_type="so101_follower", rename_map={})
+    other_robot = policy_identity(str(path), "cuda", {}, robot_type="so100_follower", rename_map={})
 
-    assert action_steps != original
-    assert ensemble != original
-    assert action_steps != ensemble
+    assert action_steps == original
+    assert ensemble == original
+    assert other_device != original
+    assert other_robot != original
+
+
+def test_device_spellings_share_one_entry(tmp_path: Path) -> None:
+    path = _model(tmp_path / "model")
+    canonical = policy_identity(str(path), "cuda", {}, robot_type="so101_follower", rename_map={})
+
+    for spelling in ("CUDA", " cuda ", "cuda:0"):
+        assert (
+            policy_identity(str(path), spelling, {}, robot_type="so101_follower", rename_map={})
+            == canonical
+        )
+    assert (
+        policy_identity(str(path), "cuda:1", {}, robot_type="so101_follower", rename_map={})
+        != canonical
+    )
 
 
 def test_repo_id_and_resolved_snapshot_share_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -232,12 +253,108 @@ def test_rtc_stop_does_not_forget_a_thread_that_is_still_running(monkeypatch: py
     engine._shutdown_event = threading.Event()
     engine._policy_active = threading.Event()
     engine._rtc_thread = worker
+    engine._stop_signal_logged = False
+    engine._thread_exit_logged = False
     try:
         assert engine.stop() is False
         assert engine._rtc_thread is worker
+        assert engine._shutdown_event.is_set()
+        assert engine.wait_stopped(timeout=0.01) is False
+        assert engine._rtc_thread is worker
         release.set()
-        assert engine.stop() is True
+        assert engine.wait_stopped(timeout=2) is True
         assert engine._rtc_thread is None
+        assert engine.stop() is True
     finally:
         release.set()
         worker.join(timeout=2)
+
+
+def test_engine_stop_logs_one_transition_per_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from lerobot_monitor.pathutil import ensure_lerobot_on_path
+
+    ensure_lerobot_on_path()
+    from lerobot.rollout.inference import rtc
+
+    monkeypatch.setattr(rtc, "_RTC_JOIN_TIMEOUT_S", 0.01)
+    release = threading.Event()
+    worker = threading.Thread(target=lambda: release.wait(5), daemon=True)
+    worker.start()
+    engine = rtc.RTCInferenceEngine.__new__(rtc.RTCInferenceEngine)
+    engine._shutdown_event = threading.Event()
+    engine._policy_active = threading.Event()
+    engine._rtc_thread = worker
+    engine._stop_signal_logged = False
+    engine._thread_exit_logged = False
+    try:
+        with caplog.at_level(logging.INFO, logger=rtc.__name__):
+            assert engine.stop() is False
+            assert engine.stop() is False
+            assert engine.wait_stopped(timeout=0.01) is False
+            release.set()
+            assert engine.stop() is True
+            assert engine.stop() is True
+        messages = [record.getMessage() for record in caplog.records]
+        assert messages.count("Stopping RTC inference thread...") == 1
+        assert messages.count("RTC inference thread stopped") == 1
+        assert sum("still finishing an inference" in message for message in messages) == 1
+        assert not any("did not join" in message for message in messages)
+    finally:
+        release.set()
+        worker.join(timeout=2)
+
+
+def test_acquire_waits_out_a_cold_load_without_a_bound(tmp_path: Path) -> None:
+    path = _model(tmp_path / "model")
+    release = threading.Event()
+    entered = threading.Event()
+
+    def loader(source: str, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(5)
+        return _loaded(source)
+
+    manager = _manager(loader)
+    try:
+        manager.request(str(path), "cpu", {})
+        assert entered.wait(2)
+        result: list[Any] = []
+
+        def worker() -> None:
+            result.append(manager.acquire(str(path), "cpu", {}, timeout=0.2))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        time.sleep(0.6)
+        # A cold load is legitimate work, so the stopping-state bound must not cut it off.
+        assert result == []
+        release.set()
+        thread.join(timeout=5)
+        assert result and result[0].loaded is not None
+        result[0].release()
+    finally:
+        release.set()
+        manager.close()
+
+
+def test_acquire_times_out_on_a_stopping_entry(tmp_path: Path) -> None:
+    path = _model(tmp_path / "model")
+    manager = _manager(lambda source, **kwargs: _loaded(source))
+    try:
+        lease = manager.acquire(str(path), "cpu", {})
+        stopped = threading.Event()
+        lease.retire(stopped)
+
+        with pytest.raises(PolicyBusyError, match=r"not ready after 0\.2s"):
+            manager.acquire(str(path), "cpu", {}, timeout=0.2)
+
+        stopped.set()
+        _wait_for_state(manager, path, "ready")
+        retry = manager.acquire(str(path), "cpu", {}, timeout=2)
+        assert retry.cache_hit is True
+        assert retry.loaded is not None
+        retry.release()
+    finally:
+        manager.close()

@@ -656,3 +656,13 @@
 - 用户要求倍率再增加 6× 与 8×：`RATE_PRESETS` 扩展为 `(1, 2, 4, 6, 8)`，`#rate-kind` 增加两档；Rollout 的倍率说明文字按用户要求移除，面板只保留档位本身。倍率仍只能在 Playback/Rollout 使用，折算结果超过 240 Hz 时（例如 60 FPS 策略 × 8）后端拒绝并回报「… this setting resolves to 480 Hz」，面板内联显示该原因。验证：新增倍率档位参数化测试、非法档位与溢出信息测试、Playback 会话中 6×→90 Hz／8×→120 Hz 的实时变频测试；`scripts/verify-rate-panel.cjs` 增加每个视口 9 项档位检查（五档齐备、Rollout 全可用、Joints 全置灰、8× 落到 chip、恢复继承），六视口共 324 项通过；全套 pytest 保持通过。
 - 验证：全套 pytest 276 passed；新增静态契约测试覆盖面板 id／层级／CSS 规则与 JS 入口；新增 `scripts/verify-rate-panel.cjs` 在 2560×1440、1920×1080、1440×900、1024×900、768×500、390×844 六种视口下共 270 项检查通过（面板完整落在视口内、中心与四角 `elementFromPoint` 命中面板自身、无横向溢出、顶栏标签不压时钟、Apply／继承恢复／非法值不请求、四种关闭路径与焦点回归、窄屏滚动跟随）。冒烟使用临时配置与临时 store，未改动 `data/monitor_store.json`。
 - 未验证：实体机械臂在面板里改频后的实际发送间隔；触屏设备上的粗指针样式只做了静态声明，未在真机触摸操作下验证。
+
+## 2026-09-26：RTC 停止协议、热权重复用与 rollout 失败退出
+
+- 反馈：真实 rollout 日志反复出现 `Stopping RTC inference thread...` 与 `RTC thread did not join within 3.0s`；rollout 失败后顶栏 rollout 灯仍亮；模型加载仍要求重复填写命令行参数。三条指向同一批状态机缺陷。
+- 根因：`RTCInferenceEngine.stop()` 只做一次 3 秒 join 就返回 `False`，而 RTC 线程只能在 `predict_action_chunk` 返回后检查关闭事件，停止延迟天然 ≥ 一次在飞推理；监视器又用 `while engine.stop() is False: time.sleep(0.05)` 重试，于是每约 3.05 秒重复两条日志。更严重的是推理租约因此长期停在 `stopping`，`acquire()` 无超时轮询，下一次 rollout 启动会永久挂在 `pending="rollout_start"`。
+- 停止协议改为「一次信号 + 可等待」：`stop()` 只发一次信号并做一次有界 join，返回 `False` 表示仍在收尾；新增 `wait_stopped()` 让调用方阻塞到线程真正退出；`start()` 拒绝在线程未退出时重启；RTC 循环的空闲与退避睡眠改为 `_shutdown_event.wait()`，文本查询返回后立刻检查关闭。监控端只调用一次 `stop()`，由后台线程等到线程死亡后再释放租约，租约释放即代表同一份 policy 不会有两个引擎。
+- 模型实例身份改为只由权重决定：`policy_identity` 不再把命令行覆盖并进键，`policy.*` 覆盖在 rollout 启动时实时应用到常驻实例（`apply_requested_overrides`），设备拼写（`cuda` / `cuda:0` / 大小写）归一。改 `policy.n_action_steps` 之类的运行参数不再加载第二份同权重；`acquire()` 的超时只约束 `stopping` 等待，冷加载仍是合法长等待。
+- 失败即退出 rollout：`_drain_commands` 在命令失败或 e-stop 拒绝时清掉该命令自己创建的 pending；五处退出路径先把 mode/pending 落定再做可能失败的录制收尾；控制循环加最后一道守卫，单次异常不再杀死控制线程，重复故障按签名只记一次日志。
+- 验证：lerobot 侧 `tests/test_rollout.py` 与 `tests/test_interactive_rollout.py` 115 passed；lerobot-monitor 全套 324 passed、1 skipped。无硬件端到端冒烟（虚拟从臂 + 已缓存 SmolVLA 权重，走 HTTP API）：空 `policy_path` 的 `rollout_start` 返回 4xx 后 `pending` 为空、灯灭；同一权重冷加载一次（日志 `model ready in 98.7s`），第二次带不同 `policy.n_action_steps` 启动显示 `using cached policy` 且没有第二次加载；两次停止各只有一条 `Stopping RTC inference thread...` 与一条 `RTC inference thread stopped`，不再出现 `did not join`；引擎因缺相机图像失败时 rollout 在约 4.5 秒内自动退出（`mode=idle`、灯灭、`message` 带 traceback）。
+- 未验证：没有人工制造超过 3 秒的单次策略推理，因此「`stop()` 返回 `False` → `wait_stopped()` 阻塞数秒」这条路径只由单元测试覆盖（真实 RTC 线程 + 真实引擎类）；实体机械臂上的 rollout 行为仍需真机复核。

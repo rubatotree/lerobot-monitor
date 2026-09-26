@@ -955,3 +955,20 @@ note 即时过滤。底部实时图表不再把模式切换当作数据边界：
 验证：全套 pytest 276 passed；`scripts/verify-rate-panel.cjs` 在 2560×1440／1920×1080／1440×900／1024×900／768×500／390×844 下 270 项检查通过（视口包含性、`elementFromPoint` 命中、无横向溢出、非法输入不请求、四种关闭路径与焦点回归、窄屏滚动跟随）。冒烟用临时配置和临时 store 运行，未改动 `data/monitor_store.json`。
 
 未验证：实体机械臂改频后的实际发送间隔与关节跟踪；触屏粗指针样式的真机触摸操作。
+
+## 2026-09-26：RTC 停止协议、热权重复用与 rollout 失败退出
+
+状态：代码与自动验证完成；真机 rollout 行为待复核。
+
+架构：推理后端的停止协议由「尽力 join」改为「一次信号 + 可等待」——`stop()` 返回是否已在有界时间内退出，`wait_stopped()` 负责阻塞到线程真正结束，`start()` 拒绝在旧线程未退出时重启；监控端只在后台调用一次停止并等到线程死亡后才释放策略租约，租约因此成为「同一份 policy 只有一个推理引擎」的唯一门闩。模型实例身份只由权重（来源、设备、revision、权重指纹）决定，命令行覆盖属于运行期设置，改为在 claim 常驻实例时实时应用。rollout 状态机的每条失败路径先落定 `mode`/`pending` 再做录制收尾，控制循环对单次异常自我恢复。
+
+技术难点：RTC 线程无法被打断，关闭延迟本质上等于当前在飞推理的剩余时间，任何「固定超时后重试」的写法都会退化成日志风暴并把租约钉在 `stopping`；`policy.*` 覆盖既能从命令行来也能从模型面板来，身份键必须与它们解耦，否则同一份权重会在显存里出现多份；退出路径里 `_close_writer()` 可能抛错，所以状态变更必须排在它之前，控制循环也必须能承受单次异常而不是让最后一次快照永久冻住界面。
+
+里程碑：
+1. [x] `InferenceEngine.stop()` 返回布尔并新增 `wait_stopped()`；RTC 引擎单次信号、一次性日志、可唤醒睡眠；滚动策略 teardown 尊重停止结果。
+2. [x] 监控端单次停止线程；`acquire()` 对 `stopping` 设上界而对冷加载不设；身份改为只按权重，`apply_requested_overrides()` 在使用时常驻实例上应用覆盖。
+3. [x] `_drain_commands` 清理失败启动的 pending；五处退出路径重排；`_recover_control_loop()` + `_run` 守卫。
+4. [x] 单元与回归测试、无硬件端到端冒烟、开发记录。
+
+验证：lerobot 侧 rollout 测试 115 passed；lerobot-monitor 全套 324 passed、1 skipped；虚拟从臂 + 缓存 SmolVLA 的 HTTP 冒烟覆盖了被拒启动清 pending、冷加载一次后 `using cached policy` 复用、每次停止只有一条 `Stopping...`/`RTC inference thread stopped` 且无 `did not join`、引擎失败后约 4.5 秒自动退出并熄灭顶栏灯。
+未验证：超过 3 秒的单次推理下 `wait_stopped()` 的实机阻塞时长；实体机械臂上的 rollout 收尾行为。

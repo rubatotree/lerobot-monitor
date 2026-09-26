@@ -45,7 +45,8 @@ class FakeInferenceEngine:
         self.failure_traceback = None
         self.notify_observation = MagicMock()
         self.get_action = MagicMock(return_value=action)
-        self.stop = MagicMock()
+        self.stop = MagicMock(return_value=True)
+        self.wait_stopped = MagicMock(return_value=True)
         self.action_queue = None
         if leftovers is not None:
             self.action_queue = SimpleNamespace(
@@ -213,7 +214,64 @@ def test_rtc_changes_reuse_loaded_policy_but_model_changes_do_not(
     assert next_lease.loaded is loaded
     next_lease.release()
     load.assert_called_once()
-    assert loop._cached_policy("same", "cuda", {**changed_rtc, "policy.n_action_steps": "16"}) is None
+    # A policy override is applied to the resident instance, never to a second copy.
+    assert loop._cached_policy("same", "cuda", {**changed_rtc, "policy.n_action_steps": "16"}) is loaded
+    assert loop._cached_policy("same", "cuda:1", {}) is None
+
+
+def test_rejected_rollout_start_clears_pending(tmp_path: Path) -> None:
+    """A start command that fails must drop the pending marker the light is derived from."""
+    loop = _loop(tmp_path)
+    loop.follower.connected = False
+    token = loop.note_pending("rollout_start", "rollout requested")
+    loop.submit_nowait("rollout_start", {"policy_path": "some/policy", "_start_generation": token})
+
+    loop._drain_commands()
+
+    assert loop.pending is None
+    assert loop.snapshot()["display_mode"] != "loading"
+    assert "connected follower" in (loop.last_error or "")
+
+
+def test_rollout_stop_reports_writer_failure_but_leaves_rollout(tmp_path: Path) -> None:
+    """Saving the dataset must not be able to keep a stopped rollout in charge."""
+    loop = _loop(tmp_path)
+    loop._inference_engine = FakeInferenceEngine({"gripper": 0.0})
+    loop._active_policy_lease = MagicMock()
+    loop.mode = "rollout"
+    loop.writer = MagicMock()
+    loop.writer.close.side_effect = RuntimeError("disk full")
+    reply: queue.Queue[dict] = queue.Queue(maxsize=1)
+    loop._commands.put(Command("rollout_stop", {}, reply))
+
+    loop._drain_commands()
+
+    result = reply.get(timeout=1)
+    assert result["ok"] is False
+    assert "disk full" in result["error"]
+    assert loop.mode in {"idle", "offline"}
+    assert loop._inference_engine is None
+    assert loop.pending is None
+
+
+def test_control_loop_survives_a_failing_tick(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One bad tick must not kill the only thread that drives the robot."""
+    loop = _loop(tmp_path)
+    loop.hold_when_idle = False
+    monkeypatch.setattr(loop, "_tick", MagicMock(side_effect=RuntimeError("boom")))
+
+    loop.start()
+    try:
+        deadline = time.perf_counter() + 5.0
+        while time.perf_counter() < deadline and "boom" not in (loop.last_error or ""):
+            time.sleep(0.02)
+        assert "boom" in (loop.last_error or "")
+        assert loop._thread is not None and loop._thread.is_alive()
+        assert loop.mode in {"idle", "offline"}
+        assert loop.pending is None
+    finally:
+        loop.stop()
+    assert loop._thread is None
 
 
 def test_sync_rollout_reuses_policy_after_async_worker_stops(

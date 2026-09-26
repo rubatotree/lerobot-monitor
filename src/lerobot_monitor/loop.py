@@ -28,6 +28,7 @@ from .policy import (
     ActionChunk,
     LoadedPolicy,
     action_queue_state,
+    apply_requested_overrides,
     create_monitor_inference_engine,
     inference_config_from_extra,
     inference_leftover_poses,
@@ -67,6 +68,10 @@ _LOG_QUIET_PREFIXES = (
 # Inference operations sharing one process still serialize mutable policy state;
 # cold construction has its own lock in PolicyResidencyManager.
 _POLICY_INFER_LOCK = threading.Lock()
+# How long a rollout start waits for the resident model to become usable. A previous
+# RTC thread can only exit once its in-flight policy call returns — seconds, not
+# milliseconds — so the start waits, then reports instead of hanging on `pending`.
+_POLICY_READY_TIMEOUT_S: float = 30.0
 _UI_LOG_LOCK = threading.Lock()
 _UI_LOG_HANDLERS: set[logging.Handler] = set()
 _UI_LOG_PREVIOUS_ROOT_LEVEL: int | None = None
@@ -205,6 +210,9 @@ class ControlLoop:
         self.action: dict[str, float] = {}
         self.loop_fps = 0.0
         self.last_error: str | None = None
+        # Fault signature of the last failed control iteration, so a persistent failure
+        # logs once instead of at control rate.
+        self._last_control_error: str | None = None
         self.logs: list[dict[str, str | int]] = []
         self._log_sequence = 0
 
@@ -847,6 +855,7 @@ class ControlLoop:
         model_wait_ms = (time.perf_counter() - wait_started) * 1000.0
         try:
             assert lease.loaded is not None
+            apply_requested_overrides(lease.loaded, extra)
             lease.loaded.task = task
             with _POLICY_INFER_LOCK:
                 compute_started = time.perf_counter()
@@ -892,7 +901,9 @@ class ControlLoop:
         extra: dict[str, str],
     ) -> None:
         try:
-            lease = self.policy_residency.acquire(path, device, extra)
+            lease = self.policy_residency.acquire(
+                path, device, extra, timeout=_POLICY_READY_TIMEOUT_S
+            )
             with self._policy_job_lock:
                 generation_stale = self._policy_generation != 0 and job.generation != self._policy_generation
                 replaced = self._policy_job is not None and self._policy_job is not job
@@ -1495,47 +1506,50 @@ class ControlLoop:
         self._next_read_t = fps_t
         next_snapshot_t = fps_t
         while not self._stop.is_set():
-            t0 = time.perf_counter()
-            if self._estop.is_set() and self.mode != "estop":
-                self._apply_estop()
-            self._drain_commands()
-            self._complete_rollout_load()
-            self._sync_run_diagnostics()
-            output_hz = self._control_hz()
-            self._output_due = time.perf_counter() >= self._next_output_t
-            read_hz = max(
-                30.0,
-                self.policy_fps if self.mode == "rollout" else 0.0,
-                float(self.record_session.fps) if self.mode == "record" and self.record_session else 0.0,
-                float(getattr(self.writer, "video_fps", 0) or 0),
-                float(getattr(self.writer, "action_fps", 0) or 0),
-            )
-            self._tick()
-            now = time.perf_counter()
-            if self._output_due:
-                missed = max(0, math.floor((now - self._next_output_t) * output_hz + 1e-9))
-                self.cadence.missed_slots += missed
-                if missed:
-                    self._note_control_event("missed_output_slots", now, {"count": missed})
-                self._next_output_t = self._advance_deadline(self._next_output_t, 1.0 / output_hz, now)
-            if now >= self._next_read_t:
-                self._next_read_t = self._advance_deadline(self._next_read_t, 1.0 / read_hz, now)
-            fps_n += 1
-            if now - fps_t >= 1.0:
-                self.loop_fps = fps_n / (now - fps_t)
-                fps_n = 0
-                fps_t = now
-            self._check_cadence(now)
-            self._sync_run_diagnostics()
-            if self.on_snapshot is not None and now >= next_snapshot_t:
-                self.on_snapshot(self.snapshot())
-                next_snapshot_t = now + 0.1
-            deadlines = [self._next_output_t, self._next_read_t]
-            if self.mode == "rollout":
-                deadlines.append(self._next_policy_t)
-            if self.mode == "record" and self.record_phase == "recording":
-                deadlines.append(self._next_action_t)
-            _precise_sleep(max(0.0, min(deadlines) - time.perf_counter()))
+            try:
+                if self._estop.is_set() and self.mode != "estop":
+                    self._apply_estop()
+                self._drain_commands()
+                self._complete_rollout_load()
+                self._sync_run_diagnostics()
+                output_hz = self._control_hz()
+                self._output_due = time.perf_counter() >= self._next_output_t
+                read_hz = max(
+                    30.0,
+                    self.policy_fps if self.mode == "rollout" else 0.0,
+                    float(self.record_session.fps) if self.mode == "record" and self.record_session else 0.0,
+                    float(getattr(self.writer, "video_fps", 0) or 0),
+                    float(getattr(self.writer, "action_fps", 0) or 0),
+                )
+                self._tick()
+                now = time.perf_counter()
+                if self._output_due:
+                    missed = max(0, math.floor((now - self._next_output_t) * output_hz + 1e-9))
+                    self.cadence.missed_slots += missed
+                    if missed:
+                        self._note_control_event("missed_output_slots", now, {"count": missed})
+                    self._next_output_t = self._advance_deadline(self._next_output_t, 1.0 / output_hz, now)
+                if now >= self._next_read_t:
+                    self._next_read_t = self._advance_deadline(self._next_read_t, 1.0 / read_hz, now)
+                fps_n += 1
+                if now - fps_t >= 1.0:
+                    self.loop_fps = fps_n / (now - fps_t)
+                    fps_n = 0
+                    fps_t = now
+                self._check_cadence(now)
+                self._sync_run_diagnostics()
+                if self.on_snapshot is not None and now >= next_snapshot_t:
+                    self.on_snapshot(self.snapshot())
+                    next_snapshot_t = now + 0.1
+                deadlines = [self._next_output_t, self._next_read_t]
+                if self.mode == "rollout":
+                    deadlines.append(self._next_policy_t)
+                if self.mode == "record" and self.record_phase == "recording":
+                    deadlines.append(self._next_action_t)
+                _precise_sleep(max(0.0, min(deadlines) - time.perf_counter()))
+                self._last_control_error = None
+            except Exception as exc:  # noqa: BLE001 - one bad iteration must not kill the loop
+                self._recover_control_loop(exc)
         if self.follower.connected and self.mode != "estop":
             self._park_relax_blocking()
         self.leader.disconnect()
@@ -1693,6 +1707,7 @@ class ControlLoop:
                 cmd = self._commands.get_nowait()
             except queue.Empty:
                 return
+            token = cmd.payload.get("_start_generation")
             try:
                 if self._estop.is_set() and cmd.kind not in {
                     "resume",
@@ -1700,12 +1715,19 @@ class ControlLoop:
                     "task_stop",
                     "debug_lease_release",
                 }:
+                    if isinstance(token, int):
+                        self.clear_pending(token)
                     self._reply(cmd, ok=False, error="estop")
                     continue
                 self._handle(cmd)
             except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
                 self.log("error", f"{cmd.kind}: {exc}")
+                # The command that marked a start pending is the only one allowed to clear
+                # it, and only while it is still the current start: a rejected rollout must
+                # not leave the top-bar indicator lit.
+                if isinstance(token, int):
+                    self.clear_pending(token)
                 self._reply(cmd, ok=False, error=str(exc))
 
     def _handle(self, cmd: Command) -> None:
@@ -2110,14 +2132,15 @@ class ControlLoop:
                 self.log("info", "record stopped")
                 self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
             elif stopped == "rollout":
-                path = self._close_writer()
                 self.loaded_policy = None
                 self._end_rollout()
+                self.pending = None
                 self.mode = "idle" if self.follower.connected else "offline"
                 if self.joints:
                     self.latched = dict(self.joints)
                 self._touch_bus()
                 self.log("info", "rollout stopped")
+                path = self._close_writer()
                 self._reply(cmd, ok=True, stopped=stopped, path=None if path is None else str(path))
             elif stopped == "playback":
                 self._end_playback()
@@ -2410,13 +2433,14 @@ class ControlLoop:
             self._reply(cmd, ok=True, accepted=True)
         elif kind == "rollout_stop":
             self._invalidate_policy_load()
-            path = self._close_writer()
             self.loaded_policy = None
             self._end_rollout()
+            self.pending = None
             self.mode = "idle" if self.follower.connected else "offline"
             if self.joints:
                 self.latched = dict(self.joints)
             self._touch_bus()
+            path = self._close_writer()
             self._reply(cmd, ok=True, path=None if path is None else str(path))
         elif kind == "capture_start":
             self._require_no_debug_lease("start capture")
@@ -2516,8 +2540,30 @@ class ControlLoop:
                     self.loaded_policy = None
                 elif self.mode == "playback":
                     self._end_playback()
-                self._close_writer()
+                self.pending = None
                 self.mode = "idle"
+                # Saving the dataset must not be able to leave a dead task in charge.
+                self._close_writer()
+
+    def _recover_control_loop(self, exc: BaseException) -> None:
+        """Return to a safe state after an unexpected per-iteration control failure.
+
+        The loop thread is the only thing driving the robot: letting an exception escape
+        would freeze every state update while the last cached snapshot keeps reporting a
+        running task.
+        """
+        self.last_error = str(exc)
+        signature = f"{type(exc).__name__}: {exc}"
+        if self._last_control_error != signature:
+            self._last_control_error = signature
+            self.log("error", f"control loop iteration failed: {exc}")
+            self.log("error", traceback.format_exc())
+        try:
+            self._abort_active_task(f"control loop error: {exc}")
+        except Exception as recovery_exc:  # noqa: BLE001 - recovery must not re-kill the loop
+            self.log("error", f"control loop recovery failed: {recovery_exc}")
+            self.pending = None
+            self.mode = "idle" if self.follower.connected else "offline"
 
     def _abort_active_task(self, reason: str) -> None:
         """Return to a safe idle/offline state without waiting for another tick."""
@@ -2528,12 +2574,12 @@ class ControlLoop:
         self._end_rollout()
         self._end_playback()
         self.loaded_policy = None
-        self._close_writer()
         self._slew_goal = None
         self._pending_release = None
         self.mode = "idle" if self.follower.connected else "offline"
         self.last_error = reason
         self.log("error", f"active task aborted: {reason}")
+        self._close_writer()
 
     def _force_abort_active_task(self) -> None:
         """Detach slow shutdown work so force stop can return immediately."""
@@ -2543,10 +2589,10 @@ class ControlLoop:
         self._invalidate_policy_load()
         self._end_rollout()
         self.loaded_policy = None
-        self._close_writer()
         self._slew_goal = None
         self._pending_release = None
         self.mode = "idle" if self.follower.connected else "offline"
+        self._close_writer()
 
     def _tick_jog(self) -> None:
         if not self._output_due:
@@ -2862,6 +2908,12 @@ class ControlLoop:
                 + (f", rtc={rtc}" if rtc is not None else ""),
             )
             hw_features = self._rollout_hw_features()
+            applied = apply_requested_overrides(loaded, self.rollout_extra)
+            if applied:
+                self.log(
+                    "info",
+                    f"policy overrides applied to the resident model: {', '.join(applied)}",
+                )
             engine = create_monitor_inference_engine(
                 loaded,
                 inference_config=config,
@@ -2920,12 +2972,13 @@ class ControlLoop:
 
             def finish_engine() -> None:
                 try:
-                    while engine.stop() is False:
-                        time.sleep(0.05)
-                except Exception as exc:  # noqa: BLE001 - retain ownership if stop is unconfirmed
+                    engine.stop()
+                except Exception as exc:  # noqa: BLE001 - a failed stop must still be waited out
                     self.log("error", f"inference engine stop failed: {exc}")
-                else:
+                if engine.wait_stopped():
                     stopped.set()
+                else:  # pragma: no cover - a wedged CUDA call keeps the lease reserved
+                    self.log("error", "inference engine thread did not exit; its policy stays reserved")
 
             threading.Thread(target=finish_engine, name="stop-monitor-rtc", daemon=True).start()
             if lease is not None:

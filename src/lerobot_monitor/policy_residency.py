@@ -4,21 +4,17 @@ from __future__ import annotations
 
 import gc
 import hashlib
-import json
 import queue
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .policy import (
-    RUNTIME_POLICY_EXTRA_KEYS,
-    RUNTIME_POLICY_EXTRA_PREFIXES,
     LoadedPolicy,
-    _coerce_override,
     resolve_cached_policy_path,
 )
 
@@ -56,6 +52,21 @@ def _checkpoint_fingerprint(root: Path) -> tuple[tuple[str, int, int], ...]:
     return tuple(sorted(result))
 
 
+def _extra_value(extra: Mapping[str, str] | None, key: str) -> str:
+    """Read one extra, tolerating the spellings the UI and CLI may send for it."""
+    values = {
+        str(k).removeprefix("--").removeprefix("policy."): str(v)
+        for k, v in (extra or {}).items()
+    }
+    return values.get(key, "")
+
+
+def _canonical_device(device: str | None) -> str:
+    """Canonical CUDA spelling, so ``cuda`` and ``cuda:0`` name the same instance."""
+    text = str(device or "cuda").strip().lower() or "cuda"
+    return "cuda:0" if text == "cuda" else text
+
+
 def policy_identity(
     path: str,
     device: str,
@@ -64,54 +75,23 @@ def policy_identity(
     robot_type: str,
     rename_map: dict[str, str],
 ) -> tuple[Any, ...]:
-    """Keep only overrides that can change the loaded policy or processors."""
-    values = {str(k).removeprefix("--").removeprefix("policy."): str(v) for k, v in extra.items()}
-    revision = values.get("pretrained_revision", "").strip()
-    values = {
-        key: value for key, value in values.items()
-        if key not in RUNTIME_POLICY_EXTRA_KEYS and not key.startswith(RUNTIME_POLICY_EXTRA_PREFIXES)
-    }
+    """Identify a loaded instance by the weights it holds, not by the command line.
+
+    ``policy.*`` and the other runtime extras cannot change the tensors a checkpoint
+    holds, so they must never force a second copy of the same weights into VRAM; they
+    are applied to the resident instance at use time (``policy.apply_requested_overrides``).
+    ``robot_type`` and ``rename_map`` come from the process configuration, so they are
+    constant across requests and never split entries in practice — but they do change the
+    preprocessors built alongside the weights, so they stay in the key.
+    """
+    revision = _extra_value(extra, "pretrained_revision").strip()
     source = _canonical_source(path, revision)
-    local = Path(source).expanduser()
-    config: dict[str, Any] = {}
-    config_path = local / "config.json"
-    if config_path.is_file():
-        try:
-            raw = json.loads(config_path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                config = raw
-        except (OSError, ValueError):
-            pass
-    effective: dict[str, str] = {}
-    for key, value in values.items():
-        # Revision selects the source snapshot; it is not a field on the loaded policy config.
-        if key == "pretrained_revision":
-            continue
-        obj: Any = config
-        parts = key.split(".")
-        for part in parts[:-1]:
-            obj = obj.get(part) if isinstance(obj, dict) else None
-        found = isinstance(obj, dict) and parts[-1] in obj
-        current = obj[parts[-1]] if found else None
-        try:
-            normalized = _coerce_override(value, current)
-        except (TypeError, ValueError):
-            normalized = value
-        # Older checkpoints may omit fields whose values equal dataclass defaults.
-        # Treat a missing leaf as effective and let load-time validation decide.
-        if not found or normalized != current:
-            effective[key] = json.dumps(normalized, sort_keys=True, default=str)
-    # A remote whose configuration has not yet been cached must retain explicit
-    # policy overrides until load_policy can resolve its actual configuration.
-    if not config:
-        effective = dict(values)
     return (
         source,
-        str(device or "cuda").strip().lower(),
-        tuple(sorted(effective.items())),
+        _canonical_device(device),
+        _checkpoint_fingerprint(Path(source).expanduser()),
         robot_type,
         tuple(sorted((str(k), str(v)) for k, v in rename_map.items())),
-        _checkpoint_fingerprint(local),
     )
 
 
@@ -281,8 +261,14 @@ class PolicyResidencyManager:
             entry = self._entries.get(key)
             return entry.loaded if entry is not None and entry.state == "ready" and not entry.busy else None
 
-    def acquire(self, path: str, device: str, extra: dict[str, str]) -> PolicyLease:
+    def acquire(
+        self, path: str, device: str, extra: dict[str, str], *, timeout: float | None = None
+    ) -> PolicyLease:
         entry = self.request(path, device, extra)
+        # Only a lease that is waiting for a previous owner to let go is bounded: a cold
+        # load is a legitimate multi-minute wait, while a thread that will not exit is
+        # something the caller must be told about instead of hanging on `pending` forever.
+        deadline: float | None = None
         with self._lock:
             cache_hit = entry.state in {"ready", "stopping"}
         while True:
@@ -295,6 +281,17 @@ class PolicyResidencyManager:
                     entry.busy = True
                     self._changed()
                     return PolicyLease(self, entry, cache_hit=cache_hit)
+                stopping = entry.state == "stopping"
+            if timeout is not None and stopping:
+                if deadline is None:
+                    deadline = time.monotonic() + max(0.0, timeout)
+                if time.monotonic() >= deadline:
+                    raise PolicyBusyError(
+                        f"model instance is not ready after {timeout:.1f}s (state={entry.state}); "
+                        "wait for the previous inference thread to exit"
+                    )
+            else:
+                deadline = None
             with entry.condition:
                 entry.condition.wait(timeout=0.1)
 
@@ -462,7 +459,7 @@ class PolicyResidencyManager:
                 {
                     "id": item.instance_id,
                     "device": item.device,
-                    "overrides": dict(item.key[2]),
+                    "overrides": dict(item.extra),
                     "state": "in_use" if item.busy and item.state == "ready" else item.state,
                     "phase": item.phase,
                     "completed_steps": item.completed_steps,

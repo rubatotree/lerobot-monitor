@@ -105,6 +105,21 @@ def apply_policy_overrides(cfg: Any, extra: Mapping[str, str] | None) -> list[st
     return applied
 
 
+def apply_requested_overrides(loaded: LoadedPolicy, extra: Mapping[str, str] | None) -> list[str]:
+    """Apply ``policy.*`` extras to an already-loaded instance; return the keys applied.
+
+    Runs on every claim of a resident instance, so one weight copy can serve requests
+    that differ only in runtime configuration instead of loading a second one.
+    """
+    config = getattr(loaded.policy, "config", None)
+    if config is None:
+        return []
+    applied = apply_policy_overrides(config, extra)
+    if applied:
+        logger.info("applied policy overrides to resident %s: %s", loaded.path, ", ".join(applied))
+    return applied
+
+
 @dataclass
 class LoadedPolicy:
     path: str

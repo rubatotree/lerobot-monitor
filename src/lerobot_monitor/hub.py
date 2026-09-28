@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any
 
@@ -18,7 +19,7 @@ from .policy import load_policy
 from .policy_residency import PolicyResidencyManager
 from .robot import FollowerArm
 from .robot_models import RobotModelRegistry
-from .runtime import format_runtime, probe_runtime
+from .runtime import format_runtime, prepare_policy_runtime, probe_runtime
 from .session import list_sessions
 from .snapshots import SnapshotLibrary
 from .store import JsonStore
@@ -75,9 +76,24 @@ class RuntimeHub:
             self._snapshot = snapshot
 
     def start(self) -> None:
+        # Finish cold Python imports before camera/control threads start doing
+        # repeated I/O and timing work. Do not allocate weights or download here.
+        if not self.config.rollout.preload_dependencies:
+            self.runtime["policy_dependencies"] = {"state": "disabled"}
+        elif not self.runtime.get("lerobot_file") or not self.runtime.get("torch"):
+            self.runtime["policy_dependencies"] = {"state": "unavailable"}
+        else:
+            self.runtime["policy_dependencies"] = prepare_policy_runtime(self._log_policy_startup)
         self.cameras.start()
         self.loop.start()
         self._restore_active_hardware_preset()
+
+    def _log_policy_startup(self, level: str, message: str) -> None:
+        # The control loop's UI logging handler is not attached until start().
+        self.loop.log(level, message, echo=False)
+        logging.getLogger("uvicorn.error").log(
+            logging.ERROR if level == "error" else logging.INFO, message,
+        )
 
     def _trim_video_library(self) -> None:
         for row in self.videos.trim_all_to_first_episode():

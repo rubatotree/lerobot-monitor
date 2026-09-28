@@ -167,6 +167,7 @@ class _Entry:
     load_started_at: float | None = None
     phase_started_at: float | None = None
     stage_durations_ms: dict[str, float] = field(default_factory=dict)
+    source_aliases: set[str] = field(default_factory=set)
 
 
 def _matches_source(entry: _Entry, source: str) -> bool:
@@ -446,9 +447,13 @@ class PolicyResidencyManager:
 
             def progress(phase: str, completed: int, target: _Entry = entry) -> None:
                 previous: tuple[str, float] | None = None
+                # A Hub download can create a local snapshot during this load.
+                # Refresh aliases at stage boundaries, not on every UI snapshot.
+                resolved_source = _canonical_source(target.source_path)
                 with self._lock:
                     if target.invalidated or self._closed:
                         raise PolicyLoadCancelled("model loading was cancelled")
+                    target.source_aliases.add(resolved_source)
                     now = time.perf_counter()
                     if target.phase_started_at is not None:
                         elapsed = (now - target.phase_started_at) * 1000.0
@@ -692,9 +697,25 @@ class PolicyResidencyManager:
             cuda.empty_cache()
 
     def status(self, path: str) -> dict[str, Any]:
-        source = _canonical_source(path)
+        return self._status_for_source(_canonical_source(path), resolve_aliases=True)
+
+    def _status_for_source(self, source: str, *, resolve_aliases: bool = False) -> dict[str, Any]:
+        """Read resident keys in memory; external path queries may resolve aliases."""
         with self._lock:
-            entries = [item for item in self._entries.values() if _matches_source(item, source)]
+            entries = [
+                item for item in self._entries.values()
+                if (
+                    _matches_source(item, source) if resolve_aliases else
+                    source in {str(item.key[0]), item.source_path, *item.source_aliases}
+                )
+            ]
+            if resolve_aliases:
+                for item in entries:
+                    item.source_aliases.add(source)
+            source_paths = sorted({
+                alias for item in entries
+                for alias in {str(item.key[0]), item.source_path, *item.source_aliases}
+            })
             unique_storages: dict[tuple[str, int, int], int] = {}
             for item in entries:
                 unique_storages.update(item.storages)
@@ -729,7 +750,7 @@ class PolicyResidencyManager:
         state = next((candidate for candidate in priority if candidate in states), "unloaded")
         return {
             "state": state,
-            "source_paths": sorted({alias for item in entries for alias in (str(item.key[0]), item.source_path, _canonical_source(item.source_path))}),
+            "source_paths": source_paths,
             "instances": instances,
             "gpu_bytes": sum(unique_storages.values()),
             "can_unload": bool(instances) and states <= {"ready", "error", "cancelled"},
@@ -740,7 +761,7 @@ class PolicyResidencyManager:
     def all_statuses(self) -> dict[str, dict[str, Any]]:
         with self._lock:
             sources = {str(key[0]) for key in self._entries}
-        return {source: self.status(source) for source in sources}
+            return {source: self._status_for_source(source) for source in sources}
 
     def load_diagnostics(self) -> dict[str, Any]:
         """Sample Python stacks on demand, without retaining frames or their locals.
@@ -768,6 +789,10 @@ class PolicyResidencyManager:
     def has_active_inference(self) -> bool:
         with self._lock:
             return any(item.busy for item in self._entries.values())
+
+    def has_stopping_inference(self) -> bool:
+        with self._lock:
+            return any(item.state == "stopping" for item in self._entries.values())
 
     @staticmethod
     def process_gpu_memory() -> list[dict[str, int]]:

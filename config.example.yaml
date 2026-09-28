@@ -71,6 +71,9 @@ robot_models:
 
 rollout:
   device: cpu
+  # Import shared policy libraries before camera/control threads start.
+  # No weights are loaded. Disable for a monitor-only installation.
+  preload_dependencies: true
   default_duration_s: 60
   default_fps: 15
   # Receive-time checks, not camera exposure timestamps; tune for the task.

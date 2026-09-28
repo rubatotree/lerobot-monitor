@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from lerobot_monitor.hub import RuntimeHub
+from lerobot_monitor.config import MonitorConfig
 
 
 def _hub_without_runtime_setup() -> RuntimeHub:
@@ -11,6 +12,47 @@ def _hub_without_runtime_setup() -> RuntimeHub:
     hub.cameras = MagicMock()
     hub.policy_residency = MagicMock()
     return hub
+
+
+@pytest.mark.parametrize("enabled,available", [(True, True), (False, True), (True, False)])
+def test_policy_imports_precede_runtime_threads(monkeypatch, enabled, available) -> None:
+    hub = _hub_without_runtime_setup()
+    hub.config = MonitorConfig()
+    hub.config.rollout.preload_dependencies = enabled
+    hub.runtime = {"torch": "test" if available else None, "lerobot_file": "test"}
+    events = []
+
+    def prepare(log):
+        events.append("imports")
+        return {"state": "ready"}
+
+    monkeypatch.setattr("lerobot_monitor.hub.prepare_policy_runtime", prepare)
+    hub.cameras.start.side_effect = lambda: events.append("cameras")
+    hub.loop.start.side_effect = lambda: events.append("control")
+    hub._restore_active_hardware_preset = lambda: events.append("restore")
+    hub.start()
+    assert events == (["imports"] if enabled and available else []) + ["cameras", "control", "restore"]
+    assert hub.runtime["policy_dependencies"]["state"] == (
+        "disabled" if not enabled else "ready" if available else "unavailable"
+    )
+
+
+def test_optional_policy_import_failure_still_starts_monitor(monkeypatch) -> None:
+    hub = _hub_without_runtime_setup()
+    hub.config = MonitorConfig()
+    hub.runtime = {"torch": "test", "lerobot_file": "test"}
+    hub._restore_active_hardware_preset = MagicMock()
+
+    def fail(progress):
+        progress("imports_factory", 0)
+        raise ImportError("missing optional policy dependency")
+
+    monkeypatch.setattr("lerobot_monitor.policy.import_policy_dependencies", fail)
+    hub.start()
+    assert hub.runtime["policy_dependencies"]["state"] == "error"
+    assert hub.runtime["policy_dependencies"]["phase"] == "imports_factory"
+    hub.cameras.start.assert_called_once()
+    hub.loop.start.assert_called_once()
 
 
 def test_stop_always_stops_cameras_and_preserves_loop_error() -> None:

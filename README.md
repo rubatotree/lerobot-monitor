@@ -40,6 +40,7 @@ Windows 也可以运行 `.\run.ps1`。它优先读取本地 `config.yaml`，否�
 - 缓存迁移后可设置 `huggingface_home`；若校准文件仍在旧目录，分别设置 `robot.calibration_dir` 和 `leader.calibration_dir` 为包含 `<id>.json` 的目录。
 - `recording.root`、`library.*_roots`、`robot_models.root` 可改为你自己的目录。
 - 运行数据默认放在 `data/`，不会提交到 Git。Hugging Face 凭据请使用其标准本机认证方式，不要写入配置文件。
+- `rollout.preload_dependencies` 默认开启：服务在摄像头和控制线程启动前导入策略共享依赖，避免首次 Load 在运行中的线程间竞争。此步骤不构建模型、不读取权重；阶段耗时写入启动日志与 `runtime.policy_dependencies`。仅使用监控功能时可设为 `false`，恢复按需导入。未安装 PyTorch/LeRobot 时跳过，其他依赖导入失败会记录错误并继续启动监控。
 
 ## 开发与验证
 
@@ -54,7 +55,7 @@ node scripts/test-rollout-lanes.mjs
 node scripts/verify-model-delete-id.cjs
 ```
 
-应用后端位于 `src/lerobot_monitor/`，前端资源位于 `src/lerobot_monitor/web/static/`。控制循环独占机械臂总线；HTTP 接口向循环投递命令。硬件/策略依赖按需导入，因此基础页面与虚拟从臂可独立运行。
+应用后端位于 `src/lerobot_monitor/`，前端资源位于 `src/lerobot_monitor/web/static/`。控制循环独占机械臂总线；HTTP 接口向循环投递命令。硬件依赖按需导入，策略共享依赖默认在启动时准备；基础页面与虚拟从臂可在未安装模型依赖时独立运行。
 
 ## 许可与资源
 

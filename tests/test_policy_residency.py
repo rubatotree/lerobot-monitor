@@ -325,20 +325,126 @@ def test_busy_and_stopping_instances_cannot_unload(tmp_path: Path) -> None:
     manager = _manager(lambda path, **kwargs: _loaded(path))
     try:
         lease = manager.acquire(str(path), "cpu", {})
+        assert not manager.has_stopping_inference()
         with pytest.raises(PolicyBusyError):
             manager.unload(str(path))
         stopped = threading.Event()
         lease.retire(stopped)
+        assert manager.has_stopping_inference()
         assert manager.status(str(path))["state"] == "stopping"
         with pytest.raises(PolicyBusyError):
             manager.unload(str(path))
         stopped.set()
         _wait_for_state(manager, path, "ready")
+        assert not manager.has_stopping_inference()
         assert manager.unload(str(path)) == 1
         assert manager.unload(str(path)) in {0, 1}
         _wait_for_state(manager, path, "unloaded")
         assert manager.unload(str(path)) == 0
     finally:
+        manager.close()
+
+
+def test_status_refresh_uses_resident_keys_without_filesystem_io(tmp_path, monkeypatch) -> None:
+    path = _model(tmp_path / "model")
+    manager = _manager(lambda path, **kwargs: _loaded(path))
+    try:
+        manager.request(str(path), "cpu", {})
+        _wait_for_state(manager, path, "ready")
+        source = str(path.resolve())
+        expected = manager.status(str(path))
+
+        def unexpected_io(*args, **kwargs):
+            raise AssertionError("status refresh must not resolve or stat resident paths")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(residency_module, "_canonical_source", unexpected_io)
+            patch.setattr(Path, "stat", unexpected_io)
+            actual = manager.all_statuses()
+            assert actual == {source: expected}
+            assert not manager.has_stopping_inference()
+            actual[source]["instances"][0]["stage_durations_ms"]["modified"] = 1
+            actual[source]["instances"][0]["overrides"]["modified"] = "value"
+            assert manager.all_statuses() == {source: expected}
+    finally:
+        manager.close()
+
+
+def test_load_stage_remembers_new_snapshot_alias_for_status_pushes(tmp_path, monkeypatch) -> None:
+    snapshot = _model(tmp_path / "snapshot")
+    resolved = []
+    entered, finish = threading.Event(), threading.Event()
+    monkeypatch.setattr(
+        residency_module, "resolve_cached_policy_path",
+        lambda path, *args: resolved[0] if path == "owner/model" and resolved else None,
+    )
+
+    def loader(source, **kwargs):
+        resolved.append(str(snapshot))
+        kwargs["progress"]("weights", 1)
+        entered.set()
+        assert finish.wait(4)
+        return _loaded(source)
+
+    manager = _manager(loader)
+    try:
+        manager.request("owner/model", "cpu", {})
+        assert entered.wait(2)
+        with monkeypatch.context() as patch:
+            def unexpected_io(*args, **kwargs):
+                raise AssertionError("status push re-resolved the downloaded snapshot")
+
+            patch.setattr(residency_module, "_canonical_source", unexpected_io)
+            status = manager.all_statuses()["owner/model"]
+            assert status["state"] == "loading"
+            assert status["source_paths"] == sorted(["owner/model", str(snapshot)])
+    finally:
+        finish.set()
+        manager.close()
+
+
+def test_status_push_keeps_devices_grouped_during_snapshot_rekey(tmp_path, monkeypatch) -> None:
+    snapshot = _model(tmp_path / "snapshot")
+    resolved = []
+    first_started, finish_first = threading.Event(), threading.Event()
+    second_started, finish_second = threading.Event(), threading.Event()
+    monkeypatch.setattr(
+        residency_module, "resolve_cached_policy_path",
+        lambda path, *args: resolved[0] if path == "owner/model" and resolved else None,
+    )
+
+    def loader(source, **kwargs):
+        if kwargs["device"] == "cpu":
+            first_started.set()
+            assert finish_first.wait(4)
+        else:
+            kwargs["progress"]("weights", 1)
+            second_started.set()
+            assert finish_second.wait(4)
+        return _loaded(source)
+
+    manager = _manager(loader)
+    try:
+        manager.request("owner/model", "cpu", {})
+        assert first_started.wait(2)
+        manager.request("owner/model", "cuda", {})
+        resolved.append(str(snapshot))
+        finish_first.set()
+        assert second_started.wait(2)
+        with monkeypatch.context() as patch:
+            def unexpected_io(*args, **kwargs):
+                raise AssertionError("status aggregation must use cached aliases")
+
+            patch.setattr(residency_module, "_canonical_source", unexpected_io)
+            statuses = manager.all_statuses()
+            assert set(statuses) == {"owner/model", str(snapshot)}
+            for status in statuses.values():
+                assert status["state"] == "loading"
+                assert {item["state"] for item in status["instances"]} == {"ready", "loading"}
+                assert {item["device"] for item in status["instances"]} == {"cpu", "cuda"}
+    finally:
+        finish_first.set()
+        finish_second.set()
         manager.close()
 
 

@@ -110,6 +110,7 @@ class RobotModelsConfig(BaseModel):
 
 class RolloutConfig(BaseModel):
     device: str = "cuda"
+    preload_dependencies: bool = True
     default_duration_s: float = 60.0
     default_fps: int = 15
     rename_map: dict[str, str] = Field(default_factory=dict)

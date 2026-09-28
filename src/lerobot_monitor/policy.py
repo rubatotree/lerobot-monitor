@@ -35,6 +35,48 @@ class PolicyLoadCancelled(RuntimeError):
     """A requested model operation was cancelled at a safe boundary."""
 
 
+@dataclass(frozen=True)
+class PolicyDependencies:
+    torch: Any
+    config_class: Any
+    get_policy_class: Callable[..., Any]
+    make_pre_post_processors: Callable[..., Any]
+    action: str
+    model_load_context: Callable[..., Any]
+
+
+def import_policy_dependencies(
+    progress: Callable[[str, int], None] | None = None,
+) -> PolicyDependencies:
+    """Prepare the same dependency graph for startup and on-demand loading.
+
+    Run before camera/control threads when possible: cold imports perform many
+    small filesystem operations and compete with those threads on Windows.
+    Python's module cache handles reuse; no model or processor is constructed.
+    Keep LeRobot's public imports so its policy/processor registrations run.
+    """
+    def report(phase: str) -> None:
+        if progress is not None:
+            progress(phase, 0)
+
+    report("imports")
+    ensure_lerobot_on_path()
+    report("imports_torch")
+    import torch
+
+    report("imports_config")
+    from lerobot.configs import PreTrainedConfig
+
+    report("imports_factory")
+    from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+    from lerobot.utils.constants import ACTION
+    from lerobot.utils.loading import model_load_context
+
+    return PolicyDependencies(
+        torch, PreTrainedConfig, get_policy_class, make_pre_post_processors, ACTION, model_load_context,
+    )
+
+
 @contextmanager
 def _prefer_hub_cache() -> Iterator[None]:
     """Hint newly imported Hub modules; existing imports still need local paths/options."""
@@ -354,18 +396,13 @@ def _load_policy(
         if progress is not None:
             progress(phase, completed)
 
-    report("imports", 0)
-    ensure_lerobot_on_path()
-    report("imports_torch", 0)
-    import torch
-
-    report("imports_config", 0)
-    from lerobot.configs import PreTrainedConfig
-
-    report("imports_factory", 0)
-    from lerobot.policies.factory import get_policy_class, make_pre_post_processors
-    from lerobot.utils.constants import ACTION
-    from lerobot.utils.loading import model_load_context
+    dependencies = import_policy_dependencies(report)
+    torch = dependencies.torch
+    PreTrainedConfig = dependencies.config_class
+    get_policy_class = dependencies.get_policy_class
+    make_pre_post_processors = dependencies.make_pre_post_processors
+    ACTION = dependencies.action
+    model_load_context = dependencies.model_load_context
 
     report("cache", 0)
     requested_revision = str(

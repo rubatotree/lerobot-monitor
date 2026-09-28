@@ -754,3 +754,16 @@
 - 失败即退出 rollout：`_drain_commands` 在命令失败或 e-stop 拒绝时清掉该命令自己创建的 pending；五处退出路径先把 mode/pending 落定再做可能失败的录制收尾；控制循环加最后一道守卫，单次异常不再杀死控制线程，重复故障按签名只记一次日志。
 - 验证：lerobot 侧 `tests/test_rollout.py` 与 `tests/test_interactive_rollout.py` 115 passed；lerobot-monitor 全套 324 passed、1 skipped。无硬件端到端冒烟（虚拟从臂 + 已缓存 SmolVLA 权重，走 HTTP API）：空 `policy_path` 的 `rollout_start` 返回 4xx 后 `pending` 为空、灯灭；同一权重冷加载一次（日志 `model ready in 98.7s`），第二次带不同 `policy.n_action_steps` 启动显示 `using cached policy` 且没有第二次加载；两次停止各只有一条 `Stopping RTC inference thread...` 与一条 `RTC inference thread stopped`，不再出现 `did not join`；引擎因缺相机图像失败时 rollout 在约 4.5 秒内自动退出（`mode=idle`、灯灭、`message` 带 traceback）。
 - 未验证：没有人工制造超过 3 秒的单次策略推理，因此「`stop()` 返回 `False` → `wait_stopped()` 阻塞数秒」这条路径只由单元测试覆盖（真实 RTC 线程 + 真实引擎类）；实体机械臂上的 rollout 行为仍需真机复核。
+
+## 2026-09-28：修复首次策略依赖导入与状态刷新 I/O
+
+- 在线服务同一次 SmolVLA 加载耗时 380.908 秒，其中 configs 27.315 秒、factory 244.410 秒、weights 107.800 秒。加载线程采样依次位于 importlib 文件读取、pandas 模块导入、Transformers 的 `importlib.metadata.packages_distributions()` 包文件扫描，未看到同一导入锁上停滞。同期控制与状态推送线程多次在模型目录 `is_dir/resolve/stat` 中。
+- 原生 configs 会引入图像变换、torchvision 等；factory 会触发策略与处理器注册、Transformers 和 pandas 等依赖。保留原生注册，未跳过包初始化、修改第三方导入器或关闭安全软件。当前证据不能把数分钟延迟完全归因于某一个 OS/GIL 因素。
+- Monitor 现在通过统一的 `import_policy_dependencies` 准备共享依赖，默认在摄像头和控制线程启动前完成；Load 复用 Python 模块缓存。支持 `rollout.preload_dependencies: false`，缺失 PyTorch/LeRobot 时跳过，其他导入异常记录失败阶段后继续启动监控。启动日志和 `runtime.policy_dependencies` 保留阶段耗时。
+- `all_statuses` 直接读取已归一的内存键，控制循环用布尔查询判断 stopping，不再为每次状态广播重复访问模型目录。单次外部 path 查询仍做路径归一，保留别名语义。
+- 与同期取消加载功能合并后，远程模型的本地快照别名在加载阶段切换与显式路径查询时更新；状态广播读取缓存别名，避免 `source_paths` 又引入路径解析。取消与释放 API 保留原行为。
+- 合并后全量测试 423 passed / 4 skipped（174.75 秒）。随后补齐同一远程模型多设备实例在快照重命名期间的内存聚合，并重跑全部 residency、加载日志、启动与 runtime 测试：44 passed（23.10 秒）。此最后调整未再次运行全量测试。
+- 验证：完整环境 pytest 407 passed / 4 skipped；基础环境启动与失败降级测试 10 passed。首次定向测试断言全部通过，但默认临时目录清理遇到 Windows 权限错误；改用本次任务独立临时目录后完整测试正常退出。
+- 新进程、关闭摄像头、临时 store 且禁止网络：未预载时启动加 config/factory 导入共 14.998 秒（3.941 + 8.748 秒）；预载后共 14.544 秒，预载 12.047 秒，加载线程重复导入 config/factory 为 3.5 / 2.1 微秒。此对比只验证预载没有把数分钟原封不动移到启动期，不等同于真实摄像头负载下的完整 A/B。
+- 真实缓存 SmolVLA 在独立 CPU 进程加载成功，禁止所有 socket connect；预载 12.267 秒，后续加载约 49 秒，进程到就绪共 63.009 秒。为避免干扰在线 GPU rollout，该冒烟用 CPU、PyTorch 2 个计算线程，不作 CUDA 性能结论。
+- 在线服务正在 rollout，本次未重启；修改将在下次服务启动生效。真实摄像头/控制负载下的重启后 CUDA 全链路时间仍待验证。

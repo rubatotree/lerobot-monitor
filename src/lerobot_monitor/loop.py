@@ -1129,11 +1129,7 @@ class ControlLoop:
             "playback": self._playback_snapshot(),
             "rollout_inference_ms": self._rollout_infer_ms if self.mode == "rollout" else None,
             "rollout_waiting": self._rollout_waiting if self.mode == "rollout" else False,
-            "rollout_stopping": any(
-                item["state"] == "stopping"
-                for status in self.policy_residency.all_statuses().values()
-                for item in status["instances"]
-            ),
+            "rollout_stopping": self.policy_residency.has_stopping_inference(),
             "memory_cleaning": self._memory_cleaning.is_set(),
             "memory_clean_result": self._memory_clean_result,
             "robot": self.follower.snapshot(),

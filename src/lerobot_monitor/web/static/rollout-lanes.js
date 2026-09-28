@@ -1,246 +1,131 @@
-// Pure rollout timeline geometry. Rendering stays in app.js so this module can
-// be tested without DOM or Chart.js.
-
-export const ROLLOUT_LANE_DEFAULTS = {
-  windowS: 20,
-  maxBlocks: 200,
-  overlapMinS: 0.02,
-  rows: 2,
-};
-
-function finite(value) {
-  if (value == null || value === "") return null;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
+// Pure time and pixel geometry; all phases retain uncropped source times.
+export const ROLLOUT_LANE_DEFAULTS = { windowS: 20, maxBlocks: 200, overlapMinS: 0.02, rows: 1 };
+const finite = (v) => v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v);
+const positive = (v) => finite(v) > 0 ? Number(v) : null;
+export const formatDuration = (seconds) => seconds == null || !Number.isFinite(seconds) ? '—' : seconds < 1 ? `${Math.round(Math.max(0, seconds) * 1000)} ms` : `${Math.max(0, seconds).toFixed(2)} s`;
+// Retained export for older callers: overlap never allocates additional rows.
+export function assignRows(spans) {
+  return (spans || []).filter(s => finite(s.start) != null && finite(s.end) != null)
+    .map(s => ({ ...s, row: 0 })).sort((a, b) => a.start - b.start || Number(a.id) - Number(b.id));
 }
-
-function positive(value) {
-  const number = finite(value);
-  return number != null && number > 0 ? number : null;
-}
-
-function fallbackSteps(prediction) {
-  const actions = prediction && Array.isArray(prediction.actions) ? prediction.actions.length : 0;
-  return actions > 0 ? actions : null;
-}
-
-function optionsWithDefaults(options = {}) {
-  return { ...ROLLOUT_LANE_DEFAULTS, ...options };
-}
-
-export function assignRows(spans, rows = ROLLOUT_LANE_DEFAULTS.rows) {
-  const rowCount = Math.max(1, Math.floor(Number(rows) || 1));
-  const ordered = [...(spans || [])]
-    .filter((span) => span && finite(span.start) != null && finite(span.end) != null)
-    .sort((left, right) => (
-      finite(left.start) - finite(right.start)
-      || Number(left.id || 0) - Number(right.id || 0)
-    ));
-  const rowEnds = new Array(rowCount).fill(Number.NEGATIVE_INFINITY);
-  return ordered.map((span) => {
-    const start = finite(span.start);
-    const end = Math.max(start, finite(span.end));
-    let row = rowEnds.findIndex((rowEnd) => start >= rowEnd);
-    if (row < 0) {
-      row = rowEnds.indexOf(Math.min(...rowEnds));
-    }
-    rowEnds[row] = end;
-    return { ...span, start, end, row };
-  });
-}
-
 export function chunkSpans(blocks, options = {}) {
-  const opts = optionsWithDefaults(options);
-  const fallback = fallbackSteps(opts.prediction);
-  const spans = [];
-  (blocks || []).forEach((block) => {
-    const active = finite(block && block.active);
-    if (active == null) return;
-    const realSteps = positive(block && block.steps);
-    const steps = realSteps || fallback;
-    const stepS = positive(block && block.step_s)
-      || positive(opts.prediction && opts.prediction.step_s)
-      || positive(opts.stepS);
-    if (steps == null || stepS == null) return;
-    const duration = steps * stepS;
-    if (!(duration > 0)) return;
-    spans.push({
-      id: block.id,
-      kind: String(block.kind || ""),
-      start: active,
-      end: active + duration,
-      steps,
-      step_s: stepS,
-      failed: !!block.failed,
-      active,
-      chunk: realSteps != null,
-      fallback: realSteps == null,
-    });
+  return assignRows((blocks || []).flatMap(block => {
+    const active = finite(block.active);
+    const realSteps = finite(block.accepted_steps) ?? finite(block.steps);
+    const steps = realSteps ?? options.prediction?.actions?.length;
+    const step = positive(block.step_s) || positive(options.prediction?.step_s) || positive(options.stepS);
+    if (active == null || !(steps > 0) || !step || block.failed) return [];
+    return [{ ...block, start: active, end: active + steps * step, active, steps, step_s: step,
+      chunk: realSteps != null, fallback: realSteps == null }];
+  }));
+}
+export function inferenceSpans(blocks, now = null) {
+  return (blocks || []).flatMap(block => {
+    const start = finite(block.start), end = finite(block.end) ?? finite(now);
+    return start == null || end == null || end < start ? [] : [{ ...block, start, end }];
+  }).sort((a, b) => a.start - b.start || Number(a.id) - Number(b.id));
+}
+export function inputMarkers(blocks) {
+  return chunkSpans(blocks).filter(s => s.chunk).map(s => ({ id: s.id, x: s.active, kind: s.kind, steps: s.steps }));
+}
+// Sweep exact coverage intervals: pairwise unions falsely report triple coverage.
+export function overlapSpans(spans, minS = 0.02) {
+  const points = [...new Set(spans.flatMap(s => [s.start, s.end]))].sort((a, b) => a - b);
+  const overlaps = [];
+  for (let i = 0; i + 1 < points.length; i++) {
+    const start = points[i], end = points[i + 1];
+    const ids = spans.filter(s => s.start < end && s.end > start).map(s => s.id);
+    if (ids.length < 2 || end - start + 1e-9 < minS) continue;
+    overlaps.push({ start, end, duration: end - start, ids, rows: [0], count: ids.length });
+  }
+  return overlaps;
+}
+export function buildRolloutLanes({ timeline, chartNow, epoch = null, prediction = null,
+  windowS = 20, lookaheadS = 0, maxBlocks = 200, overlapMinS = 0.02 } = {}) {
+  const now = finite(chartNow), offset = finite(timeline?.epoch_ts) ?? finite(epoch);
+  if (now == null || offset == null || !timeline?.blocks?.length) return null;
+  const window = { start: now - windowS, end: now + lookaheadS };
+  const mapTime = v => finite(v) == null ? null : Number(v) + offset;
+  const blocks = timeline.blocks.slice(-Math.max(1, maxBlocks)).map(block => ({ ...block,
+    start: mapTime(block.start), end: mapTime(block.end), active: mapTime(block.active),
+    accepted_at: mapTime(block.accepted_at), action_end: mapTime(block.action_end),
+    last_dispatched: mapTime(block.last_dispatched), replaced_at: mapTime(block.replaced_at),
+    stages: (block.stages || []).map(stage => ({ ...stage, start: mapTime(stage.start), end: mapTime(stage.end) })),
+  }));
+  const visible = span => span.end >= window.start && span.start <= window.end;
+  const chunks = chunkSpans(blocks, { prediction, stepS: timeline.step_s }).filter(visible);
+  const inferences = inferenceSpans(blocks, now).filter(visible);
+  const ribbons = blocks.flatMap(block => {
+    const inference = inferenceSpans([block], now)[0];
+    const action = chunkSpans([block], { prediction, stepS: timeline.step_s })[0] || null;
+    if (!inference) return [];
+    const end = action?.end ?? block.action_end ?? inference.end;
+    if (!visible({ start: inference.start, end })) return [];
+    return [{ id: block.id, block, inference, action, end }];
   });
-  return assignRows(spans, opts.rows);
+  return { offset, now, window, rows: 1, ribbons, chunks, inferences,
+    overlaps: overlapSpans(chunks, overlapMinS), inputs: inputMarkers(blocks).filter(m => m.x >= window.start && m.x <= window.end) };
 }
-
-export function inferenceSpans(blocks) {
-  return (blocks || [])
-    .map((block) => {
-      const start = finite(block && block.start);
-      const end = finite(block && block.end);
-      if (start == null || end == null || end < start) return null;
-      return {
-        id: block.id,
-        kind: String(block.kind || ""),
-        start,
-        end,
-        failed: !!block.failed,
-      };
-    })
-    .filter(Boolean)
-    .sort((left, right) => left.start - right.start || Number(left.id || 0) - Number(right.id || 0));
-}
-
-export function overlapSpans(spans, minS = ROLLOUT_LANE_DEFAULTS.overlapMinS) {
-  const minimum = Math.max(0, Number(minS) || 0);
-  const ordered = (spans || [])
-    .filter((span) => span && finite(span.start) != null && finite(span.end) != null)
-    .map((span) => ({
-      ...span,
-      start: finite(span.start),
-      end: Math.max(finite(span.start), finite(span.end)),
-      row: Math.max(0, Math.floor(Number(span.row) || 0)),
-    }))
-    .sort((left, right) => left.start - right.start || left.end - right.end);
-  const raw = [];
-  for (let leftIndex = 0; leftIndex < ordered.length; leftIndex += 1) {
-    const left = ordered[leftIndex];
-    for (let rightIndex = leftIndex + 1; rightIndex < ordered.length; rightIndex += 1) {
-      const right = ordered[rightIndex];
-      if (right.start >= left.end) break;
-      const start = Math.max(left.start, right.start);
-      const end = Math.min(left.end, right.end);
-      if (end - start + 1e-9 < minimum) continue;
-      raw.push({
-        start,
-        end,
-        ids: [left.id, right.id],
-        rows: [left.row, right.row],
-      });
+export function ribbonSegments(lanes, pixelForTime, top, visibility = {}) {
+  const segments = [];
+  const push = (ribbon, phase, start, end, y1, y2, extra = {}) => {
+    if (end < lanes.window.start || start > lanes.window.end || end < start) return;
+    const from = Math.max(start, lanes.window.start), to = Math.min(end, lanes.window.end);
+    const ratio = t => end > start ? (t - start) / (end - start) : 0;
+    segments.push({ ribbon, phase, start, end, x1: pixelForTime(from), x2: pixelForTime(to),
+      y1: top + y1 + (y2-y1)*ratio(from), y2: top + y1 + (y2-y1)*ratio(to), ...extra });
+  };
+  for (const ribbon of lanes?.ribbons || []) {
+    const inf = ribbon.inference, action = ribbon.action;
+    if (visibility.inference !== false) {
+      if (visibility.inferenceStages && ribbon.block.stages?.length) {
+        // Base inference preserves gaps between recorded stages and unfinished work.
+        push(ribbon, 'inference', inf.start, inf.end, 58, 36);
+        for (const stage of ribbon.block.stages) {
+          const end = stage.end ?? Math.min(lanes.now, inf.end);
+          const y = t => 58 - 22 * Math.min(1, Math.max(0, (t-inf.start)/Math.max(1e-9, inf.end-inf.start)));
+          push(ribbon, 'inference', stage.start, end, y(stage.start), y(end), { stage: stage.name });
+        }
+      } else push(ribbon, 'inference', inf.start, inf.end, 58, 36);
+    }
+    if (action && visibility.chunkSpan !== false) {
+      if (visibility.inference !== false) push(ribbon, 'wait', inf.end, action.start, 36, 28);
+      // Queue replacement is earlier than control handoff: only actual end closes execution.
+      const tail = finite(ribbon.block.action_end);
+      const end = Math.max(action.start, Math.min(action.end, tail ?? action.end));
+      const elapsed = Math.max(action.start, Math.min(end, lanes.now));
+      const y = t => 28 - 22 * (t - action.start) / (action.end - action.start);
+      push(ribbon, 'action', action.start, elapsed, 28, y(elapsed));
+      if (elapsed < end) push(ribbon, 'planned', elapsed, end, y(elapsed), y(end));
+      if (end < action.end) push(ribbon, 'replaced', end, action.end, y(end), 6);
+    } else if (!action && !ribbon.block.failed && ['inferring', 'waiting'].includes(ribbon.block.status) && visibility.inference !== false) {
+      push(ribbon, 'wait', inf.end, Math.max(inf.end, lanes.now), 36, 28);
     }
   }
-  raw.sort((left, right) => left.start - right.start || left.end - right.end);
-  const merged = [];
-  raw.forEach((item) => {
-    const previous = merged[merged.length - 1];
-    if (previous && item.start <= previous.end + 1e-9) {
-      previous.end = Math.max(previous.end, item.end);
-      previous.ids = [...new Set([...previous.ids, ...item.ids])];
-      previous.rows = [...new Set([...previous.rows, ...item.rows])].sort((a, b) => a - b);
-      return;
-    }
-    merged.push({ ...item });
-  });
-  return merged.map((item) => ({ ...item, duration: item.end - item.start }));
+  return segments;
 }
-
-export function inputMarkers(blocks) {
-  return (blocks || [])
-    .map((block) => {
-      const x = finite(block && block.active);
-      if (x == null || positive(block && block.steps) == null || block.failed) return null;
-      return {
-        id: block.id,
-        x,
-        kind: String(block.kind || ""),
-        steps: Number(block.steps),
-      };
-    })
-    .filter(Boolean)
-    .sort((left, right) => left.x - right.x || Number(left.id || 0) - Number(right.id || 0));
+export function hitTestRibbon(segments, x, y, tolerance = 7) {
+  let hit = null, best = tolerance * tolerance;
+  for (const segment of segments || []) {
+    const dx = segment.x2 - segment.x1, dy = segment.y2 - segment.y1;
+    const t = Math.min(1, Math.max(0, ((x-segment.x1)*dx + (y-segment.y1)*dy) / (dx*dx+dy*dy || 1)));
+    const distance = (x-segment.x1-t*dx)**2 + (y-segment.y1-t*dy)**2;
+    if (distance <= best + 1e-9) { hit = segment; best = distance; }
+  }
+  return hit;
 }
-
-function limitBlocks(blocks, maxBlocks) {
-  const limit = Math.max(1, Math.floor(Number(maxBlocks) || ROLLOUT_LANE_DEFAULTS.maxBlocks));
-  if (blocks.length <= limit) return blocks;
-  const active = blocks.filter((block) => finite(block && block.active) != null);
-  const inactive = blocks.filter((block) => finite(block && block.active) == null);
-  const inactiveRoom = Math.max(0, limit - active.length);
-  const kept = [...active, ...inactive.slice(-inactiveRoom)];
-  return kept.sort((left, right) => Number(left.id || 0) - Number(right.id || 0));
+export function ribbonAnalysis(ribbon, now) {
+  const b = ribbon.block;
+  const terminal = ['completed','replaced','discarded','failed','stopped'].includes(b.status) || b.failed;
+  // A replaced chunk may still have one already-consumed goal awaiting control handoff.
+  const running = !terminal || (b.status === 'replaced' && b.active != null && b.action_end == null);
+  const end = b.action_end ?? (running ? now : b.replaced_at ?? b.accepted_at ?? b.end ?? now);
+  const waitEnd = b.active ?? (running ? now : end);
+  return { total: Math.max(0, end - b.start),
+    queueWait: b.end == null ? null : Math.max(0, waitEnd - b.end),
+    plan: Math.max(0, Number(b.accepted_steps ?? b.steps ?? 0) * Number(b.step_s || 0)),
+    actionElapsed: b.active == null ? null : Math.max(0, (b.action_end ?? now) - b.active) };
 }
-
-function cropSpans(spans, window) {
-  return (spans || [])
-    .map((span) => {
-      const start = Math.max(window.start, finite(span.start));
-      const end = Math.min(window.end, finite(span.end));
-      if (!(end > start)) return null;
-      return { ...span, start, end };
-    })
-    .filter(Boolean);
-}
-
-export function buildRolloutLanes({
-  timeline,
-  chartNow,
-  prediction = null,
-  windowS = ROLLOUT_LANE_DEFAULTS.windowS,
-  lookaheadS = 0,
-  maxBlocks = ROLLOUT_LANE_DEFAULTS.maxBlocks,
-  overlapMinS = ROLLOUT_LANE_DEFAULTS.overlapMinS,
-  rows = ROLLOUT_LANE_DEFAULTS.rows,
-} = {}) {
-  const now = finite(chartNow);
-  const timelineTime = finite(timeline && timeline.t_s);
-  const rawBlocks = timeline && Array.isArray(timeline.blocks) ? timeline.blocks : [];
-  if (now == null || timelineTime == null || !rawBlocks.length) return null;
-  const offset = now - timelineTime;
-  const blocks = limitBlocks(rawBlocks, maxBlocks);
-  const window = {
-    start: now - Math.max(0, Number(windowS) || ROLLOUT_LANE_DEFAULTS.windowS),
-    end: now + Math.max(0, Number(lookaheadS) || 0),
-  };
-  const chunks = cropSpans(
-    chunkSpans(blocks, {
-      rows,
-      prediction,
-      stepS: timeline.step_s,
-    }).map((span) => ({
-      ...span,
-      start: span.start + offset,
-      end: span.end + offset,
-      active: span.active + offset,
-    })),
-    window,
-  );
-  const inferences = cropSpans(
-    inferenceSpans(blocks).map((span) => ({
-      ...span,
-      start: span.start + offset,
-      end: span.end + offset,
-    })),
-    window,
-  );
-  const inputs = inputMarkers(blocks)
-    .map((marker) => ({ ...marker, x: marker.x + offset }))
-    .filter((marker) => marker.x >= window.start && marker.x <= window.end);
-  return {
-    offset,
-    window,
-    rows: Math.max(1, Math.floor(Number(rows) || ROLLOUT_LANE_DEFAULTS.rows)),
-    chunks,
-    inferences,
-    overlaps: overlapSpans(chunks, overlapMinS),
-    inputs,
-  };
-}
-
-if (typeof window !== "undefined") {
-  window.RolloutLanes = {
-    ROLLOUT_LANE_DEFAULTS,
-    assignRows,
-    buildRolloutLanes,
-    chunkSpans,
-    inferenceSpans,
-    inputMarkers,
-    overlapSpans,
-  };
-}
+export function snapshotDisplay(value) { return structuredClone(value); }
+if (typeof window !== 'undefined') window.RolloutLanes = { ROLLOUT_LANE_DEFAULTS, assignRows, buildRolloutLanes,
+  chunkSpans, inferenceSpans, inputMarkers, overlapSpans, ribbonSegments, hitTestRibbon, formatDuration, ribbonAnalysis, snapshotDisplay };

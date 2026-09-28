@@ -116,6 +116,14 @@ function syntheticFrames(base, actionNames) {
         steps: chunk % 2 ? 1 : (chunk % 3 ? 12 : 8),
         step_s: stepS,
         failed: false,
+        original_steps: 16, prefix_trimmed: 4, accepted_steps: 12,
+        consumed_steps: 4, dispatched_steps: 4, remaining_steps: 8,
+        accepted_at: active - 0.005, last_dispatched: active + 0.1,
+        status: chunk < lastChunk ? "replaced" : "active",
+        replaced_at: chunk < lastChunk ? active + 0.2 : null,
+        replaced_by: chunk < lastChunk ? chunk + 2 : null,
+        replaced_steps: chunk < lastChunk ? 6 : 0,
+        stages: [{ name: "model", start: active - .065, end: active - .015, gpu_ms: 31.5 }],
       });
     }
     frames.push({
@@ -136,6 +144,7 @@ function syntheticFrames(base, actionNames) {
         actions: Array.from({ length: 12 }, () => ({ ...pose })),
       },
       rollout_timeline: {
+        run_id: "synthetic-run", epoch_ts: startedAt - rolloutAge,
         t_s: timelineT,
         step_s: stepS,
         blocks,
@@ -156,6 +165,11 @@ async function injectFrames(page, frames) {
         this.onclose = null;
         this.onerror = null;
         this.onmessage = null;
+        const timeShift = Date.now() / 1000 - stream[0].ts;
+        const encode = frame => JSON.stringify({ ...frame, ts: frame.ts + timeShift,
+          rollout_timeline: frame.rollout_timeline ? { ...frame.rollout_timeline, epoch_ts: frame.rollout_timeline.epoch_ts + timeShift } : null });
+        window.__rolloutEmit = frame => this.onmessage?.({ data: encode(frame) });
+        window.__rolloutEmitAbsolute = frame => this.onmessage?.({ data: JSON.stringify(frame) });
         setTimeout(() => {
           if (this.readyState === 3) return;
           this.readyState = 1;
@@ -164,7 +178,7 @@ async function injectFrames(page, frames) {
           const emit = () => {
             if (this.readyState === 3) return;
             const frame = stream[Math.min(index, stream.length - 1)];
-            if (this.onmessage) this.onmessage({ data: JSON.stringify(frame) });
+            if (this.onmessage) this.onmessage({ data: encode(frame) });
             index += 1;
             if (index < stream.length) setTimeout(emit, intervalMs);
             else window.__rolloutLanesDone = true;
@@ -225,6 +239,7 @@ async function laneCanvasStats(page) {
 async function runViewport(browser, viewport, base, frames) {
   const context = await browser.newContext({
     viewport: { width: viewport.width, height: viewport.height },
+    deviceScaleFactor: viewport.name.startsWith("390") ? 2 : 1,
   });
   const page = await context.newPage();
   page.setDefaultTimeout(20000);
@@ -252,7 +267,7 @@ async function runViewport(browser, viewport, base, frames) {
     check(`${viewport.name} legend contains ${label}`, labels.includes(label), labels.join(", "));
   }
   const stats = await laneCanvasStats(page);
-  check(`${viewport.name} lane height reserved`, stats && stats.laneHeight === 26, JSON.stringify(stats));
+  check(`${viewport.name} lane height reserved`, stats && stats.laneHeight === 64, JSON.stringify(stats));
   check(`${viewport.name} input markers rendered`, stats && stats.inputs > 0, JSON.stringify(stats));
   check(`${viewport.name} chunk spans rendered`, stats && stats.chunks > 1, JSON.stringify(stats));
   check(`${viewport.name} inference spans rendered`, stats && stats.inferences > 0, JSON.stringify(stats));
@@ -266,14 +281,10 @@ async function runViewport(browser, viewport, base, frames) {
     const canvas = document.getElementById("chart-action");
     const chart = window.Chart.getChart(canvas);
     const lanes = chart && chart.$rolloutLanes;
-    const marker = lanes && lanes.inputs && lanes.inputs[lanes.inputs.length - 1];
-    if (!marker) return null;
-    return {
-      x: chart.scales.x.getPixelForValue(marker.x),
-      y: chart.chartArea.bottom + 16,
-      left: canvas.getBoundingClientRect().left,
-      top: canvas.getBoundingClientRect().top,
-    };
+    const segment = chart.$ribbonSegments?.find(s => s.phase === "action");
+    if (!segment) return null;
+    return { x: (segment.x1 + segment.x2) / 2, y: (segment.y1 + segment.y2) / 2 };
+
   });
   if (tooltipState) {
     await page.locator("#chart-action").hover({
@@ -310,6 +321,31 @@ async function runViewport(browser, viewport, base, frames) {
     tooltip.lane,
   );
 
+  await page.locator("#chart-freeze").click();
+  check(`${viewport.name} freeze button active`, await page.locator("#chart-freeze").getAttribute("aria-pressed") === "true");
+  const frozenBefore = await page.evaluate(() => {
+    const charts = ["chart-action","chart-state"].map(id => window.Chart.getChart(document.getElementById(id)));
+    return charts.map(c => c && ({ now:c.$nowTime, data:JSON.stringify(c.data.datasets.map(ds=>ds.data)), lanes:JSON.stringify(c.$rolloutLanes), live:c.$liveSource?.[0]?.$raw.length }));
+  });
+  const futureFrame = structuredClone(frames[frames.length-1]);
+  futureFrame.ts += 1; futureFrame.rollout_timeline.blocks[0].stages[0].gpu_ms = 999;
+  await page.evaluate(frame => window.__rolloutEmit(frame), futureFrame);
+  await page.waitForTimeout(150);
+  const frozenAfter = await page.evaluate(() => ["chart-action","chart-state"].map(id => {
+    const c=window.Chart.getChart(document.getElementById(id));
+    return c && ({ now:c.$nowTime, data:JSON.stringify(c.data.datasets.map(ds=>ds.data)), lanes:JSON.stringify(c.$rolloutLanes), live:c.$liveSource?.[0]?.$raw.length });
+  }));
+  check(`${viewport.name} both frozen charts retain time curves and lanes`, JSON.stringify(frozenBefore.map(c=>c&&[c.now,c.data,c.lanes])) === JSON.stringify(frozenAfter.map(c=>c&&[c.now,c.data,c.lanes])));
+  check(`${viewport.name} frozen live cache still ingests`, frozenAfter[0].live > frozenBefore[0].live);
+  const stageToggle=page.locator("#action-legend .chart-legend-item").filter({hasText:"Inference stages"}).locator("input");
+  await stageToggle.check();
+  check(`${viewport.name} frozen stage expansion works`, await page.evaluate(()=>window.Chart.getChart(document.getElementById("chart-action")).$ribbonSegments.some(s=>s.stage==='model')));
+  await page.locator("#chart-scale").selectOption("10");
+  check(`${viewport.name} frozen scale preserves captured stage data`, await page.evaluate(()=>window.Chart.getChart(document.getElementById("chart-action")).$rolloutLanes.ribbons[0].block.stages[0].gpu_ms!==999));
+  await page.locator("#chart-freeze").click();
+  await page.waitForTimeout(150);
+  check(`${viewport.name} unfreeze restores current timeline`, await page.evaluate(()=>window.Chart.getChart(document.getElementById("chart-action")).$rolloutLanes.ribbons[0].block.stages[0].gpu_ms===999));
+
   const chunkToggle = page.locator("#action-legend .chart-legend-item")
     .filter({ hasText: "chunk span" })
     .locator("input");
@@ -345,6 +381,112 @@ async function runViewport(browser, viewport, base, frames) {
     return stats && stats.chunks > 0 && stats.inferences > 0;
   }, null, { timeout: 10000 });
 
+
+  // A fresh two-chunk scene makes phase labels and full-card layout inspectable.
+  const detail = structuredClone(frames[frames.length - 1]);
+  detail.rollout_timeline.run_id = "detail-run";
+  detail.rollout_timeline.blocks = [
+    { id: 501, kind:"rtc", start:detail.rollout_timeline.t_s-1.5, end:detail.rollout_timeline.t_s-.9,
+      accepted_at:detail.rollout_timeline.t_s-.89, active:detail.rollout_timeline.t_s-.8,
+      steps:45, original_steps:50, prefix_trimmed:5, accepted_steps:45, consumed_steps:24,
+      dispatched_steps:24, remaining_steps:0, replaced_steps:21, replaced_by:502,
+      replaced_at:detail.rollout_timeline.t_s-.4, action_end:detail.rollout_timeline.t_s-.3,
+      step_s:1/30,status:"replaced", stages:[{name:"model",start:detail.rollout_timeline.t_s-1.48,end:detail.rollout_timeline.t_s-.92,gpu_ms:301}] },
+    { id:502,kind:"rtc",start:detail.rollout_timeline.t_s-1,end:detail.rollout_timeline.t_s-.45,
+      accepted_at:detail.rollout_timeline.t_s-.4,active:detail.rollout_timeline.t_s-.3,
+      steps:45,original_steps:51,prefix_trimmed:6,accepted_steps:45,consumed_steps:9,dispatched_steps:9,
+      remaining_steps:36,replaced_steps:0,step_s:1/30,status:"active",
+      stages:[{name:"model",start:detail.rollout_timeline.t_s-.98,end:detail.rollout_timeline.t_s-.48,gpu_ms:288}] }
+  ];
+  detail.prediction = { ...detail.prediction,id:1,t_s:detail.rollout_timeline.blocks[1].active,actions:detail.prediction.actions.slice(0,2) };
+  // Deliver at the current browser-relative wall time while preserving relative event times.
+  await page.evaluate(frame => {
+    const chart=window.Chart.getChart(document.getElementById("chart-action"));
+    const now=chart.$nowTime;
+    frame.ts=now;
+    frame.rollout_timeline.epoch_ts=now-frame.rollout_timeline.t_s;
+    window.__rolloutEmitAbsolute(frame);
+  }, detail);
+  await page.locator("#chart-scale").selectOption("2");
+  await page.waitForTimeout(120);
+  check(`${viewport.name} new run clears old predictions`,await page.evaluate(()=>window.Chart.getChart(document.getElementById("chart-action")).$predictions.every(ds=>ds.data.length===2)));
+  const stableBefore=await page.evaluate(()=>{
+    const c=window.Chart.getChart(document.getElementById("chart-action"));
+    return {start:c.$rolloutLanes.ribbons[0].block.start,pred:c.$predictions[0]?.data[0]?.x};
+  });
+  await page.evaluate(()=>{
+    const c=window.Chart.getChart(document.getElementById("chart-action"));
+    // Re-delivery with a later relative snapshot time must not re-anchor events.
+    const timeline=structuredClone(c.$displayTimeline); timeline.t_s+=.37;
+    const lanes=window.RolloutLanes.buildRolloutLanes({timeline,chartNow:c.$nowTime,windowS:2,lookaheadS:2});
+    window.__alignmentError=Math.abs(c.scales.x.getPixelForValue(lanes.ribbons[0].block.start)-c.scales.x.getPixelForValue(timeline.epoch_ts+timeline.blocks[0].start));
+    window.__stableEvent=lanes.ribbons[0].block.start;
+  });
+  check(`${viewport.name} delayed snapshot aligns within one pixel`,await page.evaluate(()=>window.__alignmentError<=1&&window.__stableEvent===window.Chart.getChart(document.getElementById("chart-action")).$rolloutLanes.ribbons[0].block.start));
+  check(`${viewport.name} prediction and action epoch alignment within one pixel`,await page.evaluate(()=>{
+    const c=window.Chart.getChart(document.getElementById("chart-action"));
+    const active=c.$rolloutLanes.ribbons.find(r=>r.id===502).block.active;
+    const x=c.$predictions[0].data[0].x;
+    return Math.abs(c.scales.x.getPixelForValue(x)-c.scales.x.getPixelForValue(active+1/30))<=1;
+  }));
+  await page.evaluate(frame=>window.__rolloutEmitAbsolute({...frame,rollout_timeline:null,prediction:null}),detail);
+  await page.waitForTimeout(80);
+  check(`${viewport.name} missing timeline retains run epoch and predictions`,await page.evaluate(expected=>{
+    const c=window.Chart.getChart(document.getElementById("chart-action"));
+    return c.$rolloutLanes.ribbons[0].block.start===expected.start&&c.$predictions[0].data[0].x===expected.pred;
+  },stableBefore));
+  await page.evaluate(frame=>window.__rolloutEmitAbsolute({...frame,rollout_timeline:{...frame.rollout_timeline,epoch_ts:frame.rollout_timeline.epoch_ts+17}}),detail);
+  await page.waitForTimeout(80);
+  check(`${viewport.name} same run cannot reanchor after reconnect`,await page.evaluate(expected=>window.Chart.getChart(document.getElementById("chart-action")).$rolloutLanes.ribbons[0].block.start===expected.start,stableBefore));
+  await page.locator("#chart-freeze").click();
+  await page.locator("#chart-action").evaluate(el=>el.scrollIntoView({block:"center"}));
+  fs.mkdirSync(SHOTS,{recursive:true});
+  await page.mouse.move(1,1);
+  await page.screenshot({path:path.join(SHOTS,`rollout-ribbon-phases-${viewport.name}.png`)});
+  for (const phase of ["inference","wait","action","replaced"]) {
+    const location=await page.evaluate(phase=>{
+      const c=window.Chart.getChart(document.getElementById("chart-action"));
+      const segment=c.$ribbonSegments.find(s=>s.ribbon.id===501&&s.phase===phase);
+      return segment?{x:(segment.x1+segment.x2)/2,y:(segment.y1+segment.y2)/2}:null;
+    },phase);
+    if(location) await page.locator("#chart-action").hover({position:location,force:true});
+    await page.waitForTimeout(50);
+    const content=await page.evaluate(()=>{
+      const c=window.Chart.getChart(document.getElementById("chart-action"));
+      return c.$hoverTooltipElement.hidden?"":c.$hoverTooltipElement.textContent;
+    });
+    check(`${viewport.name} ${phase} hover returns entire ribbon`,!!location&&content.includes("chunk #501")&&content.includes("trimmed 5")&&content.includes("GPU 301.00 ms"),content);
+  }
+  const tooltipBounds=await page.evaluate(()=>{
+    const e=window.Chart.getChart(document.getElementById("chart-action")).$hoverTooltipElement;
+    const r=e.getBoundingClientRect();return {visible:!e.hidden,left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:innerWidth,height:innerHeight,clipped:e.scrollHeight>e.clientHeight};
+  });
+  check(`${viewport.name} complete analysis card stays in viewport`,tooltipBounds.visible&&tooltipBounds.left>=0&&tooltipBounds.right<=tooltipBounds.width&&tooltipBounds.top>=0&&tooltipBounds.bottom<=tooltipBounds.height&&!tooltipBounds.clipped,JSON.stringify(tooltipBounds));
+  fs.mkdirSync(SHOTS,{recursive:true});
+  await page.screenshot({path:path.join(SHOTS,`rollout-ribbon-details-${viewport.name}.png`)});
+  await page.locator("#chart-freeze").click();
+  const longDetails=structuredClone(detail);
+  longDetails.rollout_timeline.blocks[0].stages=Array.from({length:64},(_,i)=>({name:`stage_${i}`,start:detail.rollout_timeline.blocks[0].start+i*.005,end:detail.rollout_timeline.blocks[0].start+(i+1)*.005}));
+  await page.evaluate(frame=>window.__rolloutEmitAbsolute(frame),longDetails);
+  await page.waitForTimeout(100);
+  await page.locator("#chart-freeze").click();
+  await page.locator("#chart-action").evaluate(el=>el.scrollIntoView({block:"center"}));
+  const longHover=await page.evaluate(()=>{
+    const c=window.Chart.getChart(document.getElementById("chart-action"));
+    const segment=c.$ribbonSegments.find(s=>s.ribbon.id===501&&s.phase==='replaced');
+    return {x:(segment.x1+segment.x2)/2,y:(segment.y1+segment.y2)/2};
+  });
+  await page.locator("#chart-action").hover({position:longHover,force:true});
+  await page.waitForTimeout(60);
+  await page.mouse.wheel(0,350);
+  await page.waitForTimeout(60);
+  check(`${viewport.name} long whole-ribbon analysis scrolls with wheel`,await page.evaluate(()=>window.Chart.getChart(document.getElementById("chart-action")).$hoverTooltipElement.scrollTop>0));
+  await page.evaluate(frame=>window.__rolloutEmit({...frame,mode:"idle",display_mode:"idle",rollout_timeline:null}),frames[frames.length-1]);
+  await page.waitForTimeout(100);
+  check(`${viewport.name} stopped rollout retains frozen ribbon and legend`,await page.evaluate(()=>window.Chart.getChart(document.getElementById("chart-action")).$rolloutLanes.ribbons[0].id===501&&document.querySelector('#action-legend').textContent.includes('Inference stages')));
+  await page.evaluate(()=>window.enterReplay());
+  check(`${viewport.name} replay clears freeze`,await page.locator("#chart-freeze").getAttribute("aria-pressed")==="false");
+  await page.evaluate(()=>window.leaveReplay());
   const overflow = await page.evaluate(() => ({
     horizontal: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
     scrollWidth: document.documentElement.scrollWidth,

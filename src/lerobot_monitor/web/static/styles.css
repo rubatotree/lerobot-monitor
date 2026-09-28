@@ -3539,3 +3539,23 @@ body.dragging-row { cursor: row-resize; user-select: none; }
     box-shadow: -6px 0 8px var(--bg-2);
   }
 }
+
+/* Rollout inspection controls keep the data region unchanged while paused. */
+.chart-freeze {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; min-height: 30px; margin-bottom: 8px; padding: 5px 8px;
+  border: 1px solid var(--line); border-radius: 4px;
+  background: var(--bg); color: var(--text); font-size: 11px; cursor: pointer;
+}
+.chart-freeze:hover { border-color: #83b9ff; }
+.chart-freeze:focus-visible { outline: 2px solid #83b9ff; outline-offset: 2px; }
+.chart-freeze[aria-pressed="true"] { color: #c9e3ff; background: #1c3047; border-color: #659bc9; }
+.chart-freeze:disabled { opacity: .4; cursor: default; }
+.chart-tooltip-lane { white-space: pre-line; overflow-wrap: anywhere; line-height: 1.45; }
+@media (max-width: 600px) { .chart-freeze { min-height: 36px; } }
+
+.chart-hover-tooltip.ribbon-tooltip {
+  position: fixed; z-index: 1400;
+  max-width: min(460px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+}

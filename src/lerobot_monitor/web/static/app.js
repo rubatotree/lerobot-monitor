@@ -178,8 +178,8 @@ const LIVE_MODE_HISTORY_S = 600;
 const CHART_TOOLTIP_TOLERANCE_S = 0.35;
 const CHART_TIME_AXIS_FADE_MS = 140;
 const CHART_TIME_AXIS_PADDING = 18;
-const ROLLOUT_LANE_BAND_PX = 26;
-const ROLLOUT_LANE_ROWS = 2;
+const ROLLOUT_LANE_BAND_PX = 64;
+const ROLLOUT_LANE_ROWS = 1;
 const ROLLOUT_LANE_MAX_BLOCKS = 200;
 const ROLLOUT_OVERLAP_MIN_S = 0.02;
 const ROLLOUT_CHUNK_COLOR = "#5dba9a";
@@ -203,12 +203,17 @@ const chartLegendVisibility = {
   chunkSpan: true,
   chunkOverlap: true,
   inference: true,
+  inferenceStages: false,
   joints: new Map(),
 };
+let chartFreeze = null;
+let liveRolloutTimeline = null;
+let liveRolloutEpoch = null;
+let liveRolloutRun = null;
 const CHART_LEGEND_STORAGE_KEY = "lerobot-monitor-chart-legend";
 try {
   const savedLegend = JSON.parse(localStorage.getItem(CHART_LEGEND_STORAGE_KEY) || "{}");
-  ["command", "prediction", "gap", "mode", "now", "chunkIn", "chunkSpan", "chunkOverlap", "inference"]
+  ["command", "prediction", "gap", "mode", "now", "chunkIn", "chunkSpan", "chunkOverlap", "inference", "inferenceStages"]
     .forEach((key) => {
       if (savedLegend && typeof savedLegend[key] === "boolean") chartLegendVisibility[key] = savedLegend[key];
     });
@@ -818,25 +823,17 @@ function liveWallClockNow() {
 }
 
 function animateLiveCharts(frameMs) {
-  if (document.hidden || replayActive) {
-    [stateChart, actionChart].forEach((chart) => {
-      if (!chart) return;
-      chart.$lastAnimationNow = Number.NaN;
-      chart.$pendingAnimationNow = Number.NaN;
-      chart.$lastRenderedNow = Number.NaN;
-    });
-  } else if (frameMs - lastChartAnimationMs >= CHART_UPDATE_INTERVAL_MS) {
+  if (!document.hidden && !replayActive && !snapshotActive && !chartFreeze
+      && frameMs - lastChartAnimationMs >= CHART_UPDATE_INTERVAL_MS) {
     lastChartAnimationMs = frameMs;
-    const now = liveWallClockNow();
-    const currentSlot = Math.floor(now * LIVE_FRAME_RATE) / LIVE_FRAME_RATE;
+    // All geometry and elapsed counters use this exact frame, independent of WS cadence.
+    const renderNow = Math.floor(liveWallClockNow() * LIVE_FRAME_RATE) / LIVE_FRAME_RATE;
+    if (currentControlMode() === "rollout") {
+      updateRolloutLanes(liveRolloutTimeline, last?.prediction, renderNow, renderNow);
+      renderRolloutOverlays(renderNow);
+    }
     [stateChart, actionChart].forEach((chart) => {
       if (!chart || chart.$timeAxis !== true) return;
-      const renderNow = Number.isFinite(Number(chart.$pendingAnimationNow))
-        ? Number(chart.$pendingAnimationNow)
-        : currentSlot - 1 / LIVE_FRAME_RATE;
-      chart.$pendingAnimationNow = currentSlot;
-      chart.$lastAnimationNow = currentSlot;
-      if (renderNow === Number(chart.$lastRenderedNow)) return;
       chart.$lastRenderedNow = renderNow;
       refreshLiveChartSeries(chart, renderNow);
       chart.$nowTime = renderNow;
@@ -849,12 +846,37 @@ function animateLiveCharts(frameMs) {
   chartAnimationFrame = requestAnimationFrame(animateLiveCharts);
 }
 
-function spanAtTime(spans, seconds) {
-  const target = Number(seconds);
-  if (!Number.isFinite(target)) return null;
-  return (spans || []).find((span) => (
-    target >= Number(span.start) && target <= Number(span.end)
-  )) || null;
+function setChartsFrozen(frozen) {
+  if (!!chartFreeze === frozen) return;
+  if (frozen) {
+    chartFreeze = { mode: currentControlMode(), now: Number(actionChart?.$nowTime) || liveWallClockNow(),
+      timeline: structuredClone(actionChart?.$displayTimeline || liveRolloutTimeline), epoch: actionChart?.$rolloutLanes?.offset ?? liveRolloutEpoch,
+      prediction: structuredClone(actionChart?.$displayPrediction || null) };
+    [stateChart, actionChart].forEach(chart => {
+      if (!chart) return;
+      chart.$liveSource = chart.$live;
+      // Chart.js adds circular metadata to datasets, so copy only data and style fields.
+      chart.$live = (chart.$live || []).map(ds => ({ ...ds, data: ds.data.map(p => ({ ...p })), $raw: ds.$raw.filter(p => p.x <= chartFreeze.now).map(p => ({ ...p })) }));
+      chart.$predictions = (chart.$predictions || []).map(ds => ({ ...ds, data: ds.data.map(p => ({ ...p })) }));
+      chart.$modeMarkers = structuredClone(chart.$modeMarkers || []);
+      chart.$predictionGaps = structuredClone(chart.$predictionGaps || []);
+      syncChartDatasets(chart);
+      chart.update("none");
+    });
+  } else {
+    chartFreeze = null;
+    [stateChart, actionChart].forEach(chart => {
+      if (!chart) return;
+      if (chart.$liveSource) chart.$live = chart.$liveSource;
+      delete chart.$liveSource;
+      chart.$modeMarkers = liveModeMarkers;
+      syncChartDatasets(chart);
+    });
+    if (currentControlMode() !== "rollout") clearRolloutPredictions();
+    lastChartAnimationMs = 0;
+  }
+  actionLegendSignature = "";
+  renderActionLegend();
 }
 
 function pointerYInRolloutLanes(chart, pointerY) {
@@ -870,36 +892,45 @@ function pointerInRolloutLanes(chart) {
   return pointerYInRolloutLanes(chart, chart && chart.$pointerPosition && chart.$pointerPosition.y);
 }
 
-function rolloutLaneTooltipModel(chart, seconds) {
-  const lanes = chart && chart.$rolloutLanes;
-  if (!lanes) return null;
-  const chunk = spanAtTime((lanes.chunks || []).filter((span) => span.chunk), seconds);
-  const inference = spanAtTime(lanes.inferences, seconds);
-  const overlap = spanAtTime(lanes.overlaps, seconds);
-  if (!chunk && !inference && !overlap) return null;
-  const parts = [];
-  if (chunk) {
-    parts.push(
-      `chunk #${chunk.id} · ${chunk.steps} steps · ${(chunk.end - chunk.start).toFixed(2)} s`
-      + ` · start ${formatChartTimeValue(chunk.active, chart, true)}`
-      + (chunk.failed ? " · failed" : ""),
-    );
-  }
-  if (inference) {
-    parts.push(`inference ${Math.round((inference.end - inference.start) * 1000)} ms`);
-  }
-  if (overlap) parts.push(`overlap ${overlap.duration.toFixed(2)} s`);
-  return {
-    text: parts.join(" · "),
-    chunk,
-    inference,
-    overlap,
-  };
+function rolloutLaneTooltipModel(chart) {
+  const pointer = chart.$pointerPosition;
+  if (!pointer || !chart.$rolloutLanes) return null;
+  const hit = window.RolloutLanes.hitTestRibbon(chart.$ribbonSegments, pointer.x, pointer.y);
+  chart.$hoveredRibbon = hit ? hit.ribbon.id : null;
+  if (!hit) return null;
+  const { ribbon, phase, stage } = hit;
+  const b = ribbon.block, now = chart.$rolloutLanes.now;
+  const duration = window.RolloutLanes.formatDuration;
+  const time = v => v == null ? "—" : formatChartTimeValue(v, chart, true);
+  const n = value => value == null ? "—" : String(value);
+  const a = ribbon.action;
+  const analysis = window.RolloutLanes.ribbonAnalysis(ribbon, now);
+  const overlaps = chart.$rolloutLanes.overlaps.filter(o => o.ids.includes(b.id));
+  const parts = [
+    `chunk #${b.id} · ${b.kind || "sync"} · ${b.status || (b.failed ? "failed" : a ? "active" : "waiting")}`,
+    `Focus: ${stage || phase} · total ${duration(analysis.total)}`,
+    `Inference ${duration(ribbon.inference.end - b.start)} · ${time(b.start)} → ${time(b.end)}`,
+    ...b.stages.map(st => `  ${st.name}: ${duration((st.end ?? now) - st.start)}${st.gpu_ms != null ? ` · GPU ${Number(st.gpu_ms).toFixed(2)} ms` : ""}`),
+    `Accepted ${time(b.accepted_at)} · first send ${time(b.active)}`,
+    `Queue wait ${duration(analysis.queueWait)}`,
+    `Action elapsed ${duration(analysis.actionElapsed)} / plan ${duration(analysis.plan)}`,
+    `Last send ${time(b.last_dispatched)} · end ${time(b.action_end)}`,
+    `RTC steps: original ${n(b.original_steps ?? b.steps)} · trimmed ${n(b.prefix_trimmed)} (${b.prefix_trimmed != null ? duration(b.prefix_trimmed * (b.step_s || 0)) : "—"})`,
+    `Accepted ${n(b.accepted_steps ?? b.steps)} · taken ${n(b.consumed_steps)} · sent ${n(b.dispatched_steps)}`,
+    `Remaining ${n(b.remaining_steps)} · replaced ${n(b.replaced_steps)}${b.replaced_by != null ? ` by #${b.replaced_by}` : ""}`,
+    `Plan overlap: ${overlaps.length ? overlaps.map(o => `#${o.ids.filter(id => id !== b.id).join(", #")} (${duration(o.duration)})`).join("; ") : "none"}`,
+  ];
+  return { text: parts.join("\n"), ribbon, hit };
 }
 
 function chartTooltipModel(chart, seconds, laneHovered = false) {
   const rawTarget = Number(seconds);
   if (!chart || !Number.isFinite(rawTarget)) return null;
+  if (laneHovered) {
+    const lane = rolloutLaneTooltipModel(chart);
+    return lane ? { lane, rows: [], time: rawTarget, gap: false } : null;
+  }
+  chart.$hoveredRibbon = null;
   const target = snapChartTimeToFrame(chart, rawTarget);
   const fixedFrames = chart.$timeAxis === false;
   const tolerance = Number(chart.$tooltipToleranceS) || CHART_TOOLTIP_TOLERANCE_S;
@@ -1010,6 +1041,7 @@ function hideChartHoverTooltip(chart) {
   }
   chart.$tooltipRequest = null;
   tooltip.hidden = true;
+  chart.$hoveredRibbon = null;
   delete tooltip.dataset.timeValue;
 }
 
@@ -1022,6 +1054,15 @@ function positionChartHoverTooltip(chart, pointerX, pointerY) {
   const hostRect = host.getBoundingClientRect();
   const tooltipWidth = tooltip.offsetWidth;
   const tooltipHeight = tooltip.offsetHeight;
+  if (tooltip.classList.contains("ribbon-tooltip")) {
+    const x = canvasRect.left + pointerX * canvasRect.width / chart.width;
+    const y = canvasRect.top + pointerY * canvasRect.height / chart.height;
+    const left = x + 12 + tooltipWidth < innerWidth ? x + 12 : x - tooltipWidth - 12;
+    const top = y + 12 + tooltipHeight < innerHeight ? y + 12 : y - tooltipHeight - 12;
+    tooltip.style.left = `${Math.max(8, Math.min(left, innerWidth-tooltipWidth-8))}px`;
+    tooltip.style.top = `${Math.max(8, Math.min(top, innerHeight-tooltipHeight-8))}px`;
+    return;
+  }
   let left = canvasRect.left - hostRect.left + pointerX + 12;
   let top = canvasRect.top - hostRect.top + pointerY + 12;
   if (left + tooltipWidth > hostRect.width - 4) {
@@ -1058,6 +1099,11 @@ function buildChartHoverTooltip(chart, model) {
     gap.textContent = "gap";
     header.appendChild(gap);
   }
+  const scrollHint = document.createElement("span");
+  scrollHint.className = "chart-tooltip-scroll-hint";
+  scrollHint.textContent = "wheel to scroll";
+  scrollHint.hidden = true;
+  header.appendChild(scrollHint);
   tooltip.appendChild(header);
   const lane = document.createElement("div");
   lane.className = "chart-tooltip-lane";
@@ -1129,9 +1175,12 @@ function renderChartHoverTooltip(chart, seconds, pointerX, pointerY) {
       predicted.classList.toggle("muted", !row.predictedVisible);
     }
   });
+  tooltip.classList.toggle("ribbon-tooltip", !!model.lane);
   tooltip.dataset.timeValue = String(model.time);
   tooltip.hidden = false;
   positionChartHoverTooltip(chart, pointerX, pointerY);
+  const scrollHint = tooltip.querySelector(".chart-tooltip-scroll-hint");
+  if (scrollHint) scrollHint.hidden = !model.lane || tooltip.scrollHeight <= tooltip.clientHeight;
   if (window.RobotPreview && (chart === actionChart || chart === stateChart)) {
     const pose = {};
     let hasPrediction = false;
@@ -1175,7 +1224,7 @@ const chartHoverTooltipPlugin = {
     if (event.type === "mouseout") {
       chart.$pointerPosition = null;
       hideChartHoverTooltip(chart);
-      if (chart.$timeAxis === false) chart.draw();
+      if (chart.$timeAxis === false || chartFreeze) chart.draw();
       return;
     }
     if (!["mousemove", "mouseover", "touchstart", "touchmove"].includes(event.type)) return;
@@ -1202,7 +1251,7 @@ const chartHoverTooltipPlugin = {
     chart.$pointerPosition = { x: pointerX, y: pointerY, inside: true };
     const seconds = snapChartTimeToFrame(chart, xScale.getValueForPixel(pointerX));
     scheduleChartHoverTooltip(chart, seconds, pointerX, pointerY);
-    if (chart.$timeAxis === false) chart.draw();
+    if (chart.$timeAxis === false || chartFreeze) chart.draw();
   },
 };
 
@@ -1318,79 +1367,77 @@ const rolloutLanesPlugin = {
     ctx.restore();
   },
   afterDatasetsDraw(chart) {
-    const lanes = chart.$rolloutLanes;
-    const area = chart.chartArea;
-    const xScale = chart.scales && chart.scales.x;
-    const laneHeight = Number(chart.$laneHeight) || 0;
-    if (!lanes || !area || !xScale || laneHeight <= 0) return;
+    const lanes = chart.$rolloutLanes, area = chart.chartArea, scale = chart.scales?.x;
+    chart.$ribbonSegments = [];
+    chart.$rolloutLaneDrawStats = { chunks: 0, inferences: 0, overlaps: 0 };
+    if (!lanes || !area || !scale || !chart.$laneHeight) return;
     const ctx = chart.ctx;
-    const baseTop = area.bottom + 4;
-    const xRange = (span) => {
-      const left = Math.max(area.left, xScale.getPixelForValue(Number(span.start)));
-      const right = Math.min(area.right, xScale.getPixelForValue(Number(span.end)));
-      return Number.isFinite(left) && Number.isFinite(right) && right > left
-        ? { left, right }
-        : null;
-    };
+    const segments = window.RolloutLanes.ribbonSegments(lanes, t => scale.getPixelForValue(t), area.bottom, chartLegendVisibility);
+    chart.$ribbonSegments = segments;
+    const pointer = chart.$pointerPosition;
+    const hit = pointer?.inside ? window.RolloutLanes.hitTestRibbon(segments, pointer.x, pointer.y) : null;
+    chart.$hoveredRibbon = hit?.ribbon.id ?? null;
+    const stageColors = { observation: "#83b9ff", observation_prepare: "#83b9ff", preprocessing: "#91c9e8",
+      preprocess: "#91c9e8", model: "#58a8ff", model_call: "#58a8ff", postprocessing: "#b8b8ee",
+      postprocess: "#b8b8ee", cpu_transfer: "#b5c5e2", publish: "#7fcfd4", lock_wait: "#c4b4a4", rtc_prefix: "#799ccc" };
     ctx.save();
-    const drawStats = { chunks: 0, inferences: 0, overlaps: 0 };
-    if (chartLegendVisibility.inference !== false) {
-      lanes.inferences.forEach((span) => {
-        const range = xRange(span);
-        if (!range) return;
-        drawStats.inferences += 1;
-        ctx.fillStyle = "rgba(88, 168, 255, 0.28)";
-        ctx.strokeStyle = span.failed ? "#e06b7a" : "rgba(88, 168, 255, 0.72)";
-        ctx.lineWidth = 1;
-        ctx.fillRect(range.left, baseTop, range.right - range.left, 8);
-        ctx.strokeRect(range.left + 0.5, baseTop + 0.5, range.right - range.left - 1, 7);
-      });
-    }
-    const chunkTop = baseTop + 10;
-    const rowHeight = 6;
-    const rowGap = 2;
-    if (chartLegendVisibility.chunkSpan !== false) {
-      lanes.chunks.filter((span) => span.chunk).forEach((span) => {
-        const range = xRange(span);
-        if (!range) return;
-        drawStats.chunks += 1;
-        const row = Math.max(0, Math.floor(Number(span.row) || 0));
-        const top = chunkTop + row * (rowHeight + rowGap);
-        ctx.fillStyle = "rgba(93, 186, 154, 0.28)";
-        ctx.strokeStyle = span.failed ? "#e06b7a" : "rgba(93, 186, 154, 0.72)";
-        ctx.lineWidth = 1;
-        ctx.fillRect(range.left, top, range.right - range.left, rowHeight);
-        ctx.strokeRect(range.left + 0.5, top + 0.5, range.right - range.left - 1, rowHeight - 1);
-      });
-    }
+    ctx.beginPath(); ctx.rect(area.left, area.bottom + 1, area.right-area.left, 63); ctx.clip();
+    ctx.fillStyle = "rgba(15, 22, 32, .55)";
+    ctx.fillRect(area.left, area.bottom + 2, area.right-area.left, 62);
     if (chartLegendVisibility.chunkSpan !== false && chartLegendVisibility.chunkOverlap !== false) {
-      lanes.overlaps.forEach((overlap) => {
-        const range = xRange(overlap);
-        if (!range) return;
-        drawStats.overlaps += 1;
-        const rows = overlap.rows && overlap.rows.length ? overlap.rows : [0, 1];
-        const firstRow = Math.max(0, Math.min(...rows));
-        const lastRow = Math.max(firstRow, Math.max(...rows));
-        const top = chunkTop + firstRow * (rowHeight + rowGap);
-        const bottom = chunkTop + lastRow * (rowHeight + rowGap) + rowHeight;
-        const height = bottom - top;
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(range.left, top, range.right - range.left, height);
-        ctx.clip();
-        ctx.strokeStyle = "rgba(93, 186, 154, 0.85)";
-        ctx.lineWidth = 1;
-        for (let x = range.left - height; x <= range.right + height; x += 6) {
-          ctx.beginPath();
-          ctx.moveTo(x, bottom);
-          ctx.lineTo(x + height, top);
-          ctx.stroke();
+      lanes.overlaps.forEach(overlap => {
+        const left = Math.max(area.left, scale.getPixelForValue(overlap.start));
+        const right = Math.min(area.right, scale.getPixelForValue(overlap.end));
+        if (right <= left) return;
+        chart.$rolloutLaneDrawStats.overlaps++;
+        ctx.save(); ctx.beginPath(); ctx.rect(left, area.bottom+4, right-left, 26); ctx.clip();
+        ctx.strokeStyle = "rgba(93,186,154,.18)"; ctx.lineWidth = 1;
+        for (let x = left-26; x < right; x += 6) {
+          ctx.beginPath(); ctx.moveTo(x,area.bottom+30); ctx.lineTo(x+26,area.bottom+4); ctx.stroke();
         }
         ctx.restore();
+        if (right-left > 26) {
+          ctx.font = "9px 'IBM Plex Mono', monospace"; ctx.fillStyle = "#9ab8ac";
+          ctx.fillText(`×${overlap.count}`, left+3, area.bottom+12);
+        }
       });
     }
+    const draw = segment => {
+      const { phase, ribbon } = segment;
+      const selected = ribbon.id === chart.$hoveredRibbon;
+      ctx.strokeStyle = ribbon.block.failed ? "#e06b7a" : phase === "inference"
+        ? stageColors[segment.stage] || ROLLOUT_INFERENCE_COLOR
+        : phase === "action" ? ROLLOUT_CHUNK_COLOR : phase === "planned" ? "rgba(93,186,154,.38)" : "#87929e";
+      ctx.lineWidth = selected ? 5 : 3;
+      ctx.setLineDash(["wait", "replaced"].includes(phase) ? [3,3] : []);
+      ctx.beginPath(); ctx.moveTo(segment.x1,segment.y1); ctx.lineTo(segment.x2,segment.y2); ctx.stroke();
+    };
+    segments.forEach(draw);
+    segments.filter(segment => segment.ribbon.id === chart.$hoveredRibbon).forEach(draw);
+    ctx.setLineDash([]);
+    chart.$rolloutLaneDrawStats.chunks = new Set(segments.filter(s => ['action','planned','replaced'].includes(s.phase)).map(s => s.ribbon.id)).size;
+    chart.$rolloutLaneDrawStats.inferences = new Set(segments.filter(s => s.phase === 'inference').map(s => s.ribbon.id)).size;
+    const labels = [];
+    const duration = window.RolloutLanes.formatDuration;
+    ctx.font = "9px 'IBM Plex Mono', monospace"; ctx.textBaseline = "middle";
+    lanes.ribbons.forEach(ribbon => {
+      const label = (span, text, y, color) => {
+        if (!span) return;
+        const left = Math.max(area.left, scale.getPixelForValue(span.start));
+        const right = Math.min(area.right, scale.getPixelForValue(span.end));
+        const width = ctx.measureText(text).width;
+        if (right-left < width+8 || labels.some(box => Math.abs(box.y-y) < 12 && left < box.right && right > box.left)) return;
+        labels.push({ left, right, y });
+        ctx.fillStyle = 'rgba(10,15,24,.9)'; ctx.fillRect(left+3,y-6,width+4,12);
+        ctx.fillStyle = color; ctx.fillText(text,left+5,y);
+      };
+      if (chartLegendVisibility.inference !== false) label(ribbon.inference,
+        duration(ribbon.inference.end-ribbon.inference.start), area.bottom+54, '#b9d9ff');
+      if (chartLegendVisibility.chunkSpan !== false && ribbon.action) label(ribbon.action,
+        `${duration(window.RolloutLanes.ribbonAnalysis(ribbon,lanes.now).actionElapsed)} / ${duration(ribbon.action.end-ribbon.action.start)}`,
+        area.bottom+20,'#b9e5d4');
+    });
     ctx.restore();
-    chart.$rolloutLaneDrawStats = drawStats;
   },
 };
 
@@ -1691,7 +1738,7 @@ function legendItemVisible(group, key) {
 
 function persistChartLegendVisibility() {
   const saved = {};
-  ["command", "prediction", "gap", "mode", "now", "chunkIn", "chunkSpan", "chunkOverlap", "inference"]
+  ["command", "prediction", "gap", "mode", "now", "chunkIn", "chunkSpan", "chunkOverlap", "inference", "inferenceStages"]
     .forEach((key) => { saved[key] = chartLegendVisibility[key] !== false; });
   try { localStorage.setItem(CHART_LEGEND_STORAGE_KEY, JSON.stringify(saved)); } catch { /* ignore */ }
 }
@@ -1790,6 +1837,7 @@ function bindChartScaleSelect(select) {
     const nextScale = Number(select.value);
     if (!CHART_SCALE_OPTIONS.some((option) => option.seconds === nextScale)) return;
     chartScaleSeconds = nextScale;
+    if (chartFreeze) updateRolloutLanes(chartFreeze.timeline, chartFreeze.prediction, chartFreeze.now, chartFreeze.now);
     try { localStorage.setItem(CHART_SCALE_STORAGE_KEY, String(chartScaleSeconds)); } catch { /* ignore */ }
     [stateChart, actionChart].forEach((chart) => {
       if (!chart) return;
@@ -1821,7 +1869,7 @@ function renderActionLegend(names = actionLegendNames) {
   const legend = $("action-legend");
   if (!legend) return;
   const seriesNames = names && names.length ? names : jointNames();
-  const rolloutMode = !replayActive && currentControlMode() === "rollout";
+  const rolloutMode = !replayActive && (chartFreeze?.mode || currentControlMode()) === "rollout";
   const signature = [
     seriesNames.join("|"),
     replayActive ? "replay" : "live",
@@ -1834,6 +1882,17 @@ function renderActionLegend(names = actionLegendNames) {
   const extras = seriesNames.filter((name) => !canonical.includes(name));
   const displayNames = [...canonical, ...extras].reverse();
   legend.replaceChildren();
+  const freeze = document.createElement("button");
+  freeze.id = "chart-freeze";
+  freeze.type = "button";
+  freeze.className = "chart-freeze";
+  freeze.disabled = replayActive || snapshotActive;
+  freeze.setAttribute("aria-pressed", String(!!chartFreeze));
+  freeze.setAttribute("aria-label", chartFreeze ? "Resume live charts" : "Freeze both charts");
+  freeze.title = chartFreeze ? "Resume latest live charts" : "Freeze both charts for inspection; control continues";
+  freeze.textContent = chartFreeze ? "❄ Frozen" : "❄ Freeze";
+  freeze.addEventListener("click", () => setChartsFrozen(!chartFreeze));
+  legend.appendChild(freeze);
 
   const series = document.createElement("section");
   series.className = "chart-legend-section";
@@ -1870,6 +1929,7 @@ function renderActionLegend(names = actionLegendNames) {
     appendLegendItem(lines, "chart-legend-band chunk", "chunk span", "", { group: "style", key: "chunkSpan" });
     appendLegendItem(lines, "chart-legend-band overlap", "chunk overlap", "", { group: "style", key: "chunkOverlap" });
     appendLegendItem(lines, "chart-legend-line inference", "inference", "", { group: "style", key: "inference" });
+    appendLegendItem(lines, "chart-legend-line inference", "Inference stages", "", { group: "style", key: "inferenceStages" });
   }
 
   const time = document.createElement("section");
@@ -1933,12 +1993,12 @@ function liveTimestamp(status) {
 
 function showLiveNowLine() {
   return !replayActive
-    && currentControlMode() === "rollout"
+    && (chartFreeze?.mode || currentControlMode()) === "rollout"
     && chartLegendVisibility.now !== false;
 }
 
 function rolloutFutureWindowS(now) {
-  if (currentControlMode() !== "rollout") return 0;
+  if ((chartFreeze?.mode || currentControlMode()) !== "rollout") return 0;
   return Math.min(
     ROLLOUT_FUTURE_MAX_S,
     Math.max(1, chartScaleSeconds * ROLLOUT_FUTURE_RATIO),
@@ -1978,6 +2038,7 @@ function liveTimeAxis(now) {
 }
 
 function syncLiveChartChrome(now) {
+  if (chartFreeze) return;
   const timestamp = Number(now);
   if (!Number.isFinite(timestamp)) return;
   const latestMarker = liveModeMarkers.length ? liveModeMarkers[liveModeMarkers.length - 1] : null;
@@ -1988,9 +2049,7 @@ function syncLiveChartChrome(now) {
     if (!chart || chart.$timeAxis !== true) return;
     if (Number.isFinite(Number(chart.$historyStart))) chart.$historyEnd = timestamp;
     chart.$modeMarkers = liveModeMarkers;
-    chart.$nowTime = timestamp;
     chart.$showNowLine = showLiveNowLine();
-    chart.options.scales.x = liveTimeAxis(timestamp);
     scheduleChartUpdate(chart);
   });
   renderActionLegend();
@@ -2053,7 +2112,7 @@ function syncChartDatasets(chart) {
 function pushChart(chart, scalars, timeS = null) {
   if (!chart) return;
   const keys = Object.keys(scalars);
-  if (chart === actionChart && keys.length) {
+  if (!chartFreeze && chart === actionChart && keys.length) {
     actionLegendNames = keys;
     renderActionLegend(actionLegendNames);
   }
@@ -2070,11 +2129,13 @@ function pushChart(chart, scalars, timeS = null) {
     chart.data.datasets = [];
     syncChartDatasets(chart);
   }
-  chart.$historyStart = Number.isFinite(Number(chart.$historyStart)) ? Number(chart.$historyStart) : now;
-  chart.$historyEnd = now;
-  chart.$showNowLine = showLiveNowLine();
-  chart.$modeMarkers = liveModeMarkers;
-  const live = chart.$live || (chart.$live = []);
+  if (!chartFreeze) {
+    chart.$historyStart = Number.isFinite(Number(chart.$historyStart)) ? Number(chart.$historyStart) : now;
+    chart.$historyEnd = now;
+    chart.$showNowLine = showLiveNowLine();
+    chart.$modeMarkers = liveModeMarkers;
+  }
+  const live = chart.$liveSource || chart.$live || (chart.$live = []);
   while (live.length < keys.length) {
     live.push({
       label: "",
@@ -2091,8 +2152,6 @@ function pushChart(chart, scalars, timeS = null) {
     });
   }
   live.forEach((ds, i) => { if (keys[i]) ds.label = keys[i]; });
-  chart.$nowTime = now;
-  chart.options.scales.x = liveTimeAxis(now);
   keys.forEach((k, i) => {
     const ds = live[i];
     const raw = ds.$raw || (ds.$raw = []);
@@ -2107,8 +2166,10 @@ function pushChart(chart, scalars, timeS = null) {
       raw.splice(0, raw.length - HISTORY_CAPACITY);
     }
   });
-  syncChartDatasets(chart);
-  scheduleChartUpdate(chart);
+  if (!chartFreeze) {
+    syncChartDatasets(chart);
+    scheduleChartUpdate(chart);
+  }
 }
 
 function rolloutPredictionList() {
@@ -2123,7 +2184,7 @@ function recordRolloutPrediction(prediction, now, taskElapsed = now) {
   const step = Number(prediction.step_s) > 0 ? Number(prediction.step_s) : 1 / 30;
   const elapsed = Number(taskElapsed);
   const publishedAfterStatus = Number.isFinite(elapsed) ? Math.max(0, start - elapsed) : 0;
-  const chartStart = now + publishedAfterStatus;
+  const chartStart = liveRolloutEpoch != null ? liveRolloutEpoch + start : now + publishedAfterStatus;
   const key = String(prediction.id || `${start.toFixed(3)}#${actions.length}`);
   const list = rolloutPredictionList();
   if (list.some((chunk) => chunk.key === key)) return;
@@ -2238,6 +2299,7 @@ function applyRolloutOverlay(chart, now) {
 }
 
 function renderRolloutOverlays(now) {
+  if (chartFreeze) return;
   applyRolloutOverlay(stateChart, now);
   applyRolloutOverlay(actionChart, now);
 }
@@ -2249,7 +2311,8 @@ function updateRolloutLanes(timeline, prediction, chartNow, liveNow) {
       timeline,
       prediction,
       chartNow,
-      windowS: 20,
+      epoch: chartFreeze ? chartFreeze.epoch : liveRolloutEpoch,
+      windowS: chartScaleSeconds,
       lookaheadS: rolloutFutureWindowS(liveNow),
       maxBlocks: ROLLOUT_LANE_MAX_BLOCKS,
       overlapMinS: ROLLOUT_OVERLAP_MIN_S,
@@ -2257,12 +2320,17 @@ function updateRolloutLanes(timeline, prediction, chartNow, liveNow) {
     })
     : null;
   vizState.rolloutLanes = lanes;
-  if (actionChart) actionChart.$rolloutLanes = lanes;
+  if (actionChart) {
+    actionChart.$rolloutLanes = lanes;
+    actionChart.$displayTimeline = timeline;
+    actionChart.$displayPrediction = prediction;
+  }
   if (stateChart) stateChart.$rolloutLanes = null;
   return lanes;
 }
 
 function clearRolloutLanes() {
+  if (chartFreeze) return;
   vizState.rolloutLanes = null;
   if (actionChart) actionChart.$rolloutLanes = null;
   if (stateChart) stateChart.$rolloutLanes = null;
@@ -2278,6 +2346,7 @@ function clearRolloutPredictions() {
   if (!hasChunks && !hasLanes && !hasOverlay(stateChart) && !hasOverlay(actionChart)) return;
   if (jointSyncSource === "prediction") jointPredictionStale = true;
   vizState.rolloutPredictions = [];
+  if (chartFreeze) return;
   clearRolloutLanes();
   [stateChart, actionChart].forEach((chart) => {
     chart.$predictions = [];
@@ -3542,14 +3611,30 @@ function applyStatus(d) {
     pushChart(actionChart, d.action, liveNowS);
   }
   if (rolloutLive) {
+    const timeline = d.rollout_timeline;
+    if (timeline) {
+      const run = timeline.run_id || liveRolloutRun || "legacy";
+      if (run !== liveRolloutRun) {
+        liveRolloutRun = run;
+        liveRolloutEpoch = null;
+        vizState.rolloutPredictions = [];
+      }
+      if (liveRolloutEpoch == null) {
+        liveRolloutEpoch = Number.isFinite(Number(timeline.epoch_ts)) && timeline.epoch_ts != null
+          ? Number(timeline.epoch_ts) : liveNowS - Number(timeline.t_s || 0);
+      }
+      liveRolloutTimeline = { ...timeline, epoch_ts: liveRolloutEpoch };
+    }
     recordRolloutPrediction(
       d.prediction,
       rolloutChartNow,
       taskElapsedS,
     );
-    updateRolloutLanes(d.rollout_timeline, d.prediction, rolloutChartNow, liveNowS);
-    renderRolloutOverlays(liveNowS);
+
   } else {
+    liveRolloutRun = null;
+    liveRolloutTimeline = null;
+    liveRolloutEpoch = null;
     clearRolloutPredictions();
   }
   if (!replayActive) syncLiveChartChrome(liveNowS);
@@ -6154,6 +6239,7 @@ async function openSnapshot(snapshotId) {
   if (replayActive) leaveReplay();
   previewRequestGeneration += 1;
   activeSnapshot = snapshot;
+  setChartsFrozen(false);
   snapshotActive = true;
   selectLibraryItem("snapshot", snapshot.id);
   vizState.kind = "snapshot";
@@ -7240,6 +7326,7 @@ function syncModeBadges() {
 }
 
 function enterReplay({ showEpisodes = true } = {}) {
+  setChartsFrozen(false);
   setEpisodePanelVisible(showEpisodes);
   replayActive = true;
   replaySeekId = null;
@@ -7747,20 +7834,20 @@ function updateChartHoverFromClient(chart, event) {
     pointerX < area.left
     || pointerX > area.right
     || pointerY < area.top
-    || pointerY > area.bottom
+    || (pointerY > area.bottom && !pointerYInRolloutLanes(chart, pointerY))
   ) {
     chart.$pointerPosition = null;
     hideChartHoverTooltip(chart);
     if (window.RobotPreview && (chart === actionChart || chart === stateChart)) {
       window.RobotPreview.setFocusContext(null);
     }
-    if (chart.$timeAxis === false) chart.draw();
+    if (chart.$timeAxis === false || chartFreeze) chart.draw();
     return;
   }
   chart.$pointerPosition = { x: pointerX, y: pointerY, inside: true };
   const seconds = snapChartTimeToFrame(chart, xScale.getValueForPixel(pointerX));
   scheduleChartHoverTooltip(chart, seconds, pointerX, pointerY);
-  if (chart.$timeAxis === false) chart.draw();
+  if (chart.$timeAxis === false || chartFreeze) chart.draw();
 }
 
 function stepReplayFrame(chart, direction) {
@@ -7786,6 +7873,14 @@ function bindReplayChartWheel(chart) {
   const canvas = chart.canvas;
   let accumulatedDelta = 0;
   canvas.addEventListener("wheel", (event) => {
+    const tooltip = chart.$hoverTooltipElement;
+    if (tooltip && !tooltip.hidden && tooltip.classList.contains("ribbon-tooltip")
+        && tooltip.scrollHeight > tooltip.clientHeight) {
+      event.preventDefault();
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? tooltip.clientHeight : 1;
+      tooltip.scrollTop += event.deltaY * unit;
+      return;
+    }
     if (!replayActive || !vizState.previewReady || chart.$timeAxis !== false) return;
     event.preventDefault();
     updateChartHoverFromClient(chart, event);
@@ -8678,7 +8773,7 @@ const MODEL_LOAD_PHASES = {
   imports_torch: "Importing PyTorch", imports_config: "Importing policy configuration",
   imports_factory: "Importing policy dependencies",
   imports_policy: "Importing selected policy",
-  cache: "Resolving local cache", config: "Reading configuration", weights: "Building model and loading weights",
+  vlm_cache: "Resolving VLM cache", cache: "Resolving local cache", config: "Reading configuration", weights: "Building model and loading weights",
   device: "Finalizing device", processors: "Preparing processors", finalizing: "Finalizing model", ready: "Ready",
 };
 

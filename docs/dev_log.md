@@ -792,3 +792,12 @@
 - 本地上传样例实测完成 manifest/SHA256 校验、托管登记、delete_files 删除，远端 staging 和 asset 均确认不存在。既有 ACT、SmolVLA 外部缓存权重保留。
 - 最终测试：远端 Linux cloud + manager + smoke-harness **79 passed**；既有本地完整回归在完整重依赖环境与固定 LeRobot archive 下 **357 passed、4 skipped**；UI **12 项测试及 4 个视口检查通过**。
 - 验收边界：输入为零状态与黑色 PNG，未连接实体机器人，不表示策略任务准确率或实机性能。PI profile 已实现，但无缓存 PI checkpoint，因此未完成 PI 实际推理验收。A6000 本轮未连接、未安装、未测试。本地 Monitor 集成的手动确认门禁继续保留。
+
+## 2026-09-28：Monitor 远端推理与 GPU 占用归属
+
+- 用户已明确解除 Monitor 接入门禁。模型库新增 `cloud://` 远端条目，Models 页面可连接 SSH 主机、选择部署和 GPU；云模型沿用既有 Load／Unload、Debug 和 Rollout 入口，令牌只保存在后端。
+- 云端 GPU 探针合并 `nvidia-smi` 计算进程、`/proc` 用户和程序信息。8x4090-server 实测能标注 Blender／Python 的主要占用用户和显存；页面禁用忙卡，并在单卡查询故障时保留其余七张健康卡。
+- ControlLoop 新增远端 Debug、同步和 RTC 分流。RTC 保留 raw／absolute 前缀、延迟补偿、后台网络请求、心跳、epoch reset 和显式 close；停止或异常会回收远端独占 session。远端配置解析不要求本机安装 LeRobot。
+- 8x4090-server 实测：ACT Debug 返回 4×6、Sync 返回 1×6；SmolVLA RTC 生成 50 个六关节动作。完整 Monitor API、ControlLoop、虚拟 follower 跨层测试通过；浏览器完成 ACT 云模型登记。输入为零状态和黑色图像，未连接实体机械臂。
+- 当前 LeRobot runtime wheel 来自 `e5315df2`，SHA256 `ae5a3dbb2f67298ee1953319b7805603047c4ee680817245bd23cef413b29803`，ACT／SmolVLA 独立 runtime 安装成功。8A6000-server 未连接、未安装、未测试。
+- 最终受影响回归 **231 passed、2 skipped、1 deselected**；云端与兼容性定向 **38 passed**，Python／JavaScript 语法和差异检查通过。未运行的录制用例需要本地轻量环境未安装的 `huggingface_hub`，与远端推理路径无关。

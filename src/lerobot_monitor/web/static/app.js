@@ -5952,7 +5952,7 @@ function editLibrarySource(kind, row) {
 function libraryResourceTools(kind, row) {
   const sourceId = librarySourceId(kind, row);
   const tools = [];
-  if (row.path) {
+  if (row.path && row.source !== "cloud") {
     const folder = makeLibraryIconButton("lib-folder", `Open ${sourceId} folder in file manager on this computer`, LIBRARY_FOLDER_ICON);
     folder.addEventListener("click", async (event) => {
       event.stopPropagation();
@@ -5967,12 +5967,14 @@ function libraryResourceTools(kind, row) {
     });
     tools.push(folder);
   }
-  const edit = makeLibraryIconButton("lib-source-edit", `Edit details for ${sourceId}`, LIBRARY_EDIT_ICON);
-  edit.addEventListener("click", (event) => {
-    event.stopPropagation();
-    editLibrarySource(kind, row);
-  });
-  tools.push(edit);
+  if (row.source !== "cloud") {
+    const edit = makeLibraryIconButton("lib-source-edit", `Edit details for ${sourceId}`, LIBRARY_EDIT_ICON);
+    edit.addEventListener("click", (event) => {
+      event.stopPropagation();
+      editLibrarySource(kind, row);
+    });
+    tools.push(edit);
+  }
   if (kind === "video" || kind === "snapshot") {
     const copy = makeLibraryIconButton("lib-copy", `Copy ${kind} ${sourceId}`, LIBRARY_DUPLICATE_ICON);
     copy.addEventListener("click", (event) => {
@@ -9467,6 +9469,17 @@ function modalField(labelText, input) {
 function openDownloadModal(kind) {
   const isModel = kind === "model";
   openLibraryModal(isModel ? "Add model" : "Download dataset", (body) => {
+    const sourceKind = document.createElement("select");
+    if (isModel) {
+      sourceKind.setAttribute("aria-label", "Model source");
+      [["hub", "Hugging Face or local path"], ["cloud", "Cloud deployment"]].forEach(([value, label]) => {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        sourceKind.appendChild(option);
+      });
+      body.appendChild(modalField("Source", sourceKind));
+    }
     const search = document.createElement("div");
     search.className = "library-modal-search";
     const query = document.createElement("input");
@@ -9501,13 +9514,90 @@ function openDownloadModal(kind) {
       modalField("Revision", revision),
       ...(isModel ? [modalField("Name", name)] : []),
     );
+    const cloudPanel = document.createElement("div");
+    cloudPanel.className = "library-modal-grid hidden";
+    const cloudHost = document.createElement("select");
+    cloudHost.setAttribute("aria-label", "Cloud host");
+    const cloudDeployment = document.createElement("select");
+    cloudDeployment.setAttribute("aria-label", "Cloud deployment");
+    const cloudGpu = document.createElement("select");
+    cloudGpu.setAttribute("aria-label", "Cloud GPU");
+    const connectCloud = document.createElement("button");
+    connectCloud.type = "button";
+    connectCloud.className = "ghost";
+    connectCloud.textContent = "Connect and refresh";
+    cloudPanel.append(
+      modalField("SSH host", cloudHost),
+      modalField("Deployment", cloudDeployment),
+      modalField("GPU", cloudGpu),
+      connectCloud,
+    );
     const actions = document.createElement("div");
     actions.className = "library-modal-actions";
     const submit = document.createElement("button");
     submit.type = "button";
     submit.textContent = isModel ? "Add model" : "Download";
     actions.appendChild(submit);
-    body.append(search, results, grid, actions);
+    body.append(search, results, grid, cloudPanel, actions);
+    let cloudCatalog = null;
+
+    const renderCloudGpus = () => {
+      cloudGpu.innerHTML = "";
+      (cloudCatalog?.gpus || []).filter(row => row.healthy !== false && !row.error).forEach(row => {
+        const option = document.createElement("option");
+        option.value = row.uuid;
+        const owner = row.primary_user && row.primary_program ? ` · ${row.primary_user}/${row.primary_program}` : "";
+        option.textContent = `GPU ${row.index} · ${((Number(row.memory_used_mb || 0))/1024).toFixed(1)} GiB used${owner}`;
+        option.disabled = !!row.busy && !(cloudCatalog?.deployments || []).some(
+          model => model.id === cloudDeployment.value && model.status === "loaded" && model.gpu_uuid === row.uuid,
+        );
+        cloudGpu.appendChild(option);
+      });
+    };
+
+    const loadCloudCatalog = async () => {
+      if (!cloudHost.value) return;
+      connectCloud.disabled = true;
+      libraryModalStatus(body, `connecting ${cloudHost.selectedOptions[0]?.textContent || cloudHost.value}…`);
+      try {
+        const catalog = await api(`/api/cloud/hosts/${encodeURIComponent(cloudHost.value)}/connect`, {});
+        cloudCatalog = catalog;
+        cloudDeployment.innerHTML = "";
+        (catalog.deployments || []).filter(row => ["ready", "loaded", "error"].includes(row.status)).forEach(row => {
+          const option = document.createElement("option");
+          option.value = row.id;
+          option.textContent = `${row.name || row.id} · ${row.status}`;
+          cloudDeployment.appendChild(option);
+        });
+        renderCloudGpus();
+        libraryModalStatus(body, `${cloudDeployment.options.length} deployment(s), ${cloudGpu.options.length} GPU(s)`);
+      } catch (err) {
+        libraryModalStatus(body, err.message || String(err), true);
+      } finally {
+        connectCloud.disabled = false;
+      }
+    };
+    if (isModel) {
+      fetchJson("/api/cloud/hosts").then(hosts => {
+        cloudHost.innerHTML = "";
+        (hosts || []).forEach(row => {
+          const option = document.createElement("option");
+          option.value = row.id;
+          option.textContent = `${row.alias || row.id} · ${row.status || "disconnected"}`;
+          cloudHost.appendChild(option);
+        });
+      }).catch(() => {});
+      connectCloud.addEventListener("click", loadCloudCatalog);
+      cloudDeployment.addEventListener("change", renderCloudGpus);
+      sourceKind.addEventListener("change", () => {
+        const cloud = sourceKind.value === "cloud";
+        search.classList.toggle("hidden", cloud);
+        results.classList.toggle("hidden", cloud);
+        grid.classList.toggle("hidden", cloud);
+        cloudPanel.classList.toggle("hidden", !cloud);
+        submit.textContent = cloud ? "Add cloud model" : "Add model";
+      });
+    }
 
     const runSearch = async () => {
       const text = query.value.trim();
@@ -9552,14 +9642,25 @@ function openDownloadModal(kind) {
     });
     submit.addEventListener("click", async () => {
       const address = remote.value.trim();
-      if (!address) {
+      if ((!isModel || sourceKind.value !== "cloud") && !address) {
         libraryModalStatus(body, "Enter an address first", true);
         return;
       }
       submit.disabled = true;
       try {
         let saved;
-        if (isModel) {
+        if (isModel && sourceKind.value === "cloud") {
+          if (!cloudHost.value || !cloudDeployment.value || !cloudGpu.value) {
+            throw new Error("Connect a host and choose a deployment and GPU first");
+          }
+          saved = await api("/api/models/cloud", {
+            host_id: cloudHost.value,
+            deployment_id: cloudDeployment.value,
+            gpu_uuid: cloudGpu.value,
+            name: name.value.trim(),
+          });
+          selectedModelId = String(saved.id || "");
+        } else if (isModel) {
           saved = await addModelFromRemote(address, name.value.trim());
           selectedModelId = String(saved.id || "");
         } else {

@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lerobot_monitor.cloud.app import ApiBoundary, create_app
+from lerobot_monitor.cloud import gpu as gpu_module
 from lerobot_monitor.cloud.gpu import probe_gpus
 from lerobot_monitor.cloud.runtime import CloudRuntime
 from lerobot_monitor.cloud.schemas import DeploymentCreate, LoadRequest, SessionOpen
@@ -288,6 +289,35 @@ def test_partial_nvidia_error_keeps_idle_healthy_gpu(monkeypatch: pytest.MonkeyP
     rows = probe_gpus()
     assert rows[0]["healthy"] is True and rows[0]["busy"] is False
     assert calls[-1][1:3] == ["-i", "GPU-good"]
+
+
+def test_gpu_inventory_attributes_primary_user_and_program(monkeypatch: pytest.MonkeyPatch) -> None:
+    outputs = iter([
+        subprocess.CompletedProcess([], 0, "1, GPU-used, RTX 4090, 24564, 12288\n", ""),
+        subprocess.CompletedProcess(
+            [],
+            0,
+            "GPU-used, 42, /opt/runtime/python, 10240\nGPU-used, 84, renderer, 1024\n",
+            "",
+        ),
+    ])
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: next(outputs))
+    monkeypatch.setattr(
+        gpu_module,
+        "_process_owners",
+        lambda pids: {
+            42: {"user": "researcher", "program": "python"},
+            84: {"user": "artist", "program": "renderer"},
+        },
+    )
+
+    row = probe_gpus()[0]
+
+    assert row["busy"] is True
+    assert row["primary_user"] == "researcher"
+    assert row["primary_program"] == "python"
+    assert row["process_memory_used_mb"] == 11264
+    assert [process["pid"] for process in row["processes"]] == [42, 84]
 
 
 def test_ipc_subprocess_timeout_terminates_child(tmp_path: Path) -> None:

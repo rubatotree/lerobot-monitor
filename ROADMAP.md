@@ -1123,7 +1123,7 @@ note 即时过滤。底部实时图表不再把模式切换当作数据边界：
 3. [x] manager：SSH 探测、隔离初始化、连接与代理、本地上传和独立管理页面。
 4. [x] verify：单元与 API 测试、4090 管理与 ACT/SmolVLA 推理冒烟、页面验证；A6000 未连接、未安装、未测试。
 5. [x] review：独立审查、修复、记录测试证据与运行限制。
-6. [ ] later：等待用户手动确认后另行接入本地 Monitor。
+6. [x] gate：用户已手动确认开始接入本地 Monitor。
 
 技术难点：SSH 跳板机与隧道生命周期；云端依赖及模型运行环境；服务进程所有权验证；上传路径和删除边界；令牌不出现在日志、页面和持久化主机列表中。无用户级 systemd 时采用服务自己的受控后台进程；失败如实保留任务错误，不影响已有项目。
 
@@ -1133,4 +1133,27 @@ note 即时过滤。底部实时图表不再把模式切换当作数据边界：
 
 当前交付：独立分支 codex/cloud-model-manager，管理页面 http://127.0.0.1:8095，云端专用根目录 /data/zhuyutian/lerobot-monitor。运行与复测说明见 docs/cloud_models.md。
 
-剩余边界：PI profile 已实现，但没有缓存 PI checkpoint 可供本轮实测；零状态与黑色 PNG 仅验证管理和推理链路，不代表实体机械臂任务表现。实体机械臂与本地 Monitor 集成继续等待用户手动确认。
+剩余边界：PI profile 已实现，但没有缓存 PI checkpoint 可供本轮实测；零状态与黑色 PNG 仅验证管理和推理链路，不代表实体机械臂任务表现。实体机械臂验证仍待执行。
+
+## 2026-09-28：Monitor 远端推理接入与 GPU 占用归属
+
+状态：完成。用户已解除 Monitor 接入门禁；远端测试限定为 8x4090-server。
+
+架构：模型库用 `cloud://<host>/<deployment>?gpu=<uuid>` 标识远端部署，同时保存可读的主机、部署和 GPU 元数据。Monitor 后端持有独立 SSH 隧道和远端推理会话；Debug 使用短会话返回动作块，Rollout 的 Sync／RTC 引擎使用长会话、心跳、reset 和显式 close。浏览器只提交远端模型选择，不接触令牌。云端 GPU 探针把 NVML 进程显存与操作系统用户、程序名合并，管理页面展示每张卡的主要占用者。
+
+核心模块：
+- `cloud/gpu.py`：GPU 进程、用户和程序归属；单卡故障保持局部降级。
+- `monitor_cloud.py`：云端 URI、SSH 连接、部署加载、会话和动作引擎。
+- `model_hub.py` 与 Monitor API／页面：登记云端模型并把它当作模型库条目选择。
+- `loop.py`：Debug、Sync Rollout、RTC Rollout 的本地／远端分流和生命周期回收。
+
+技术难点：远端 session 租约需要在推理间隙续期；RTC 前缀必须同时保留 raw 与 absolute 动作；停止和异常路径必须关闭会话并释放远端独占锁；网络等待不能阻塞控制循环；SSH 令牌不能进入网页、日志或模型存储。
+
+里程碑：
+1. [x] GPU 资源显示主要占用用户、程序和显存。
+2. [x] Monitor 云端连接、模型登记和模型库页面。
+3. [x] Debug、Sync Rollout、RTC Rollout 接入远端会话。
+4. [x] 本地回归与 8x4090-server ACT／SmolVLA 真实推理验证。
+5. [x] 独立审查、开发记录与原子提交。
+
+验证：GPU 探针在 8x4090-server 返回进程显存、Linux 用户和程序；Monitor 页面实际连接后会禁用忙卡并显示主要占用者。ACT 的 Debug／Sync、SmolVLA 的 RTC 已通过真实 CUDA 推理；完整 Monitor API、ControlLoop 和虚拟 follower 跨层测试成功，且本地轻量环境无需安装 LeRobot。未连接 8A6000-server，未驱动实体机械臂。

@@ -240,6 +240,53 @@ class ModelRegistry:
         saved = self.store.put_model(entry)
         return {**self._decorate(saved), "warning": warning}
 
+    def register_cloud(
+        self,
+        *,
+        path: str,
+        host_id: str,
+        deployment: dict[str, Any],
+        gpu_uuid: str,
+        name: str = "",
+    ) -> dict[str, Any]:
+        """Register a remote deployment without persisting credentials or endpoints."""
+        from .monitor_cloud import parse_cloud_uri
+
+        target = parse_cloud_uri(path)
+        if target is None or target.host_id != host_id or target.gpu_uuid != gpu_uuid:
+            raise ModelHubError("invalid cloud deployment address")
+        deployment_id = str(deployment.get("id") or "")
+        if deployment_id != target.deployment_id:
+            raise ModelHubError("cloud deployment identity mismatch")
+        existing = next(
+            (entry for entry in self.store.models() if str(entry.get("path") or "") == path),
+            None,
+        )
+        entry = dict(existing) if existing is not None else {
+            "id": self._unique_id(
+                ModelRemote(source="local", remote=path, path=f"{host_id}-{deployment_id}")
+            ),
+            "created_utc": _utc_now(),
+        }
+        metadata = dict(deployment.get("metadata") or {})
+        entry.update(
+            {
+                "name": name.strip() or str(deployment.get("name") or deployment_id),
+                "source": "cloud",
+                "remote": path,
+                "path": path,
+                "repo_id": "",
+                "revision": str(deployment.get("revision") or ""),
+                "cloud_host_id": host_id,
+                "cloud_deployment_id": deployment_id,
+                "cloud_gpu_uuid": gpu_uuid,
+                "policy_type": str(metadata.get("policy_type") or deployment.get("policy_type") or ""),
+                "cloud_metadata": metadata,
+                "updated_utc": _utc_now(),
+            }
+        )
+        return self._decorate(self.store.put_model(entry))
+
     def save(self, model_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Edit name / remote address / revision / note of a registered model."""
         entry = self.store.model(model_id)
@@ -342,6 +389,9 @@ class ModelRegistry:
         row = dict(entry)
         row["managed"] = True
         path = str(row.get("path") or "")
+        if row.get("source") == "cloud":
+            row.update(playable=bool(path), missing=False, mtime=0, default_device="remote")
+            return row
         facts = (
             describe_path(path)
             if path
@@ -364,7 +414,9 @@ def merge_models(scanned: list[dict[str, Any]], registered: list[dict[str, Any]]
         row = dict(entry)
         row["managed"] = True
         path = str(row.get("path") or "")
-        if path:
+        if row.get("source") == "cloud":
+            row.update(playable=bool(path), missing=False, mtime=0, default_device="remote")
+        elif path:
             claimed_paths.add(_path_key(path))
             facts = describe_path(path)
             row["playable"] = facts["playable"]

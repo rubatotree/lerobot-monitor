@@ -15,6 +15,7 @@ from .leader import LeaderArm
 from .library import VideoLibrary
 from .loop import ControlLoop
 from .model_hub import ModelRegistry
+from .monitor_cloud import MonitorCloudClient
 from .policy import load_policy
 from .policy_residency import PolicyResidencyManager
 from .robot import FollowerArm
@@ -61,6 +62,10 @@ class RuntimeHub:
             robot_type=config.robot.type,
             rename_map=config.rollout.rename_map,
         )
+        self.cloud = MonitorCloudClient(
+            Path.home() / ".lerobot-cloud-manager",
+            project=Path(__file__).resolve().parents[2],
+        )
         self.loop = ControlLoop(
             config,
             self.cameras,
@@ -69,6 +74,7 @@ class RuntimeHub:
             on_snapshot=self._store_snapshot,
             store=self.store,
             policy_residency=self.policy_residency,
+            cloud_client=self.cloud,
         )
 
     def _store_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -130,7 +136,12 @@ class RuntimeHub:
         else:
             self.cameras.stop()
         finally:
-            self.policy_residency.close()
+            try:
+                self.policy_residency.close()
+            finally:
+                cloud = getattr(self, "cloud", None)
+                if cloud is not None:
+                    cloud.close()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -141,7 +152,12 @@ class RuntimeHub:
         data["runtime"] = dict(self.runtime)
         data["runtime_label"] = format_runtime(self.runtime)
         data["dataset_transfers"] = self.dataset_transfers()
-        data["model_residency"] = self.policy_residency.all_statuses()
+        residencies = self.policy_residency.all_statuses()
+        for row in self.model_registry.list():
+            path = str(row.get("path") or "")
+            if row.get("source") == "cloud" and path:
+                residencies[path] = self.cloud.residency(path)
+        data["model_residency"] = residencies
         data["model_gpu_process"] = self.policy_residency.process_gpu_memory()
         return data
 

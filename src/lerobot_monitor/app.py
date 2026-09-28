@@ -40,6 +40,7 @@ from .pathutil import ensure_lerobot_on_path
 from .session import safe_cam_name
 from .metrics import evaluate_action_chunk
 from .model_hub import ModelHubError, search_hf_models
+from .monitor_cloud import CloudRequestError, CloudTarget, parse_cloud_uri
 from .policy_residency import PolicyBusyError
 from .robot_models import RobotModelError, search_hf_robot_models
 from .preview import (
@@ -263,6 +264,13 @@ class ModelRegisterBody(BaseModel):
     revision: str = ""
     note: str = ""
     download: bool = True
+
+
+class CloudModelRegisterBody(BaseModel):
+    host_id: str = Field(min_length=1, max_length=128)
+    deployment_id: str = Field(min_length=1, max_length=128)
+    gpu_uuid: str = Field(min_length=1, max_length=128)
+    name: str = Field(default="", max_length=200)
 
 
 class ModelSaveBody(BaseModel):
@@ -940,6 +948,19 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     @asynccontextmanager
     async def _model_weight_mutation(path: str) -> AsyncIterator[None]:
         """Keep new users off the source until an edit or deletion completes."""
+        cloud_target = parse_cloud_uri(path)
+        if cloud_target is not None:
+            async with library_mutation_lock:
+                residency = hub.cloud.residency(path)
+                if residency["state"] == "in_use":
+                    raise HTTPException(409, "cloud model is in use")
+                if residency["can_unload"]:
+                    try:
+                        await asyncio.to_thread(hub.cloud.unload, cloud_target)
+                    except CloudRequestError as exc:
+                        raise HTTPException(502, str(exc)) from exc
+                yield
+            return
         async with library_mutation_lock:
             try:
                 source = hub.policy_residency.block_source(path)
@@ -1366,11 +1387,14 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 if row is None:
                     raise FileNotFoundError(id)
                 async with _model_weight_mutation(str(row.get("path") or "")):
-                    target = hub_cache_repo_dir(row.get("path"), str(row.get("repo_id") or ""), kind="model") or row.get("path")
-                    try:
-                        await _delete_library_path(target)
-                    except OSError as exc:
-                        raise HTTPException(400, f"could not delete {target}: {exc}") from exc
+                    if row.get("source") != "cloud":
+                        target = hub_cache_repo_dir(
+                            row.get("path"), str(row.get("repo_id") or ""), kind="model"
+                        ) or row.get("path")
+                        try:
+                            await _delete_library_path(target)
+                        except OSError as exc:
+                            raise HTTPException(400, f"could not delete {target}: {exc}") from exc
                     await asyncio.to_thread(hub.model_registry.delete, id)
                     await asyncio.to_thread(hub.store.delete_library_override, "model", id)
             elif kind == "dataset":
@@ -1584,7 +1608,12 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         result: list[dict[str, Any]] = []
         for row in rows:
             merged = _merge_library_override("model", str(row.get("id") or row.get("name") or ""), row)
-            residency = hub.policy_residency.status(str(merged.get("path") or ""))
+            path = str(merged.get("path") or "")
+            residency = (
+                hub.cloud.residency(path)
+                if merged.get("source") == "cloud"
+                else hub.policy_residency.status(path)
+            )
             merged["residency"] = residency
             merged["metadata"]["gpu_memory"] = f"{residency['gpu_bytes'] / 1048576:.1f} MiB" if residency["gpu_bytes"] else "—"
             merged["metadata"]["resident_device"] = ", ".join(
@@ -1597,6 +1626,58 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     async def model_load_diagnostics() -> dict[str, Any]:
         return await asyncio.to_thread(hub.policy_residency.load_diagnostics)
 
+    @router.get("/api/cloud/hosts")
+    async def cloud_hosts() -> list[dict[str, Any]]:
+        return await asyncio.to_thread(hub.cloud.hosts)
+
+    @router.post("/api/cloud/hosts/{host_id}/connect")
+    async def connect_cloud_host(host_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(hub.cloud.connect, host_id)
+        except (CloudRequestError, KeyError, ValueError, RuntimeError) as exc:
+            raise HTTPException(502, str(exc)) from exc
+
+    @router.get("/api/cloud/hosts/{host_id}/catalog")
+    async def cloud_catalog(host_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(hub.cloud.catalog, host_id)
+        except (CloudRequestError, KeyError, ValueError, RuntimeError) as exc:
+            raise HTTPException(502, str(exc)) from exc
+
+    @router.post("/api/models/cloud")
+    async def register_cloud_model(body: CloudModelRegisterBody) -> dict[str, Any]:
+        try:
+            catalog = await asyncio.to_thread(hub.cloud.connect, body.host_id)
+            deployment = next(
+                (row for row in catalog["deployments"] if str(row.get("id")) == body.deployment_id),
+                None,
+            )
+            if deployment is None:
+                raise ValueError("cloud deployment does not exist")
+            gpu = next(
+                (row for row in catalog["gpus"] if str(row.get("uuid")) == body.gpu_uuid),
+                None,
+            )
+            if gpu is None or gpu.get("healthy") is False:
+                raise ValueError("selected cloud GPU is unavailable")
+            deployment_owns_gpu = (
+                deployment.get("status") == "loaded"
+                and str(deployment.get("gpu_uuid") or "") == body.gpu_uuid
+            )
+            if gpu.get("busy") and not deployment_owns_gpu:
+                raise ValueError("selected cloud GPU is already in use")
+            target = CloudTarget(body.host_id, body.deployment_id, body.gpu_uuid)
+            return await asyncio.to_thread(
+                hub.model_registry.register_cloud,
+                path=target.uri,
+                host_id=body.host_id,
+                deployment=deployment,
+                gpu_uuid=body.gpu_uuid,
+                name=body.name,
+            )
+        except (CloudRequestError, KeyError, ValueError, ModelHubError, RuntimeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @router.post("/api/models/{model_id:path}/load", status_code=202)
     async def load_model(model_id: str, body: ModelLoadBody) -> dict[str, Any]:
         row = next((item for item in await asyncio.to_thread(hub.models) if str(item.get("id")) == model_id), None)
@@ -1606,12 +1687,23 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         if not path or not row.get("playable"):
             raise HTTPException(400, "model weights are unavailable; download or update this model first")
         try:
+            target = parse_cloud_uri(path)
+            if target is not None:
+                await asyncio.to_thread(hub.cloud.ensure_loaded, target)
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "instance_id": f"cloud:{target.host_id}:{target.deployment_id}",
+                    "residency": hub.cloud.residency(path),
+                }
             entry = await asyncio.to_thread(
                 hub.policy_residency.request, path, body.device or hub.config.rollout.device,
                 {},
             )
         except PolicyBusyError as exc:
             raise HTTPException(409, str(exc)) from exc
+        except CloudRequestError as exc:
+            raise HTTPException(502, str(exc)) from exc
         return {"ok": True, "accepted": True, "instance_id": entry.instance_id}
 
     @router.post("/api/models/{model_id:path}/unload", status_code=202)
@@ -1620,11 +1712,18 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         if row is None:
             raise HTTPException(404, f"unknown model '{model_id}'")
         try:
+            path = str(row.get("path") or "")
+            target = parse_cloud_uri(path)
+            if target is not None:
+                await asyncio.to_thread(hub.cloud.unload, target)
+                return {"ok": True, "accepted": True, "instances": 1, "residency": hub.cloud.residency(path)}
             count = await asyncio.to_thread(
-                hub.policy_residency.unload, str(row.get("path") or ""), body.instance_id
+                hub.policy_residency.unload, path, body.instance_id
             )
         except PolicyBusyError as exc:
             raise HTTPException(409, str(exc)) from exc
+        except CloudRequestError as exc:
+            raise HTTPException(502, str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(404, f"unknown resident instance '{body.instance_id}'") from exc
         return {"ok": True, "accepted": True, "instances": count}
@@ -1634,6 +1733,13 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         if row is None:
             raise HTTPException(404, f"unknown model '{model_id}'")
         path = str(row.get("path") or "")
+        if parse_cloud_uri(path) is not None:
+            if cancel:
+                return {"ok": True, "count": 0, "residency": hub.cloud.residency(path)}
+            if getattr(hub.loop.loaded_policy, "path", None) != path:
+                return {"ok": True, "count": 0, "residency": hub.cloud.residency(path)}
+            result = hub.loop.request_stop()
+            return {"ok": True, "count": 1, "result": result, "residency": hub.cloud.residency(path)}
         action = hub.policy_residency.cancel_load if cancel else hub.policy_residency.release_owner
         count = await asyncio.to_thread(action, path, body.instance_id)
         return {"ok": True, "count": count, "residency": hub.policy_residency.status(path)}

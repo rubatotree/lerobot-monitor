@@ -15,6 +15,8 @@ from lerobot_monitor import loop as loop_module
 from lerobot_monitor.config import CamerasConfig, LibraryConfig, MonitorConfig, RecordingConfig, RobotConfig
 from lerobot_monitor.loop import Command, ControlLoop
 from lerobot_monitor.policy_worker import PolicyWorker
+from lerobot_monitor.policy import ActionChunk, LoadedPolicy
+from lerobot_monitor.monitor_cloud import CloudTarget
 from lerobot_monitor.types import JOINT_ORDER
 
 
@@ -88,6 +90,55 @@ def _dispatch(loop: ControlLoop, kind: str, payload: dict[str, object] | None = 
     reply: queue.Queue[dict] = queue.Queue(maxsize=1)
     loop._handle(Command(kind, payload or {}, reply))
     return reply.get(timeout=1)
+
+
+def test_debug_cloud_model_bypasses_local_residency(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    cloud = MagicMock()
+    expected = ActionChunk([{"shoulder_pan": 1.0}], "cloud_policy_chunk", False, [])
+    cloud.debug_infer.return_value = expected
+    loop.cloud_client = cloud
+    loop.policy_residency.acquire = MagicMock(side_effect=AssertionError("local loader must not run"))
+    target = CloudTarget("8x4090-server", "act", "GPU-test")
+
+    result = loop.infer_action_chunk(
+        path=target.uri,
+        task="pick",
+        device="cuda",
+        extra={},
+        joints={name: 0.0 for name in JOINT_ORDER},
+        images_rgb={},
+        chunk_size=8,
+    )
+
+    assert result is expected
+    cloud.debug_infer.assert_called_once()
+
+
+def test_rollout_cloud_policy_worker_uses_remote_loader(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    cloud = MagicMock()
+    loaded = LoadedPolicy(
+        path="cloud://8x4090-server/act?gpu=GPU-test",
+        device="remote",
+        task="pick",
+        policy=MagicMock(),
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        dataset_features={},
+        ordered_action_keys=list(JOINT_ORDER),
+    )
+    cloud.load_policy.return_value = loaded
+    loop.cloud_client = cloud
+    job = loop_module._PolicyLoadJob(generation=1, payload={})
+    loop._policy_generation = 1
+    loop._policy_job = job
+
+    loop._policy_worker(job, loaded.path, "cuda", "pick", {})
+
+    assert job.result is loaded
+    assert job.lease is None
+    cloud.load_policy.assert_called_once_with(loaded.path, task="pick", state_keys=list(JOINT_ORDER))
 
 
 def test_recorder_resume_is_explicit_and_root_is_honored(tmp_path: Path) -> None:

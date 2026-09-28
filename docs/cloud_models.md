@@ -1,6 +1,6 @@
-# Cloud models: independent service contract
+# Cloud models: service and Monitor integration
 
-This stage delivers a standalone cloud service and local cloud manager. Monitor model registry, rollout, Debug and sibling LeRobot changes require the user's later manual confirmation.
+The cloud service can be operated from its standalone manager or registered in LeRobot Monitor as a normal model entry. Monitor keeps SSH credentials and service tokens in its backend, while Debug, synchronous Rollout and RTC Rollout use authenticated remote sessions.
 
 ## Entry points and state
 
@@ -23,7 +23,7 @@ All `/api/v1/*` endpoints require `Authorization: Bearer <token>` (including hea
 - `GET /api/v1/deployments/{id}/logs`: `{text: string}`.
 - `GET /api/v1/jobs`: jobs including id, kind, status, message/error, created_at, updated_at.
 
-Inference initially uses authenticated HTTP sessions owned by cloud workers. LeRobot transport extensions and Monitor RTC wiring are withheld. Cloud service owns and documents the additional session schema.
+Inference uses authenticated HTTP sessions owned by cloud workers. Monitor reaches those sessions through its backend SSH tunnel; the browser receives only model, deployment and GPU metadata.
 
 ## Local manager HTTP API
 
@@ -75,7 +75,20 @@ Installation diagnostics are saved with user-only permissions on Linux: `ROOT/re
 - `POST /api/v1/sessions/{id}/infer` takes `{epoch, request_id, state, images?, task?, chunk_size?, prefix_raw?, prefix_absolute?, inference_delay?}`. Images must be base64-encoded PNG files; other image formats are rejected. Prefix tensors have shape `[T,A]` and must match each other.
 - `DELETE /api/v1/sessions/{id}` closes the session.
 
-These APIs are exposed through the local manager's authenticated backend proxy. They are not wired into Monitor's local robot-control loop in this phase.
+These APIs are exposed through the local manager's authenticated backend proxy and through Monitor's backend-only cloud client. Monitor uses `debug_chunk` for Debug, `select_action` for synchronous Rollout and `rtc_chunk` for RTC Rollout.
+
+## Monitor integration
+
+Monitor stores a cloud model as `cloud://<host>/<deployment>?gpu=<uuid>`. The model remains selectable in the existing Debug and Rollout panels and has the same load, unload and residency controls as a local model. The Models add dialog can connect an SSH host, select a deployment, and bind it to a currently available GPU.
+
+The cloud catalog API is backend-only:
+
+- `GET /api/cloud/hosts`: configured SSH hosts without credentials or tokens.
+- `POST /api/cloud/hosts/{id}/connect`: opens or reuses the SSH tunnel and returns deployments plus current GPU ownership.
+- `GET /api/cloud/hosts/{id}/catalog`: refreshes the connected catalog.
+- `POST /api/models/cloud`: registers `{host_id, deployment_id, gpu_uuid, name?}` in the normal model library.
+
+GPU rows include the compute processes reported by `nvidia-smi`, their Linux users resolved through `/proc/<pid>/status`, executable names and per-process GPU memory. The UI shows the leading owner/program and disables a busy GPU unless it already belongs to the selected deployment. A single faulty GPU query does not hide healthy rows.
 
 ## Validation evidence
 
@@ -92,10 +105,14 @@ These APIs are exposed through the local manager's authenticated backend proxy. 
 | Linux service/manager/harness tests | 79 passed |
 | Existing local full regression | 357 passed, 4 skipped, using a complete dependency environment and pinned LeRobot archive |
 | UI | 12 tests and four viewport checks passed |
+| GPU ownership | Real 4090 probe resolved Blender/Python processes to their Linux users and retained seven healthy GPU rows while one device query failed |
+| Monitor direct client | ACT Debug returned 4×6 actions; ACT Sync returned 1×6; SmolVLA RTC returned a 50-action queue |
+| Monitor control loop | Cloud registration, Sync ACT and RTC SmolVLA passed through the normal Monitor API, ControlLoop and virtual follower |
+| Monitor browser | 4090 deployments and ownership labels rendered; busy GPUs were disabled; ACT was registered on an idle GPU |
 
 Evidence files in the isolated checkout are `.tmp_cloud_results/act.json` and `.tmp_cloud_results/smolvla.json`; both report `status: passed`. Existing ACT/SmolVLA external cache weights were retained. The earlier lightweight-environment test failures and missing `datasets` import were resolved by the complete dependency environment and runtime profile correction; they are not the final acceptance result.
 
-These inference tests used zero state and black PNG observations, with no robot attached. They validate the management and inference path, not task accuracy or physical robot performance. PI runtime support is implemented but no cached PI checkpoint was available for actual inference testing. A6000 was not contacted. Local Monitor integration and physical robot tests remain pending the user's manual confirmation.
+These inference tests used zero state and black PNG observations, with no robot attached. They validate the management and inference path, not task accuracy or physical robot performance. PI runtime support is implemented but no cached PI checkpoint was available for actual inference testing. A6000 was not contacted. Physical robot validation remains pending.
 
 ### Profile selection and transport status
 
@@ -136,13 +153,13 @@ $env:PYTHONPATH = Join-Path $cloudCheckout 'src'
 
 Leave this terminal running and open the page in a browser. If port 8095 already serves the manager, reuse the running page. The default local state remains `%USERPROFILE%\.lerobot-cloud-manager`; tokens are stored separately from host configuration. In the page select `8x4090-server` and connect. After a server restart, initialize the same build to restart its owned daemon; after code changes use Upgrade. Neither action modifies another project's service or Python environment.
 
-The remote deployment root is `/data/zhuyutian/lerobot-monitor`. The verified LeRobot runtime wheel was built from commit `79f1e10d`, version `0.6.2`, with SHA256:
+The remote deployment root is `/data/zhuyutian/lerobot-monitor`. The Monitor integration runtimes use a LeRobot wheel built from commit `e5315df2`, version `0.6.2`, with SHA256:
 
 ```text
-5d8af18eaf294a690b4325f6f335c4a92cdbd375a9a313f1dbfcba63bb60fdcd
+ae5a3dbb2f67298ee1953319b7805603047c4ee680817245bd23cef413b29803
 ```
 
-Its local build artifact remains at `.tmp_cloud_build/wheels/lerobot-0.6.2-py3-none-any.whl` in this checkout. The installed runtime's resolved dependencies and hashes remain on the server in its `requirements.lock` and `installed.txt`. Runtime profiles reuse the explicitly selected `/data/zhuyutian/cache/huggingface` cache without deleting externally owned checkpoints.
+The wheel was installed into the dedicated ACT and SmolVLA runtime profiles under the cloud service root. The installed runtimes' resolved dependencies and hashes remain on the server in their `requirements.lock` and `installed.txt`. Runtime profiles reuse the explicitly selected `/data/zhuyutian/cache/huggingface` cache without deleting externally owned checkpoints.
 
 For repeat inference checks, first refresh the GPU list and select a currently unused healthy GPU UUID. Run in a second PowerShell terminal:
 

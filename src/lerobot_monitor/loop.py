@@ -24,6 +24,13 @@ from .control_rates import RATE_MODES, CadenceStats, RateSetting
 from .hardware import apply_hardware_preset
 from .leader import LeaderArm
 from .library import DatasetRecorder, VideoLibrary
+from .monitor_cloud import (
+    MonitorCloudClient,
+    RemoteRTCInferenceEngine,
+    RemoteSyncInferenceEngine,
+    parse_cloud_uri,
+    remote_inference_settings,
+)
 from .policy import (
     ActionChunk,
     LoadedPolicy,
@@ -207,6 +214,7 @@ class ControlLoop:
         on_snapshot: Callable[[dict[str, Any]], None] | None = None,
         store: JsonStore | None = None,
         policy_residency: PolicyResidencyManager | None = None,
+        cloud_client: MonitorCloudClient | None = None,
     ) -> None:
         self.config = config
         self.cameras = cameras
@@ -219,6 +227,7 @@ class ControlLoop:
             robot_type=config.robot.type,
             rename_map=config.rollout.rename_map,
         )
+        self.cloud_client = cloud_client
 
         self.mode = "offline"
         self.hold_when_idle = config.control.hold_when_idle
@@ -885,6 +894,22 @@ class ControlLoop:
                 raise RuntimeError("model debug was cancelled")
 
         check_request()
+        if parse_cloud_uri(path) is not None:
+            if self.cloud_client is None:
+                raise RuntimeError("cloud inference is unavailable")
+            compute_started = time.perf_counter()
+            result = self.cloud_client.debug_infer(
+                path,
+                task=task,
+                state_keys=[name for name in JOINT_ORDER if name in joints],
+                extra=extra,
+                joints=joints,
+                images_rgb=images_rgb,
+                chunk_size=chunk_size,
+            )
+            check_request()
+            result.compute_ms = max(result.compute_ms, (time.perf_counter() - compute_started) * 1000.0)
+            return result
         wait_started = time.perf_counter()
         lease = self.policy_residency.acquire(path, device, extra, cancel_event=cancel_event)
         # Cancellation discards the result but ownership lasts through the native call.
@@ -944,6 +969,22 @@ class ControlLoop:
         extra: dict[str, str],
     ) -> None:
         try:
+            if parse_cloud_uri(path) is not None:
+                if self.cloud_client is None:
+                    raise RuntimeError("cloud inference is unavailable")
+                loaded = self.cloud_client.load_policy(
+                    path,
+                    task=task,
+                    state_keys=list(JOINT_ORDER),
+                )
+                with self._policy_job_lock:
+                    generation_stale = self._policy_generation != 0 and job.generation != self._policy_generation
+                    replaced = self._policy_job is not None and self._policy_job is not job
+                    if generation_stale or replaced:
+                        return
+                    job.result = loaded
+                self.log("info", f"cloud policy {path}: deployment ready")
+                return
             lease = self.policy_residency.acquire(
                 path, device, extra, timeout=_POLICY_READY_TIMEOUT_S
             )
@@ -2494,7 +2535,8 @@ class ControlLoop:
             self.rollout_extra = {str(k): str(v) for k, v in extra.items() if str(k).strip()}
             device = str(p.get("device") or self.config.rollout.device)
             task = str(p.get("task") or "")
-            lease = self.policy_residency.acquire_ready(path, device, self.rollout_extra)
+            remote = parse_cloud_uri(path) is not None
+            lease = None if remote else self.policy_residency.acquire_ready(path, device, self.rollout_extra)
             if lease is not None and lease.loaded is not None:
                 self.log("info", f"using cached policy {path}")
                 with self._policy_job_lock:
@@ -2514,7 +2556,12 @@ class ControlLoop:
                     session_id=None if self.writer is None else self.writer.session_id,
                 )
                 return
-            self.log("info", f"loading policy {path} (background, local cache first)")
+            self.log(
+                "info",
+                f"connecting cloud policy {path} (background)"
+                if remote
+                else f"loading policy {path} (background, local cache first)",
+            )
             with self._policy_job_lock:
                 self._policy_generation += 1
                 job = _PolicyLoadJob(generation=self._policy_generation, payload=dict(p))
@@ -3087,7 +3134,12 @@ class ControlLoop:
     def _start_inference_engine(self, loaded: LoadedPolicy) -> bool:
         """Build and start LeRobot's sync or RTC inference engine."""
         try:
-            config = inference_config_from_extra(self.rollout_extra)
+            target = parse_cloud_uri(getattr(loaded, "path", ""))
+            config = (
+                remote_inference_settings(self.rollout_extra)
+                if target is not None
+                else inference_config_from_extra(self.rollout_extra)
+            )
             self._rollout_timeline_debugged = False
             # Retired workers can still finish callbacks. Give each run its own
             # timeline so they cannot attach events to a subsequent model/run.
@@ -3105,6 +3157,45 @@ class ControlLoop:
                 f"rollout inference config: type={config.type}"
                 + (f", rtc={rtc}" if rtc is not None else ""),
             )
+            if target is not None:
+                if self.cloud_client is None:
+                    raise RuntimeError("cloud inference is unavailable")
+                mode = "rtc_chunk" if config.type == "rtc" else "select_action"
+                session = self.cloud_client.open_session(
+                    target,
+                    mode=mode,
+                    task=loaded.task,
+                    state_keys=list(JOINT_ORDER),
+                    overrides=self.rollout_extra,
+                )
+                if config.type == "rtc":
+                    engine = RemoteRTCInferenceEngine(
+                        session,
+                        fps=self.effective_policy_fps,
+                        queue_threshold=config.queue_threshold,
+                    )
+                    engine.observation_provider = self._prepare_rollout_observation
+                else:
+                    engine = RemoteSyncInferenceEngine(session)
+                self._inference_engine = engine
+                engine.start()
+                engine.resume()
+                self._active_policy_owner = loaded
+                if config.type == "sync":
+                    self._inference_worker = PolicyWorker(
+                        engine,
+                        _POLICY_INFER_LOCK,
+                        preview=lambda _joints: [],
+                        timeline=self._rollout_timeline,
+                        step_s=self._prediction_step_s(),
+                        kind="cloud-sync",
+                        prepare=self._prepare_rollout_observation,
+                        convert=lambda action, joints: {**joints, **dict(action)},
+                    )
+                self._rollout_hw_feature_spec = {}
+                self._next_prediction_t = self.task_t0
+                self.log("info", f"rollout inference engine started (cloud {config.type})")
+                return True
             hw_features = self._rollout_hw_features()
             applied = apply_requested_overrides(loaded, self.rollout_extra)
             if applied:

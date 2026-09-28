@@ -1,5 +1,17 @@
 # Dev log
 
+## 2026-09-28：Rollout 连续斜带与冻结检查
+
+- 将 action chart 底部改为固定 64 px 区域：同一 chunk 连接蓝色推理、虚线等待、绿色动作与淡色未来计划；实际 `action_end` 决定截断尾部，队列 merge 时间不会提前结束已经取出的目标。重叠使用精确覆盖计数，所有 chunk 固定一行。
+- 每次 rollout 固定 `run_id` / `epoch_ts`，旧协议只锚定一次；两图曲线、预测和斜带由同一帧时钟更新。保留原始区间，窗口仅裁剪几何，避免快照频率改变坐标或耗时。缺失快照和同运行重连不重建原点，新运行清理旧预测。
+- 线段距离命中覆盖推理、等待、动作及替换尾部，整根高亮并展示完整阶段/GPU/交接/RTC 步数和计划重叠。修复原生 pointermove 对底部区域的排除；详情卡按视口定位，长记录可在斜带上滚轮查看，并提供滚动提示。
+- 图例新增持久化 `Inference stages`（默认关闭）与雪花冻结按钮。冻结捕获已绘制时刻的两图、预测、标记与时间轴，后台仍接收有界实时历史；缩放和悬停使用捕获数据，停止后保留，解冻恢复实时，进入 Replay / Snapshot 解除冻结。
+- Monitor 遥测提交 `bfffe02` / 原生 `e5315df2` 记录实际队列裁剪/替换、逐阶段主机与可选 GPU 耗时，并区分队列取出与成功下发；发布阶段计入整体推理结束时间。同步 ACT / SmolVLA / Diffusion 的缓存动作归入同次生成，其他策略和 ACT temporal ensemble 保留逐步记录，缓存命中不重复记录原始推理阶段。
+- 加载日志已补充 Monitor/原生加载器和 SmolVLA 内部阶段；前端保留既有加载阶段并显示 VLM 缓存解析。加载日志提交为 Monitor `b0bf4f5` / LeRobot `99bb5ec0`；原生 queue/rollout/interactive_rollout 测试 172 passed；Monitor 全量 382 passed / 1 skipped（138.05 s），另有 2 条上游警告。跳过项为 `tests/test_library.py:630` 的 Windows 符号链接权限限制（WinError 1314）；同步分组/保留定向 96 项属于 Monitor 验证子集，不重复计入总数。修改文件 Ruff/diff 检查通过。
+- 验证：Node 几何/生命周期分析 12/12；隔离配置/store 和合成 WebSocket 的 Playwright 76/76，包含 1440×900 与 390×844（DPR 2）、完整详情卡视口边界、长阶段滚动、<1 px 时间对齐、缺失/重复快照、运行隔离、冻结后台接收、阶段展开/缩放、停止保留及 Replay 解冻。`node --check`、`git diff --check` 通过。
+- UI 截图：`C:/Users/Admin/AppData/Local/Temp/lerobot-ribbons-shots/rollout-ribbon-phases-1440x900.png`、`rollout-ribbon-phases-390x844.png`，对应 `rollout-ribbon-details-*.png` 显示整根斜带详情。前端提交 `0d0fd3f`，静态资源缓存版本更新 `f5b9ec3`。
+- 未重启现有 Monitor 服务，未发送实体机械臂动作；保留同级 LeRobot 的用户文档修改。GPU 异步事件使用假事件验证无主动等待；真实硬件 Rollout 的 profiling、控制节拍和长期运行开销需在下次服务重启后的实际运行中观察。
+
 ## 2026-09-28：模型导入缓慢排查与诊断补充
 
 - 在线 SmolVLA512 最终耗时 605.817 秒：imports 492.819 秒、构造/权重 111.208 秒，其余约 1.8 秒；加载锁等待可以排除为主要原因。后续 Rollout 日志确认复用模型。

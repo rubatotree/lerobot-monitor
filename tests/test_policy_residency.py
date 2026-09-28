@@ -199,6 +199,35 @@ def test_load_status_reports_imports_and_stage_timings(tmp_path: Path) -> None:
         manager.close()
 
 
+def test_load_diagnostics_samples_blocked_worker_without_waiting(tmp_path: Path) -> None:
+    path = _model(tmp_path / "model")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_loader(source: str, **kwargs: Any) -> Any:
+        kwargs["progress"]("imports_factory", 0)
+        entered.set()
+        assert release.wait(3)
+        return _loaded(source)
+
+    manager = _manager(blocked_loader)
+    try:
+        manager.request(str(path), "cpu", {})
+        assert entered.wait(2)
+        diagnostic = manager.load_diagnostics()
+        worker = next(row for row in diagnostic["threads"] if row["id"] == diagnostic["worker_thread_id"])
+        assert worker["name"] == "policy-residency-load"
+        assert any("in blocked_loader" in line for line in worker["stack"])
+        assert 0 < len(worker["stack"]) <= 48
+        # The public response consists only of JSON data, never live frames/locals.
+        json.dumps(diagnostic)
+        assert manager.status(str(path))["instances"][0]["phase"] == "imports_factory"
+    finally:
+        release.set()
+        _wait_for_state(manager, path, "ready")
+        manager.close()
+
+
 def test_busy_and_stopping_instances_cannot_unload(tmp_path: Path) -> None:
     path = _model(tmp_path / "model")
     manager = _manager(lambda path, **kwargs: _loaded(path))

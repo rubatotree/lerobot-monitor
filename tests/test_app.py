@@ -681,6 +681,19 @@ def test_library_delete_model_keeps_registration_if_cache_removal_fails(tmp_path
     assert app.state.hub.store.model("registered-policy") is not None
 
 
+def test_model_load_diagnostics_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.get("/lerobot/api/models/load-diagnostics")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["worker_thread_id"] is None
+        assert any(row["name"] == "control-loop" for row in body["threads"])
+        assert all(isinstance(line, str) for row in body["threads"] for line in row["stack"])
+        assert app.state.hub.policy_residency.all_statuses() == {}
+
+
 def test_model_residency_api_load_reuse_busy_and_unload(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     model = tmp_path / "policy"

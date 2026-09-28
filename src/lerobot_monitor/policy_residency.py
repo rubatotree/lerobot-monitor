@@ -518,6 +518,29 @@ class PolicyResidencyManager:
             sources = {str(key[0]) for key in self._entries}
         return {source: self.status(source) for source in sources}
 
+    def load_diagnostics(self) -> dict[str, Any]:
+        """Sample Python stacks on demand, without retaining frames or their locals.
+
+        Import deadlocks can involve another thread holding a module lock, so
+        capture all Python threads. Keep this off the high-frequency status path.
+        """
+        names = {thread.ident: thread.name for thread in threading.enumerate()}
+        threads: list[dict[str, Any]] = []
+        frames = sys._current_frames()
+        try:
+            for ident, frame in frames.items():
+                stack: list[str] = []
+                while frame is not None and len(stack) < 48:
+                    code = frame.f_code
+                    stack.append(f"{code.co_filename}:{frame.f_lineno} in {code.co_name}")
+                    frame = frame.f_back
+                threads.append({"id": ident, "name": names.get(ident, "unknown"), "stack": stack})
+        finally:
+            # Frames may own a partially built model; never cache them in status.
+            frames.clear()
+            frame = None
+        return {"worker_thread_id": self._worker.ident, "threads": threads}
+
     def has_active_inference(self) -> bool:
         with self._lock:
             return any(item.busy for item in self._entries.values())

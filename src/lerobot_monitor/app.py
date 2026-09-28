@@ -1589,6 +1589,10 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             result.append(merged)
         return result
 
+    @router.get("/api/models/load-diagnostics")
+    async def model_load_diagnostics() -> dict[str, Any]:
+        return await asyncio.to_thread(hub.policy_residency.load_diagnostics)
+
     @router.post("/api/models/{model_id:path}/load", status_code=202)
     async def load_model(model_id: str, body: ModelLoadBody) -> dict[str, Any]:
         row = next((item for item in await asyncio.to_thread(hub.models) if str(item.get("id")) == model_id), None)

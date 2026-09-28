@@ -8675,6 +8675,9 @@ const MODEL_RESIDENCY_LABELS = {
 
 const MODEL_LOAD_PHASES = {
   queued: "Waiting for load slot", waiting: "Waiting for load slot", imports: "Importing model libraries",
+  imports_torch: "Importing PyTorch", imports_config: "Importing policy configuration",
+  imports_factory: "Importing policy dependencies",
+  imports_policy: "Importing selected policy",
   cache: "Resolving local cache", config: "Reading configuration", weights: "Building model and loading weights",
   device: "Finalizing device", processors: "Preparing processors", finalizing: "Finalizing model", ready: "Ready",
 };

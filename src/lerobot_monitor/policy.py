@@ -267,9 +267,13 @@ def load_policy(
 
     report("imports", 0)
     ensure_lerobot_on_path()
+    report("imports_torch", 0)
     import torch
 
+    report("imports_config", 0)
     from lerobot.configs import PreTrainedConfig
+
+    report("imports_factory", 0)
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
     from lerobot.utils.constants import ACTION
 
@@ -314,8 +318,9 @@ def load_policy(
                     + (" and model weights" if cfg.load_vlm_weights else "")
                     + ", or set policy.vlm_model_name to a complete local directory."
                 )
-        report("weights", 1)
+        report("imports_policy", 1)
         policy_cls = get_policy_class(cfg.type)
+        report("weights", 1)
         policy = policy_cls.from_pretrained(load_path, config=cfg, local_files_only=local_only)
         report("device", 2)
         policy = policy.to(device)

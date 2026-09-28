@@ -5,12 +5,14 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from lerobot_monitor.app import create_app
 from lerobot_monitor.config import CamerasConfig, MonitorConfig, RobotConfig
 from lerobot_monitor.model_hub import ModelRegistry
 from lerobot_monitor.monitor_cloud import (
+    CloudRequestError,
     CloudTarget,
     MonitorCloudClient,
     RemoteRTCInferenceEngine,
@@ -22,23 +24,59 @@ from lerobot_monitor.store import JsonStore
 def test_cloud_target_round_trip_escapes_components() -> None:
     target = CloudTarget("host name", "deployment-id", "GPU:0/test")
     assert parse_cloud_uri(target.uri) == target
+    mounted = CloudTarget("host name", "deployment-id")
+    assert parse_cloud_uri(mounted.uri) == mounted
+    assert "gpu=" not in mounted.uri
     assert parse_cloud_uri("C:/models/local") is None
 
 
 def test_cloud_model_registry_is_playable_without_local_path(tmp_path: Path) -> None:
     registry = ModelRegistry(JsonStore(tmp_path / "store.json"), [])
-    target = CloudTarget("8x4090-server", "smolvla", "GPU-test")
+    target = CloudTarget("8x4090-server", "smolvla")
     row = registry.register_cloud(
         path=target.uri,
         host_id=target.host_id,
         deployment={"id": target.deployment_id, "name": "SmolVLA", "metadata": {"policy_type": "smolvla"}},
-        gpu_uuid=target.gpu_uuid,
     )
 
     assert row["source"] == "cloud"
     assert row["playable"] is True
     assert row["missing"] is False
     assert registry.list()[0]["path"] == target.uri
+
+
+def test_cloud_model_registry_migrates_legacy_gpu_binding(tmp_path: Path) -> None:
+    store = JsonStore(tmp_path / "store.json")
+    legacy = CloudTarget("8x4090-server", "act", "GPU-old")
+    store.put_model(
+        {
+            "id": "remote-act",
+            "name": "Remote ACT",
+            "source": "cloud",
+            "path": legacy.uri,
+            "remote": legacy.uri,
+            "cloud_host_id": legacy.host_id,
+            "cloud_deployment_id": legacy.deployment_id,
+            "cloud_gpu_uuid": legacy.gpu_uuid,
+        }
+    )
+    registry = ModelRegistry(store, [])
+    mounted = CloudTarget(legacy.host_id, legacy.deployment_id)
+
+    migrated = registry.list()[0]
+    assert migrated["path"] == mounted.uri
+    assert "cloud_gpu_uuid" not in migrated
+
+    row = registry.register_cloud(
+        path=mounted.uri,
+        host_id=mounted.host_id,
+        deployment={"id": mounted.deployment_id, "name": "Remote ACT"},
+    )
+
+    assert row["id"] == "remote-act"
+    assert row["path"] == mounted.uri
+    assert "cloud_gpu_uuid" not in row
+    assert len(registry.list()) == 1
 
 
 class FakeRemoteSession:
@@ -104,7 +142,35 @@ def test_cached_cloud_residency_tracks_active_sessions(tmp_path: Path) -> None:
     assert client.residency(target.uri)["can_unload"] is True
 
 
+def test_cloud_load_requires_explicit_gpu_and_keeps_identity_unbound(tmp_path: Path) -> None:
+    client = MonitorCloudClient(tmp_path, manager=FakeManager())  # type: ignore[arg-type]
+    target = CloudTarget("host", "model")
+    ready = {"id": "model", "status": "ready", "gpu_uuid": None}
+    loaded = {"id": "model", "status": "loaded", "gpu_uuid": "GPU-selected"}
+    client.deployment = MagicMock(side_effect=[ready, ready, loaded])  # type: ignore[method-assign]
+
+    def request(_host: str, method: str, path: str, **kwargs: Any) -> Any:
+        if method == "POST" and path.endswith("/load"):
+            assert kwargs["json"]["gpu_uuid"] == "GPU-selected"
+            return {"job_id": "job"}
+        if method == "GET" and path == "/api/v1/jobs":
+            return [{"id": "job", "status": "succeeded"}]
+        raise AssertionError((method, path))
+
+    client.request = MagicMock(side_effect=request)  # type: ignore[method-assign]
+    with pytest.raises(CloudRequestError, match="choose a cloud GPU"):
+        client.ensure_loaded(target)
+
+    result = client.ensure_loaded(target, gpu_uuid="GPU-selected")
+
+    assert result == loaded
+    assert target.uri == "cloud://host/model"
+
+
 class FakeAppCloud:
+    def __init__(self) -> None:
+        self.loaded_gpu = ""
+
     def hosts(self) -> list[dict[str, Any]]:
         return [{"id": "8x4090-server", "alias": "8x4090-server", "status": "disconnected"}]
 
@@ -119,7 +185,23 @@ class FakeAppCloud:
         }
 
     def residency(self, uri: str) -> dict[str, Any]:
-        return {"state": "unloaded", "instances": [], "gpu_bytes": 0, "can_unload": False, "source_paths": [uri]}
+        instances = [] if not self.loaded_gpu else [{"id": "cloud:test", "device": self.loaded_gpu}]
+        return {
+            "state": "ready" if self.loaded_gpu else "unloaded",
+            "instances": instances,
+            "gpu_bytes": 0,
+            "can_unload": bool(self.loaded_gpu),
+            "source_paths": [uri],
+        }
+
+    def ensure_loaded(self, target: CloudTarget, *, gpu_uuid: str | None = None) -> dict[str, Any]:
+        assert target.gpu_uuid == ""
+        assert gpu_uuid
+        self.loaded_gpu = gpu_uuid
+        return {"status": "loaded", "gpu_uuid": gpu_uuid}
+
+    def unload(self, target: CloudTarget) -> None:
+        self.loaded_gpu = ""
 
 
 def test_monitor_api_registers_cloud_deployment_as_library_model(tmp_path: Path) -> None:
@@ -142,7 +224,6 @@ def test_monitor_api_registers_cloud_deployment_as_library_model(tmp_path: Path)
                 json={
                     "host_id": "8x4090-server",
                     "deployment_id": "act-large",
-                    "gpu_uuid": "GPU-test",
                     "name": "Remote ACT",
                 },
             )
@@ -150,7 +231,8 @@ def test_monitor_api_registers_cloud_deployment_as_library_model(tmp_path: Path)
             row = response.json()
             assert row["source"] == "cloud" and row["playable"] is True
             listed = client.get("/api/models").json()
-            assert listed[0]["path"] == CloudTarget("8x4090-server", "act-large", "GPU-test").uri
+            assert listed[0]["path"] == CloudTarget("8x4090-server", "act-large").uri
+            assert "cloud_gpu_uuid" not in listed[0]
             assert listed[0]["residency"]["state"] == "unloaded"
             deleted = client.delete("/api/library", params={"kind": "model", "id": row["id"]})
             assert deleted.status_code == 200, deleted.text
@@ -159,7 +241,7 @@ def test_monitor_api_registers_cloud_deployment_as_library_model(tmp_path: Path)
         real_cloud.close()
 
 
-def test_monitor_api_rejects_gpu_owned_by_another_process(tmp_path: Path) -> None:
+def test_monitor_api_selects_gpu_when_loading_cloud_model(tmp_path: Path) -> None:
     app = create_app(
         MonitorConfig(
             store_path=tmp_path / "store.json",
@@ -170,9 +252,6 @@ def test_monitor_api_rejects_gpu_owned_by_another_process(tmp_path: Path) -> Non
     )
     real_cloud = app.state.hub.cloud
     cloud = FakeAppCloud()
-    catalog = cloud.connect("8x4090-server")
-    catalog["gpus"][0]["busy"] = True
-    cloud.connect = MagicMock(return_value=catalog)  # type: ignore[method-assign]
     app.state.hub.cloud = cloud
     app.state.hub.start = MagicMock()
     app.state.hub.stop = MagicMock()
@@ -183,10 +262,15 @@ def test_monitor_api_rejects_gpu_owned_by_another_process(tmp_path: Path) -> Non
                 json={
                     "host_id": "8x4090-server",
                     "deployment_id": "act-large",
-                    "gpu_uuid": "GPU-test",
                 },
             )
-            assert response.status_code == 400
-            assert "already in use" in response.json()["detail"]
+            assert response.status_code == 200, response.text
+            model_id = response.json()["id"]
+            missing_gpu = client.post(f"/api/models/{model_id}/load", json={})
+            assert missing_gpu.status_code == 400
+            loaded = client.post(f"/api/models/{model_id}/load", json={"device": "GPU-test"})
+            assert loaded.status_code == 202, loaded.text
+            assert cloud.loaded_gpu == "GPU-test"
+            assert loaded.json()["residency"]["instances"][0]["device"] == "GPU-test"
     finally:
         real_cloud.close()

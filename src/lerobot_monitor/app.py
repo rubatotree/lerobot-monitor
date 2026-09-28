@@ -269,7 +269,6 @@ class ModelRegisterBody(BaseModel):
 class CloudModelRegisterBody(BaseModel):
     host_id: str = Field(min_length=1, max_length=128)
     deployment_id: str = Field(min_length=1, max_length=128)
-    gpu_uuid: str = Field(min_length=1, max_length=128)
     name: str = Field(default="", max_length=200)
 
 
@@ -1654,25 +1653,12 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             )
             if deployment is None:
                 raise ValueError("cloud deployment does not exist")
-            gpu = next(
-                (row for row in catalog["gpus"] if str(row.get("uuid")) == body.gpu_uuid),
-                None,
-            )
-            if gpu is None or gpu.get("healthy") is False:
-                raise ValueError("selected cloud GPU is unavailable")
-            deployment_owns_gpu = (
-                deployment.get("status") == "loaded"
-                and str(deployment.get("gpu_uuid") or "") == body.gpu_uuid
-            )
-            if gpu.get("busy") and not deployment_owns_gpu:
-                raise ValueError("selected cloud GPU is already in use")
-            target = CloudTarget(body.host_id, body.deployment_id, body.gpu_uuid)
+            target = CloudTarget(body.host_id, body.deployment_id)
             return await asyncio.to_thread(
                 hub.model_registry.register_cloud,
                 path=target.uri,
                 host_id=body.host_id,
                 deployment=deployment,
-                gpu_uuid=body.gpu_uuid,
                 name=body.name,
             )
         except (CloudRequestError, KeyError, ValueError, ModelHubError, RuntimeError) as exc:
@@ -1689,7 +1675,10 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
         try:
             target = parse_cloud_uri(path)
             if target is not None:
-                await asyncio.to_thread(hub.cloud.ensure_loaded, target)
+                gpu_uuid = str(body.device or "").strip()
+                if not gpu_uuid:
+                    raise HTTPException(400, "choose a cloud GPU before loading this model")
+                await asyncio.to_thread(hub.cloud.ensure_loaded, target, gpu_uuid=gpu_uuid)
                 return {
                     "ok": True,
                     "accepted": True,

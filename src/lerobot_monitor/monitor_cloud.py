@@ -24,14 +24,12 @@ from .policy import ActionChunk, LoadedPolicy
 class CloudTarget:
     host_id: str
     deployment_id: str
-    gpu_uuid: str
+    gpu_uuid: str = ""
 
     @property
     def uri(self) -> str:
-        return (
-            f"cloud://{quote(self.host_id, safe='')}/{quote(self.deployment_id, safe='')}"
-            f"?gpu={quote(self.gpu_uuid, safe='')}"
-        )
+        base = f"cloud://{quote(self.host_id, safe='')}/{quote(self.deployment_id, safe='')}"
+        return f"{base}?gpu={quote(self.gpu_uuid, safe='')}" if self.gpu_uuid else base
 
 
 @dataclass(frozen=True)
@@ -60,7 +58,7 @@ def parse_cloud_uri(value: str) -> CloudTarget | None:
     host_id = unquote(parsed.netloc).strip()
     deployment_id = unquote(parsed.path.lstrip("/")).strip()
     gpu_uuid = unquote((parse_qs(parsed.query).get("gpu") or [""])[0]).strip()
-    if not host_id or not deployment_id or not gpu_uuid or "/" in deployment_id:
+    if not host_id or not deployment_id or "/" in deployment_id:
         raise ValueError("invalid cloud model address")
     return CloudTarget(host_id, deployment_id, gpu_uuid)
 
@@ -326,14 +324,14 @@ class MonitorCloudClient:
         with self._lock:
             row = dict(self._deployments.get(key) or {})
             active = self._active_sessions.get(key, 0)
-        loaded = row.get("status") == "loaded" and row.get("gpu_uuid") == target.gpu_uuid
+        loaded = row.get("status") == "loaded" and bool(row.get("gpu_uuid"))
         state = "in_use" if active else "ready" if loaded else "unloaded"
         instances = []
         if loaded:
             instances.append(
                 {
                     "id": f"cloud:{target.host_id}:{target.deployment_id}",
-                    "device": target.gpu_uuid,
+                    "device": str(row.get("gpu_uuid")),
                     "state": state,
                     "gpu_bytes": 0,
                     "can_unload": not active,
@@ -352,19 +350,28 @@ class MonitorCloudClient:
             "source_paths": [uri],
         }
 
-    def ensure_loaded(self, target: CloudTarget, *, timeout: float = 900) -> dict[str, Any]:
+    def ensure_loaded(
+        self,
+        target: CloudTarget,
+        *,
+        gpu_uuid: str | None = None,
+        timeout: float = 900,
+    ) -> dict[str, Any]:
         row = self.deployment(target)
         if row.get("status") == "loaded":
-            if row.get("gpu_uuid") != target.gpu_uuid:
+            if gpu_uuid and row.get("gpu_uuid") != gpu_uuid:
                 raise CloudRequestError("cloud deployment is loaded on a different GPU")
             return row
         if row.get("status") not in {"ready", "error"}:
             raise CloudRequestError(f"cloud deployment is not ready ({row.get('status')})")
+        selected_gpu = str(gpu_uuid or "").strip()
+        if not selected_gpu:
+            raise CloudRequestError("choose a cloud GPU before loading this model")
         job = self.request(
             target.host_id,
             "POST",
             f"/api/v1/deployments/{quote(target.deployment_id, safe='')}/load",
-            json={"gpu_uuid": target.gpu_uuid, "device": "cuda"},
+            json={"gpu_uuid": selected_gpu, "device": "cuda"},
             timeout=30,
         )
         job_id = str(job["job_id"])
@@ -413,7 +420,14 @@ class MonitorCloudClient:
         state_keys: list[str],
         overrides: Mapping[str, str],
     ) -> RemoteSession:
-        self.ensure_loaded(target)
+        row = self.ensure_loaded(target)
+        runtime_target = CloudTarget(
+            target.host_id,
+            target.deployment_id,
+            str(row.get("gpu_uuid") or ""),
+        )
+        if not runtime_target.gpu_uuid:
+            raise CloudRequestError("cloud deployment does not report its loaded GPU")
         allowed_policy = {
             "policy.n_action_steps",
             "policy.num_steps",
@@ -426,7 +440,7 @@ class MonitorCloudClient:
             for key, value in overrides.items()
             if key in allowed_policy or (mode == "rtc_chunk" and str(key).startswith("inference.rtc."))
         }
-        return RemoteSession(self, target, mode, task, state_keys, safe_overrides)
+        return RemoteSession(self, runtime_target, mode, task, state_keys, safe_overrides)
 
     def load_policy(
         self,

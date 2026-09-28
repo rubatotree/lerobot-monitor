@@ -801,3 +801,11 @@
 - 8x4090-server 实测：ACT Debug 返回 4×6、Sync 返回 1×6；SmolVLA RTC 生成 50 个六关节动作。完整 Monitor API、ControlLoop、虚拟 follower 跨层测试通过；浏览器完成 ACT 云模型登记。输入为零状态和黑色图像，未连接实体机械臂。
 - 当前 LeRobot runtime wheel 来自 `e5315df2`，SHA256 `ae5a3dbb2f67298ee1953319b7805603047c4ee680817245bd23cef413b29803`，ACT／SmolVLA 独立 runtime 安装成功。8A6000-server 未连接、未安装、未测试。
 - 最终受影响回归 **231 passed、2 skipped、1 deselected**；云端与兼容性定向 **38 passed**，Python／JavaScript 语法和差异检查通过。未运行的录制用例需要本地轻量环境未安装的 `huggingface_hub`，与远端推理路径无关。
+
+### 云模型常驻登记与按次选择 GPU
+
+- 根据用户反馈，将 GPU 从云模型持久身份移到 Load 请求。新增模型只保存主机和部署；Unload 后条目保留，下次 Load 可换卡。
+- Models 添加窗口不再要求 GPU。模型卡 Load 会刷新 8x4090-server 的实时 GPU 列表，显示主要占用用户／程序／显存，禁用忙卡，并提交所选 GPU UUID。
+- 旧 `cloud://...?...gpu=` 地址仍可解析；模型注册表启动时保留原模型 ID，自动清除旧 GPU 字段并写成稳定地址。
+- 浏览器验收确认添加窗口仅选择主机／部署，模型卡 Load 才显示实时 GPU；GPU 5 空闲，其余忙卡显示占用者并禁用。ACT 在 GPU 5 的真实 Load 成功，随后 Unload 成功，模型条目与稳定地址继续保留；未执行推理或机械臂动作。
+- 最终受影响回归 **233 passed、2 skipped、1 deselected**；定向云模型身份、迁移与 Load 选择测试 **12 passed**，Python／JavaScript 语法和差异检查通过。

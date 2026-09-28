@@ -79,16 +79,26 @@ These APIs are exposed through the local manager's authenticated backend proxy a
 
 ## Monitor integration
 
-Monitor stores a cloud model as `cloud://<host>/<deployment>?gpu=<uuid>`. The model remains selectable in the existing Debug and Rollout panels and has the same load, unload and residency controls as a local model. The Models add dialog can connect an SSH host, select a deployment, and bind it to a currently available GPU.
+Monitor stores a cloud model as `cloud://<host>/<deployment>`. This stable identity does not contain a GPU binding, so the entry remains in the model library after unloads, server reconnects and GPU changes. The Models add dialog connects an SSH host and selects a deployment. Clicking the model card's Load button refreshes the GPU list and asks which available GPU should receive that load. Unload releases the remote GPU memory without removing the library entry.
 
 The cloud catalog API is backend-only:
 
 - `GET /api/cloud/hosts`: configured SSH hosts without credentials or tokens.
 - `POST /api/cloud/hosts/{id}/connect`: opens or reuses the SSH tunnel and returns deployments plus current GPU ownership.
 - `GET /api/cloud/hosts/{id}/catalog`: refreshes the connected catalog.
-- `POST /api/models/cloud`: registers `{host_id, deployment_id, gpu_uuid, name?}` in the normal model library.
+- `POST /api/models/cloud`: registers `{host_id, deployment_id, name?}` in the normal model library.
+- `POST /api/models/{id}/load`: for a cloud model, `device` must be the selected GPU UUID.
 
-GPU rows include the compute processes reported by `nvidia-smi`, their Linux users resolved through `/proc/<pid>/status`, executable names and per-process GPU memory. The UI shows the leading owner/program and disables a busy GPU unless it already belongs to the selected deployment. A single faulty GPU query does not hide healthy rows.
+GPU rows include the compute processes reported by `nvidia-smi`, their Linux users resolved through `/proc/<pid>/status`, executable names and per-process GPU memory. The Load dialog shows the leading owner/program and disables a busy GPU unless it already belongs to the loaded deployment. A single faulty GPU query does not hide healthy rows. Stored addresses from the earlier `?gpu=<uuid>` format remain readable and migrate automatically to the stable address when Monitor opens its model registry.
+
+### Add and load from Monitor
+
+1. Open **Library → Models** and choose **Add model**.
+2. Set **Source** to **Cloud deployment**.
+3. Select `8x4090-server`, choose **Connect and refresh**, then select the deployment.
+4. Choose **Add cloud model**. No GPU is selected at this stage.
+5. On the new model card, choose **Load**, review current owners and memory, select an available GPU, and choose **Load on selected GPU**.
+6. Use the model from Debug or Rollout. Choose **Unload** when finished; the card stays in the library for the next load.
 
 ## Validation evidence
 

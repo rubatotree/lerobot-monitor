@@ -8933,7 +8933,10 @@ function modelResidencyCanAct(model, action, instanceId = null) {
   const status = modelResidencyOrEmpty(model);
   const scope = instanceId == null ? status : (status.instances || []).find(item => item.id === instanceId);
   if (!scope || modelResidencyRequests.has(modelResidencyKey(model))) return false;
-  if (action === "load") return !!model.path && !!model.playable && ["unloaded", "ready", "error", "cancelled"].includes(status.state);
+  if (action === "load") {
+    const states = model.source === "cloud" ? ["unloaded", "error", "cancelled"] : ["unloaded", "ready", "error", "cancelled"];
+    return !!model.path && !!model.playable && states.includes(status.state);
+  }
   if (action === "cancel-load") return scope.can_cancel_load === true;
   if (action === "release") return scope.can_release === true;
   if (action === "unload") return typeof scope.can_unload === "boolean"
@@ -8950,7 +8953,7 @@ function refreshModelResidencyCards(model) {
   });
 }
 
-async function runModelResidencyAction(model, action, instanceId = null) {
+async function runModelResidencyAction(model, action, instanceId = null, extraBody = {}) {
   const current = modelsCache.find(item => String(item.id) === String(model.id));
   if (!current || !modelResidencyCanAct(current, action, instanceId)) return;
   const key = modelResidencyKey(current);
@@ -8959,7 +8962,7 @@ async function runModelResidencyAction(model, action, instanceId = null) {
   modelResidencyMessages.delete(key);
   refreshModelResidencyCards(current);
   try {
-    const body = instanceId == null ? {} : { instance_id: instanceId };
+    const body = { ...extraBody, ...(instanceId == null ? {} : { instance_id: instanceId }) };
     const result = await api(`/api/models/${encodeURIComponent(current.id)}/${action}`, body);
     if (result?.ok === false) throw new Error(result.error || "Model request was not accepted");
     let residency = result?.residency;
@@ -8982,9 +8985,11 @@ async function runModelResidencyAction(model, action, instanceId = null) {
         "cancel-load": "Load cancellation requested", release: "Owning task stop requested; model stays loaded" }[action];
       localLog(`${label}: ${libraryDisplayName("model", current)}`);
     }
+    return true;
   } catch (error) {
     modelResidencyMessages.set(key, { text: error.message || "Model request failed", error: true });
     toastError(error);
+    return false;
   } finally {
     modelResidencyRequests.delete(key);
     refreshModelResidencyCards(current);
@@ -9014,6 +9019,10 @@ function modelResidencyActionButton(model, action, scope, instanceId = null) {
     release: "Stop the rollout or debug task using this model. Keep weights loaded; Unload frees memory." }[action];
   button.addEventListener("click", event => {
     event.stopPropagation();
+    if (action === "load" && model.source === "cloud") {
+      openCloudLoadModal(model);
+      return;
+    }
     runModelResidencyAction(model, action, instanceId);
   });
   return button;
@@ -9466,6 +9475,78 @@ function modalField(labelText, input) {
   return label;
 }
 
+function openCloudLoadModal(model) {
+  openLibraryModal(`Load ${libraryDisplayName("model", model)}`, (body) => {
+    const intro = document.createElement("p");
+    intro.className = "muted";
+    intro.textContent = "Choose the GPU for this load. Unload releases GPU memory while the model stays in the library.";
+    const gpu = document.createElement("select");
+    gpu.setAttribute("aria-label", "Cloud GPU");
+    const refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.className = "ghost";
+    refresh.textContent = "Refresh GPUs";
+    const actions = document.createElement("div");
+    actions.className = "library-modal-actions";
+    const load = document.createElement("button");
+    load.type = "button";
+    load.textContent = "Load on selected GPU";
+    actions.appendChild(load);
+    body.append(intro, modalField("GPU", gpu), refresh, actions);
+
+    const loadCatalog = async () => {
+      const hostId = String(model.cloud_host_id || "");
+      const deploymentId = String(model.cloud_deployment_id || "");
+      if (!hostId || !deploymentId) {
+        libraryModalStatus(body, "This cloud model is missing its host or deployment identity.", true);
+        load.disabled = true;
+        return;
+      }
+      refresh.disabled = true;
+      load.disabled = true;
+      libraryModalStatus(body, "Refreshing cloud GPU availability…");
+      try {
+        const catalog = await api(`/api/cloud/hosts/${encodeURIComponent(hostId)}/connect`, {});
+        const deployment = (catalog.deployments || []).find(row => String(row.id) === deploymentId);
+        gpu.innerHTML = "";
+        (catalog.gpus || []).filter(row => row.healthy !== false && !row.error).forEach(row => {
+          const option = document.createElement("option");
+          option.value = row.uuid;
+          const owner = row.primary_user && row.primary_program ? ` · ${row.primary_user}/${row.primary_program}` : "";
+          option.textContent = `GPU ${row.index} · ${((Number(row.memory_used_mb || 0)) / 1024).toFixed(1)} GiB used${owner}`;
+          option.disabled = !!row.busy && !(deployment?.status === "loaded" && deployment.gpu_uuid === row.uuid);
+          gpu.appendChild(option);
+        });
+        const available = [...gpu.options].filter(option => !option.disabled).length;
+        load.disabled = available === 0;
+        libraryModalStatus(body, available ? `${available} GPU(s) available` : "No GPU is currently available", available === 0);
+      } catch (error) {
+        libraryModalStatus(body, error.message || String(error), true);
+      } finally {
+        refresh.disabled = false;
+      }
+    };
+
+    refresh.addEventListener("click", loadCatalog);
+    load.addEventListener("click", async () => {
+      if (!gpu.value) {
+        libraryModalStatus(body, "Choose an available GPU first", true);
+        return;
+      }
+      load.disabled = true;
+      refresh.disabled = true;
+      libraryModalStatus(body, `Loading on ${gpu.selectedOptions[0]?.textContent || gpu.value}…`);
+      const ok = await runModelResidencyAction(model, "load", null, { device: gpu.value });
+      if (ok) closeLibraryModal();
+      else {
+        load.disabled = false;
+        refresh.disabled = false;
+      }
+    });
+    loadCatalog();
+  });
+}
+
 function openDownloadModal(kind) {
   const isModel = kind === "model";
   openLibraryModal(isModel ? "Add model" : "Download dataset", (body) => {
@@ -9520,8 +9601,6 @@ function openDownloadModal(kind) {
     cloudHost.setAttribute("aria-label", "Cloud host");
     const cloudDeployment = document.createElement("select");
     cloudDeployment.setAttribute("aria-label", "Cloud deployment");
-    const cloudGpu = document.createElement("select");
-    cloudGpu.setAttribute("aria-label", "Cloud GPU");
     const connectCloud = document.createElement("button");
     connectCloud.type = "button";
     connectCloud.className = "ghost";
@@ -9529,7 +9608,6 @@ function openDownloadModal(kind) {
     cloudPanel.append(
       modalField("SSH host", cloudHost),
       modalField("Deployment", cloudDeployment),
-      modalField("GPU", cloudGpu),
       connectCloud,
     );
     const actions = document.createElement("div");
@@ -9539,29 +9617,12 @@ function openDownloadModal(kind) {
     submit.textContent = isModel ? "Add model" : "Download";
     actions.appendChild(submit);
     body.append(search, results, grid, cloudPanel, actions);
-    let cloudCatalog = null;
-
-    const renderCloudGpus = () => {
-      cloudGpu.innerHTML = "";
-      (cloudCatalog?.gpus || []).filter(row => row.healthy !== false && !row.error).forEach(row => {
-        const option = document.createElement("option");
-        option.value = row.uuid;
-        const owner = row.primary_user && row.primary_program ? ` · ${row.primary_user}/${row.primary_program}` : "";
-        option.textContent = `GPU ${row.index} · ${((Number(row.memory_used_mb || 0))/1024).toFixed(1)} GiB used${owner}`;
-        option.disabled = !!row.busy && !(cloudCatalog?.deployments || []).some(
-          model => model.id === cloudDeployment.value && model.status === "loaded" && model.gpu_uuid === row.uuid,
-        );
-        cloudGpu.appendChild(option);
-      });
-    };
-
     const loadCloudCatalog = async () => {
       if (!cloudHost.value) return;
       connectCloud.disabled = true;
       libraryModalStatus(body, `connecting ${cloudHost.selectedOptions[0]?.textContent || cloudHost.value}…`);
       try {
         const catalog = await api(`/api/cloud/hosts/${encodeURIComponent(cloudHost.value)}/connect`, {});
-        cloudCatalog = catalog;
         cloudDeployment.innerHTML = "";
         (catalog.deployments || []).filter(row => ["ready", "loaded", "error"].includes(row.status)).forEach(row => {
           const option = document.createElement("option");
@@ -9569,8 +9630,7 @@ function openDownloadModal(kind) {
           option.textContent = `${row.name || row.id} · ${row.status}`;
           cloudDeployment.appendChild(option);
         });
-        renderCloudGpus();
-        libraryModalStatus(body, `${cloudDeployment.options.length} deployment(s), ${cloudGpu.options.length} GPU(s)`);
+        libraryModalStatus(body, `${cloudDeployment.options.length} deployment(s) available`);
       } catch (err) {
         libraryModalStatus(body, err.message || String(err), true);
       } finally {
@@ -9588,7 +9648,6 @@ function openDownloadModal(kind) {
         });
       }).catch(() => {});
       connectCloud.addEventListener("click", loadCloudCatalog);
-      cloudDeployment.addEventListener("change", renderCloudGpus);
       sourceKind.addEventListener("change", () => {
         const cloud = sourceKind.value === "cloud";
         search.classList.toggle("hidden", cloud);
@@ -9650,13 +9709,12 @@ function openDownloadModal(kind) {
       try {
         let saved;
         if (isModel && sourceKind.value === "cloud") {
-          if (!cloudHost.value || !cloudDeployment.value || !cloudGpu.value) {
-            throw new Error("Connect a host and choose a deployment and GPU first");
+          if (!cloudHost.value || !cloudDeployment.value) {
+            throw new Error("Connect a host and choose a deployment first");
           }
           saved = await api("/api/models/cloud", {
             host_id: cloudHost.value,
             deployment_id: cloudDeployment.value,
-            gpu_uuid: cloudGpu.value,
             name: name.value.trim(),
           });
           selectedModelId = String(saved.id || "");

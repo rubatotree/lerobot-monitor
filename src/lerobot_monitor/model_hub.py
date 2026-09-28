@@ -188,6 +188,35 @@ class ModelRegistry:
     def __init__(self, store: JsonStore, roots: list[Path]) -> None:
         self.store = store
         self.roots = [Path(root) for root in roots]
+        self._migrate_cloud_bindings()
+
+    def _migrate_cloud_bindings(self) -> None:
+        """Remove the obsolete persisted GPU binding from cloud model identities."""
+        from .monitor_cloud import CloudTarget, parse_cloud_uri
+
+        for saved in self.store.models():
+            if saved.get("source") != "cloud":
+                continue
+            try:
+                target = parse_cloud_uri(str(saved.get("path") or saved.get("remote") or ""))
+            except ValueError:
+                continue
+            if target is None:
+                continue
+            canonical = CloudTarget(target.host_id, target.deployment_id).uri
+            changed = target.gpu_uuid or saved.get("cloud_gpu_uuid") or saved.get("path") != canonical
+            if not changed:
+                continue
+            entry = dict(saved)
+            entry.update(
+                path=canonical,
+                remote=canonical,
+                cloud_host_id=target.host_id,
+                cloud_deployment_id=target.deployment_id,
+                updated_utc=_utc_now(),
+            )
+            entry.pop("cloud_gpu_uuid", None)
+            self.store.put_model(entry)
 
     def list(self) -> list[dict[str, Any]]:
         scanned = list_local_models(self.roots)
@@ -246,20 +275,25 @@ class ModelRegistry:
         path: str,
         host_id: str,
         deployment: dict[str, Any],
-        gpu_uuid: str,
         name: str = "",
     ) -> dict[str, Any]:
         """Register a remote deployment without persisting credentials or endpoints."""
         from .monitor_cloud import parse_cloud_uri
 
         target = parse_cloud_uri(path)
-        if target is None or target.host_id != host_id or target.gpu_uuid != gpu_uuid:
+        if target is None or target.host_id != host_id or target.gpu_uuid:
             raise ModelHubError("invalid cloud deployment address")
         deployment_id = str(deployment.get("id") or "")
         if deployment_id != target.deployment_id:
             raise ModelHubError("cloud deployment identity mismatch")
         existing = next(
-            (entry for entry in self.store.models() if str(entry.get("path") or "") == path),
+            (
+                entry
+                for entry in self.store.models()
+                if entry.get("source") == "cloud"
+                and str(entry.get("cloud_host_id") or "") == host_id
+                and str(entry.get("cloud_deployment_id") or "") == deployment_id
+            ),
             None,
         )
         entry = dict(existing) if existing is not None else {
@@ -279,12 +313,12 @@ class ModelRegistry:
                 "revision": str(deployment.get("revision") or ""),
                 "cloud_host_id": host_id,
                 "cloud_deployment_id": deployment_id,
-                "cloud_gpu_uuid": gpu_uuid,
                 "policy_type": str(metadata.get("policy_type") or deployment.get("policy_type") or ""),
                 "cloud_metadata": metadata,
                 "updated_utc": _utc_now(),
             }
         )
+        entry.pop("cloud_gpu_uuid", None)
         return self._decorate(self.store.put_model(entry))
 
     def save(self, model_id: str, payload: dict[str, Any]) -> dict[str, Any]:

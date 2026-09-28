@@ -119,7 +119,7 @@ def test_rollout_cloud_policy_worker_uses_remote_loader(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
     cloud = MagicMock()
     loaded = LoadedPolicy(
-        path="cloud://8x4090-server/act?gpu=GPU-test",
+        path="cloud://8x4090-server/act",
         device="remote",
         task="pick",
         policy=MagicMock(),

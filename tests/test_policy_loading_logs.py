@@ -149,3 +149,33 @@ def test_loading_records_reach_ui_without_recursive_echo() -> None:
         )
     )
     assert len(received) == 3
+
+
+def test_cancelled_local_attempt_never_retries_network(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO)
+    config_module = types.ModuleType("lerobot.configs")
+    config_module.PreTrainedConfig = object
+    factory = types.ModuleType("lerobot.policies.factory")
+    factory.get_policy_class = lambda _: None
+    factory.make_pre_post_processors = lambda **kw: None
+    constants = types.ModuleType("lerobot.utils.constants")
+    constants.ACTION = "action"
+    loading = types.ModuleType("lerobot.utils.loading")
+    loading.model_load_context = lambda _: contextlib.nullcontext()
+    for module in (config_module, factory, constants, loading):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(policy, "ensure_lerobot_on_path", lambda: None)
+    monkeypatch.setattr(policy, "resolve_cached_policy_path", lambda *args: None)
+    attempts: list[str] = []
+
+    def progress(phase: str, completed: int) -> None:
+        if phase == "config":
+            attempts.append(phase)
+            raise policy.PolicyLoadCancelled("cancelled")
+
+    with pytest.raises(policy.PolicyLoadCancelled):
+        policy.load_policy("owner/model", device="cpu", progress=progress)
+    assert attempts == ["config"]
+    assert "cancelled during config" in caplog.text
+    assert "allowing Hugging Face download" not in caplog.text
+    assert "FAILED" not in caplog.text

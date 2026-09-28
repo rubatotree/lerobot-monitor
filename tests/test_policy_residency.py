@@ -512,3 +512,192 @@ def test_acquire_times_out_on_a_stopping_entry(tmp_path: Path) -> None:
         retry.release()
     finally:
         manager.close()
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_cancel_loading_wakes_waiters_and_discards_late_model(tmp_path: Path, checkpoint: bool) -> None:
+    path = _model(tmp_path / "cancel")
+    entered, finish = threading.Event(), threading.Event()
+    later: list[str] = []
+    errors: list[Exception] = []
+
+    def loader(source: str, **kwargs: Any) -> Any:
+        entered.set()
+        assert finish.wait(4)
+        if checkpoint:
+            kwargs["progress"]("processors", 2)
+            later.append("processors")
+        return _loaded(source)
+
+    manager = _manager(loader)
+    manager.request(str(path), "cpu", {})
+    assert entered.wait(2)
+
+    def acquire() -> None:
+        try:
+            manager.acquire(str(path), "cpu", {})
+        except Exception as exc:
+            errors.append(exc)
+
+    waiter = threading.Thread(target=acquire)
+    waiter.start()
+    time.sleep(0.03)
+    try:
+        assert manager.cancel_load(str(path), "stale") == 0
+        assert manager.cancel_load(str(path)) == 1
+        assert manager.status(str(path))["state"] == "cancelling"
+        assert manager.cancel_load(str(path)) == 0
+        waiter.join(1)
+        assert len(errors) == 1 and not waiter.is_alive()
+        with pytest.raises(PolicyBusyError):
+            manager.request(str(path), "cpu", {})
+        finish.set()
+        _wait_for_state(manager, path, "cancelled")
+        assert manager.ready(str(path), "cpu", {}) is None
+        assert later == []
+    finally:
+        finish.set()
+        manager.close()
+
+
+def test_queued_cancel_retry_does_not_revive_old_queue_job(tmp_path: Path) -> None:
+    first, second = _model(tmp_path / "first"), _model(tmp_path / "second")
+    entered, finish = threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def loader(source: str, **kwargs: Any) -> Any:
+        calls.append(source)
+        if source == str(first):
+            entered.set()
+            assert finish.wait(4)
+        return _loaded(source)
+
+    manager = _manager(loader)
+    try:
+        manager.request(str(first), "cpu", {})
+        assert entered.wait(2)
+        old = manager.request(str(second), "cpu", {})
+        assert manager.cancel_load(str(second)) == 1
+        assert manager.status(str(second))["state"] == "cancelled"
+        new = manager.request(str(second), "cpu", {})
+        assert new is not old
+        finish.set()
+        _wait_for_state(manager, second, "ready")
+        assert calls == [str(first), str(second)]
+    finally:
+        finish.set()
+        manager.close()
+
+
+def test_release_before_callback_registration_remains_busy_until_owner_exits(tmp_path: Path) -> None:
+    path = _model(tmp_path / "model")
+    manager = _manager(lambda source, **kw: _loaded(source))
+    lease = manager.acquire(str(path), "cpu", {})
+    callbacks: list[bool] = []
+    try:
+        assert manager.release_owner(str(path), "stale") == 0
+        assert manager.release_owner(str(path), lease.entry.instance_id) == 1
+        assert lease.cancelled.is_set()
+        assert manager.status(str(path))["state"] == "stopping"
+        assert manager.acquire_ready(str(path), "cpu", {}) is None
+        assert manager.release_owner(str(path)) == 0
+        lease.set_stop_callback(lambda: callbacks.append(True))
+        assert callbacks == [True]
+        lease.release()
+        assert manager.status(str(path))["state"] == "ready"
+        assert manager.ready(str(path), "cpu", {}) is not None
+    finally:
+        lease.release()
+        manager.close()
+
+
+def test_release_cancels_existing_waiter_without_reacquiring(tmp_path: Path) -> None:
+    path = _model(tmp_path / "model")
+    manager = _manager(lambda source, **kw: _loaded(source))
+    lease = manager.acquire(str(path), "cpu", {})
+    errors: list[Exception] = []
+
+    def acquire() -> None:
+        try:
+            manager.acquire(str(path), "cpu", {})
+        except Exception as exc:
+            errors.append(exc)
+
+    waiter = threading.Thread(target=acquire)
+    waiter.start()
+    time.sleep(0.03)
+    manager.release_owner(str(path))
+    lease.release()
+    waiter.join(2)
+    try:
+        assert len(errors) == 1 and not waiter.is_alive()
+        assert manager.status(str(path))["state"] == "ready"
+    finally:
+        manager.close()
+
+
+def test_cancel_finds_remote_alias_after_cache_appears(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshot = _model(tmp_path / "snapshot")
+    entered, finish = threading.Event(), threading.Event()
+    resolved: list[str] = []
+    monkeypatch.setattr(residency_module, "resolve_cached_policy_path", lambda path, *args: resolved[0] if path == "owner/model" and resolved else None)
+
+    def loader(source: str, **kwargs: Any) -> Any:
+        entered.set()
+        assert finish.wait(4)
+        return _loaded(source)
+
+    manager = _manager(loader)
+    try:
+        entry = manager.request("owner/model", "cpu", {})
+        assert entered.wait(2)
+        resolved.append(str(snapshot))
+        assert manager.status("owner/model")["state"] == "loading"
+        assert manager.request("owner/model", "cpu", {}) is entry
+        assert manager.status("owner/model")["source_paths"] == sorted(["owner/model", str(snapshot)])
+        assert manager.cancel_load("owner/model", entry.instance_id) == 1
+        with pytest.raises(PolicyBusyError):
+            manager.request("owner/model", "cpu", {})
+        finish.set()
+        _wait_for_state(manager, snapshot, "cancelled")
+    finally:
+        finish.set()
+        manager.close()
+
+
+def test_release_during_request_log_cancels_original_acquire(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _model(tmp_path / "model")
+    manager = _manager(lambda source, **kw: _loaded(source))
+    lease = manager.acquire(str(path), "cpu", {})
+    entered, resume = threading.Event(), threading.Event()
+    errors: list[Exception] = []
+    original = residency_module.logger.info
+
+    def log(message: str, *args: Any, **kwargs: Any) -> None:
+        if threading.current_thread().name == "waiting-owner":
+            entered.set()
+            assert resume.wait(3)
+        original(message, *args, **kwargs)
+
+    monkeypatch.setattr(residency_module.logger, "info", log)
+
+    def acquire() -> None:
+        try:
+            manager.acquire(str(path), "cpu", {})
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=acquire, name="waiting-owner")
+    worker.start()
+    try:
+        assert entered.wait(2)
+        assert manager.release_owner(str(path)) == 1
+        lease.release()
+        resume.set()
+        worker.join(2)
+        assert len(errors) == 1 and not worker.is_alive()
+        assert manager.status(str(path))["state"] == "ready"
+    finally:
+        resume.set()
+        lease.release()
+        manager.close()

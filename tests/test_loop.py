@@ -1587,3 +1587,80 @@ def test_snapshot_reports_slew_motion_lock(tmp_path: Path) -> None:
 
     loop._live_control = True
     assert loop.snapshot()["motion_locked"] is False
+
+
+@pytest.mark.parametrize("during_compute", [False, True])
+def test_model_release_keeps_debug_busy_until_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, during_compute: bool) -> None:
+    loop = _loop(tmp_path)
+    bundle = SimpleNamespace(path="model", policy=None, preprocessor=None, postprocessor=None, task="")
+    loop.policy_residency.loader = lambda *args, **kwargs: bundle
+    loop._debug_lease_token = "debug"
+    monkeypatch.setattr(loop_module, "apply_requested_overrides", lambda *args: None)
+    entered, finish = threading.Event(), threading.Event()
+    errors: list[Exception] = []
+    calls: list[bool] = []
+
+    def predict(*args: object) -> object:
+        calls.append(True)
+        entered.set()
+        assert finish.wait(4)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(loop_module, "predict_action_chunk", predict)
+    if not during_compute:
+        loop_module._POLICY_INFER_LOCK.acquire()
+
+    def infer() -> None:
+        try:
+            loop.infer_action_chunk(path="model", task="task", device="cpu", extra={}, joints={}, images_rgb={}, chunk_size=1, debug_token="debug")
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=infer)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not loop.policy_residency.has_active_inference() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if during_compute:
+            assert entered.wait(2)
+        assert loop.policy_residency.release_owner("model") == 1
+        assert loop.policy_residency.status("model")["state"] == "stopping"
+        assert loop._debug_lease_token == "debug"
+        assert loop.policy_residency.acquire_ready("model", "cpu", {}) is None
+    finally:
+        finish.set()
+        if not during_compute:
+            loop_module._POLICY_INFER_LOCK.release()
+        worker.join(3)
+        loop.policy_residency.close()
+    assert len(errors) == 1
+    assert len(calls) == int(during_compute)
+
+
+def test_delayed_model_release_command_does_not_stop_new_owner(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    old, current = object(), object()
+    loop._active_policy_lease = current
+    loop.mode = "rollout"
+    loop._end_rollout = MagicMock()
+    loop._handle(Command("policy_owner_release", {"lease": old}, None))
+    loop._end_rollout.assert_not_called()
+    assert loop.mode == "rollout"
+    loop._active_policy_lease = None
+
+
+def test_model_release_stops_matching_rollout_and_retains_resident(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.policy_residency.loader = lambda *args, **kwargs: SimpleNamespace(policy=None, preprocessor=None, postprocessor=None)
+    lease = loop.policy_residency.acquire("model", "cpu", {})
+    loop._active_policy_lease = lease
+    loop.loaded_policy = lease.loaded
+    loop.mode = "rollout"
+    lease.set_stop_callback(lambda: loop.submit_nowait("policy_owner_release", {"lease": lease}))
+    assert loop.policy_residency.release_owner("other") == 0
+    assert loop.policy_residency.release_owner("model") == 1
+    loop._drain_commands()
+    assert loop.mode == "idle" and loop.loaded_policy is None
+    assert loop.policy_residency.status("model")["state"] == "ready"
+    loop.policy_residency.close()

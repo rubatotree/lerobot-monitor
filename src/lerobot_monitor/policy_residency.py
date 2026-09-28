@@ -16,6 +16,7 @@ from typing import Any
 
 from .policy import (
     LoadedPolicy,
+    PolicyLoadCancelled,
     resolve_cached_policy_path,
 )
 
@@ -158,12 +159,19 @@ class _Entry:
     busy: bool = False
     retired: threading.Event | None = None
     invalidated: bool = False
+    owner: PolicyLease | None = None
+    release_generation: int = 0
     condition: threading.Condition = field(default_factory=threading.Condition)
     requested_at: float = field(default_factory=time.monotonic)
     load_ms: float | None = None
     load_started_at: float | None = None
     phase_started_at: float | None = None
     stage_durations_ms: dict[str, float] = field(default_factory=dict)
+
+
+def _matches_source(entry: _Entry, source: str) -> bool:
+    # A remote repository can resolve to a snapshot midway through its first load.
+    return entry.key[0] == source or _canonical_source(entry.source_path) == source
 
 
 class PolicyLease:
@@ -174,6 +182,24 @@ class PolicyLease:
         self.cache_hit = cache_hit
         self._released = False
         self._release_lock = threading.Lock()
+        self.cancelled = threading.Event()
+        self._stop_owner: Callable[[], None] | None = None
+        entry.owner = self
+
+    def set_stop_callback(self, callback: Callable[[], None]) -> None:
+        """Publish a cooperative stop action while this exact lease owns the instance."""
+        with self.owner._lock:
+            if self.entry.owner is self and not self._released:
+                self._stop_owner = callback
+                cancelled = self.cancelled.is_set()
+            else:
+                cancelled = False
+        if cancelled:
+            callback()
+
+    def check_cancelled(self) -> None:
+        if self.cancelled.is_set():
+            raise PolicyLoadCancelled("model inference was released")
 
     def release(self) -> None:
         with self._release_lock:
@@ -219,6 +245,9 @@ class PolicyResidencyManager:
         return policy_identity(path, device, extra, robot_type=self.robot_type, rename_map=self.rename_map)
 
     def request(self, path: str, device: str, extra: dict[str, str]) -> _Entry:
+        return self._request_ticket(path, device, extra)[0]
+
+    def _request_ticket(self, path: str, device: str, extra: dict[str, str]) -> tuple[_Entry, int]:
         key = self.identity(path, device, extra)
         queued = False
         with self._lock:
@@ -227,10 +256,19 @@ class PolicyResidencyManager:
             if key[0] in self._blocked_sources:
                 raise PolicyBusyError("model weights are being updated or deleted")
             entry = self._entries.get(key)
+            if entry is None:
+                entry = next((
+                    item for item in self._entries.values()
+                    if item.state in {"queued", "loading", "cancelling"}
+                    and item.key[1] == key[1] and item.key[3:] == key[3:]
+                    and _matches_source(item, str(key[0]))
+                ), None)
+            if entry is not None and entry.state == "cancelled":
+                entry = None
             if entry is not None:
-                if entry.state == "unloading":
+                if entry.state in {"unloading", "cancelling"}:
                     raise PolicyBusyError(
-                        "model instance is unloading; retry loading after it is released"
+                        "model instance is cleaning up; retry loading after it is released"
                     )
                 if entry.state == "error":
                     entry.state, entry.phase, entry.error = "queued", "queued", ""
@@ -248,6 +286,7 @@ class PolicyResidencyManager:
                 self._jobs.put(entry)
                 self._changed()
             state, instance_id = entry.state, entry.instance_id
+            release_generation = entry.release_generation
         # Handlers can inspect status or deliver UI messages; never call them under the state lock.
         logger.info(
             "model instance [%s] %s: source=%s resolved=%s device=%s state=%s",
@@ -258,7 +297,7 @@ class PolicyResidencyManager:
             device,
             state,
         )
-        return entry
+        return entry, release_generation
 
     def acquire_ready(
         self, path: str, device: str, extra: dict[str, str]
@@ -305,8 +344,9 @@ class PolicyResidencyManager:
         extra: dict[str, str],
         *,
         timeout: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> PolicyLease:
-        entry = self.request(path, device, extra)
+        entry, release_generation = self._request_ticket(path, device, extra)
         # Only a lease that is waiting for a previous owner to let go is bounded: a cold
         # load is a legitimate multi-minute wait, while a thread that will not exit is
         # something the caller must be told about instead of hanging on `pending` forever.
@@ -316,8 +356,8 @@ class PolicyResidencyManager:
             cache_hit = entry.state in {"ready", "stopping"}
         while True:
             with self._lock:
-                if self._closed or entry.invalidated:
-                    raise RuntimeError("policy load was invalidated")
+                if self._closed or entry.invalidated or entry.release_generation != release_generation or (cancel_event is not None and cancel_event.is_set()):
+                    raise PolicyLoadCancelled("policy load was cancelled or invalidated")
                 if entry.state == "error":
                     raise RuntimeError(entry.error)
                 if (
@@ -368,6 +408,7 @@ class PolicyResidencyManager:
     def _release(self, entry: _Entry) -> None:
         with self._lock:
             entry.busy = False
+            entry.owner = None
             entry.retired = None
             if entry.state == "stopping":
                 entry.state = "ready"
@@ -406,8 +447,8 @@ class PolicyResidencyManager:
             def progress(phase: str, completed: int, target: _Entry = entry) -> None:
                 previous: tuple[str, float] | None = None
                 with self._lock:
-                    if target.invalidated:
-                        return
+                    if target.invalidated or self._closed:
+                        raise PolicyLoadCancelled("model loading was cancelled")
                     now = time.perf_counter()
                     if target.phase_started_at is not None:
                         elapsed = (now - target.phase_started_at) * 1000.0
@@ -439,7 +480,7 @@ class PolicyResidencyManager:
             try:
                 with _COLD_LOAD_LOCK:
                     if entry.invalidated or self._closed:
-                        continue
+                        raise PolicyLoadCancelled("model loading was cancelled")
                     loaded = self.loader(
                         entry.source_path,
                         device=entry.device,
@@ -455,6 +496,9 @@ class PolicyResidencyManager:
                 resolved_key = self.identity(
                     entry.source_path, entry.device, entry.extra
                 )
+            except PolicyLoadCancelled:
+                logger.info("model instance [%s] load cancelled", entry.instance_id)
+                failed = True
             except Exception as exc:  # noqa: BLE001 - failures belong to one entry
                 failure_phase = entry.phase
                 failure_elapsed = 0.0
@@ -488,6 +532,7 @@ class PolicyResidencyManager:
                 # otherwise keep a partially constructed CUDA model alive.
                 gc.collect()
                 self._empty_cuda_cache()
+                self._finish_cancel(entry)
                 continue
             stored = False
             with self._lock:
@@ -529,15 +574,73 @@ class PolicyResidencyManager:
                 # in the allocator after dropping the late result.
                 gc.collect()
                 self._empty_cuda_cache()
+                self._finish_cancel(entry)
+
+    def _finish_cancel(self, entry: _Entry) -> None:
+        with self._lock:
+            if entry.state == "cancelling":
+                entry.state, entry.phase = "cancelled", "cancelled"
+                self._changed()
+        with entry.condition:
+            entry.condition.notify_all()
+
+    def cancel_load(self, path: str, instance_id: str | None = None) -> int:
+        """Invalidate selected requests; an in-flight native operation finishes safely."""
+        source = _canonical_source(path)
+        with self._lock:
+            entries = [
+                entry for entry in self._entries.values()
+                if _matches_source(entry, source)
+                and (instance_id is None or entry.instance_id == instance_id)
+                and entry.state in {"queued", "loading"}
+            ]
+            for entry in entries:
+                entry.invalidated = True
+                entry.state = "cancelled" if entry.state == "queued" else "cancelling"
+                entry.phase = entry.state
+            if entries:
+                self._changed()
+        for entry in entries:
+            with entry.condition:
+                entry.condition.notify_all()
+            logger.info("model instance [%s] cancellation requested", entry.instance_id)
+        return len(entries)
+
+    def release_owner(self, path: str, instance_id: str | None = None) -> int:
+        """Ask exact current owners to stop; leases remain busy until work exits."""
+        source = _canonical_source(path)
+        callbacks: list[Callable[[], None]] = []
+        entries: list[_Entry] = []
+        with self._lock:
+            for entry in self._entries.values():
+                if not _matches_source(entry, source) or (instance_id is not None and entry.instance_id != instance_id):
+                    continue
+                owner = entry.owner
+                if entry.state != "ready" or not entry.busy or owner is None:
+                    continue
+                entry.state = "stopping"
+                entry.release_generation += 1
+                owner.cancelled.set()
+                entries.append(entry)
+                if owner._stop_owner is not None:
+                    callbacks.append(owner._stop_owner)
+            if entries:
+                self._changed()
+        for entry in entries:
+            with entry.condition:
+                entry.condition.notify_all()
+        for callback in callbacks:
+            callback()
+        return len(entries)
 
     def unload(self, path: str, instance_id: str | None = None) -> int:
         source = _canonical_source(path)
         with self._lock:
             candidates = [
                 item for item in self._entries.values()
-                if item.key[0] == source and (instance_id is None or item.instance_id == instance_id)
+                if _matches_source(item, source) and (instance_id is None or item.instance_id == instance_id)
             ]
-            if any(item.busy or item.state in {"queued", "loading", "stopping"} for item in candidates):
+            if any(item.busy or item.state in {"queued", "loading", "cancelling", "stopping"} for item in candidates):
                 raise PolicyBusyError("stop the active inference or wait for model loading to finish before unloading")
             pending = [item for item in candidates if item.state != "unloading"]
             for item in pending:
@@ -555,7 +658,7 @@ class PolicyResidencyManager:
             if source in self._blocked_sources:
                 raise PolicyBusyError("model weights are already being updated or deleted")
             if any(
-                item.key[0] == source and (item.busy or item.state in {"queued", "loading", "stopping", "unloading"})
+                _matches_source(item, source) and (item.busy or item.state in {"queued", "loading", "cancelling", "stopping", "unloading"})
                 for item in self._entries.values()
             ):
                 raise PolicyBusyError("stop the active inference or wait for loading before changing model weights")
@@ -591,7 +694,7 @@ class PolicyResidencyManager:
     def status(self, path: str) -> dict[str, Any]:
         source = _canonical_source(path)
         with self._lock:
-            entries = [item for item in self._entries.values() if item.key[0] == source]
+            entries = [item for item in self._entries.values() if _matches_source(item, source)]
             unique_storages: dict[tuple[str, int, int], int] = {}
             for item in entries:
                 unique_storages.update(item.storages)
@@ -601,6 +704,8 @@ class PolicyResidencyManager:
                     "device": item.device,
                     "overrides": dict(item.extra),
                     "state": "in_use" if item.busy and item.state == "ready" else item.state,
+                    "can_cancel_load": item.state in {"queued", "loading"},
+                    "can_release": item.busy and item.state == "ready" and item.owner is not None,
                     "phase": item.phase,
                     "completed_steps": item.completed_steps,
                     "total_steps": item.total_steps,
@@ -619,14 +724,17 @@ class PolicyResidencyManager:
                 }
                 for item in entries
             ]
-        priority = ("error", "unloading", "stopping", "loading", "queued", "in_use", "ready")
+        priority = ("error", "unloading", "cancelling", "stopping", "loading", "queued", "in_use", "ready", "cancelled")
         states = {item["state"] for item in instances}
         state = next((candidate for candidate in priority if candidate in states), "unloaded")
         return {
             "state": state,
+            "source_paths": sorted({alias for item in entries for alias in (str(item.key[0]), item.source_path, _canonical_source(item.source_path))}),
             "instances": instances,
             "gpu_bytes": sum(unique_storages.values()),
-            "can_unload": bool(instances) and states <= {"ready", "error"},
+            "can_unload": bool(instances) and states <= {"ready", "error", "cancelled"},
+            "can_cancel_load": any(item["can_cancel_load"] for item in instances),
+            "can_release": any(item["can_release"] for item in instances),
         }
 
     def all_statuses(self) -> dict[str, dict[str, Any]]:

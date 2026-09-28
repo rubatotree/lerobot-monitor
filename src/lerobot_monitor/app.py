@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -1628,6 +1629,23 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             raise HTTPException(404, f"unknown resident instance '{body.instance_id}'") from exc
         return {"ok": True, "accepted": True, "instances": count}
 
+    async def change_model_activity(model_id: str, body: ModelUnloadBody, *, cancel: bool) -> dict[str, Any]:
+        row = next((item for item in await asyncio.to_thread(hub.models) if str(item.get("id")) == model_id), None)
+        if row is None:
+            raise HTTPException(404, f"unknown model '{model_id}'")
+        path = str(row.get("path") or "")
+        action = hub.policy_residency.cancel_load if cancel else hub.policy_residency.release_owner
+        count = await asyncio.to_thread(action, path, body.instance_id)
+        return {"ok": True, "count": count, "residency": hub.policy_residency.status(path)}
+
+    @router.post("/api/models/{model_id:path}/cancel-load", status_code=202)
+    async def cancel_model_load(model_id: str, body: ModelUnloadBody = ModelUnloadBody()) -> dict[str, Any]:
+        return await change_model_activity(model_id, body, cancel=True)
+
+    @router.post("/api/models/{model_id:path}/release", status_code=202)
+    async def release_model(model_id: str, body: ModelUnloadBody = ModelUnloadBody()) -> dict[str, Any]:
+        return await change_model_activity(model_id, body, cancel=False)
+
     @router.get("/api/models/search")
     async def search_models(q: str, limit: int = 20) -> list[dict[str, Any]]:
         try:
@@ -1834,29 +1852,49 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 raise HTTPException(400, f"camera '{key}' is not a decodable image")
             images_rgb[suffix] = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        lease = await asyncio.to_thread(hub.loop.acquire_debug_lease)
-        if not lease.get("ok"):
-            raise HTTPException(409, str(lease.get("error") or "model debug is unavailable"))
-        token = str(lease.get("token") or "")
         started = time.perf_counter()
+        cancelled = threading.Event()
+
+        async def infer_and_release() -> Any:
+            token = ""
+            try:
+                lease = await asyncio.to_thread(hub.loop.acquire_debug_lease)
+                if not lease.get("ok"):
+                    raise HTTPException(409, str(lease.get("error") or "model debug is unavailable"))
+                token = str(lease.get("token") or "")
+                if cancelled.is_set():
+                    raise asyncio.CancelledError()
+                return await asyncio.to_thread(
+                    hub.loop.infer_action_chunk,
+                    path=body.policy_path,
+                    task=body.task,
+                    device=str(body.device or hub.config.rollout.device),
+                    extra={str(key): str(value) for key, value in body.extra.items()},
+                    joints=body.joints,
+                    images_rgb=images_rgb,
+                    chunk_size=body.chunk_size,
+                    debug_token=token,
+                    cancel_event=cancelled,
+                )
+            finally:
+                if token:
+                    await asyncio.to_thread(hub.loop.release_debug_lease, token)
+
+        # An HTTP disconnect must not free the bus lease while native inference runs.
+        inference = asyncio.create_task(infer_and_release())
         try:
-            chunk = await asyncio.to_thread(
-                hub.loop.infer_action_chunk,
-                path=body.policy_path,
-                task=body.task,
-                device=str(body.device or hub.config.rollout.device),
-                extra={str(key): str(value) for key, value in body.extra.items()},
-                joints=body.joints,
-                images_rgb=images_rgb,
-                chunk_size=body.chunk_size,
-            )
+            chunk = await asyncio.shield(inference)
+        except asyncio.CancelledError:
+            cancelled.set()
+            # Consume any eventual cancellation exception from the detached cleanup task.
+            inference.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+            raise
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(400, f"policy inference failed: {exc}") from exc
-        finally:
-            if token:
-                await asyncio.shield(asyncio.to_thread(hub.loop.release_debug_lease, token))
         latency_ms = (time.perf_counter() - started) * 1000.0
         actions = [
             {

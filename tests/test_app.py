@@ -2016,3 +2016,87 @@ def test_static_rate_panel_contract(tmp_path: Path, monkeypatch) -> None:
     open_body = re.search(r"function openRatePanel\(.*?\n\}", script.text, re.DOTALL)
     assert open_body is not None
     assert "scrollIntoView" not in open_body.group(0)
+
+
+@pytest.mark.parametrize("during_compute", [False, True])
+def test_cancelled_debug_http_keeps_lease_until_background_cleanup(tmp_path: Path, during_compute: bool) -> None:
+    app = create_app(_debug_config(tmp_path))
+    loop = app.state.hub.loop
+    entered, finish, released = threading.Event(), threading.Event(), threading.Event()
+    calls: list[bool] = []
+
+    def acquire() -> dict[str, object]:
+        if not during_compute:
+            entered.set()
+            assert finish.wait(4)
+        return {"ok": True, "token": "debug-token"}
+
+    def infer(**kwargs: object) -> ActionChunk:
+        calls.append(True)
+        entered.set()
+        assert finish.wait(4)
+        assert kwargs["cancel_event"].is_set()
+        raise RuntimeError("cancelled")
+
+    loop.acquire_debug_lease = acquire
+    loop.infer_action_chunk = infer
+    loop.release_debug_lease = lambda token: released.set()
+    import httpx
+
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+    async def run() -> None:
+        task = asyncio.create_task(client.post("/lerobot/api/debug/infer", json={"policy_path": "model"}))
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not released.is_set()
+        finish.set()
+        assert await asyncio.to_thread(released.wait, 2)
+        await asyncio.sleep(0)
+        await client.aclose()
+
+    try:
+        asyncio.run(run())
+        assert len(calls) == int(during_compute)
+    finally:
+        finish.set()
+        app.state.hub.policy_residency.close()
+
+
+def test_model_cancel_and_release_api_are_scoped_and_return_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+    hub = app.state.hub
+    hub.models = lambda: [{"id": "owner/model", "path": "model"}]
+    entered, finish = threading.Event(), threading.Event()
+
+    def loader(path: str, **kwargs: object) -> object:
+        entered.set()
+        assert finish.wait(4)
+        return SimpleNamespace(policy=None, preprocessor=None, postprocessor=None)
+
+    hub.policy_residency.loader = loader
+    with TestClient(app) as client:
+        entry = hub.policy_residency.request("model", "cpu", {})
+        assert entered.wait(2)
+        stale = client.post("/lerobot/api/models/owner/model/cancel-load", json={"instance_id": "stale"})
+        assert stale.status_code == 202 and stale.json()["count"] == 0
+        result = client.post("/lerobot/api/models/owner/model/cancel-load", json={"instance_id": entry.instance_id})
+        assert result.status_code == 202 and result.json()["count"] == 1
+        assert result.json()["residency"]["state"] == "cancelling"
+        finish.set()
+        deadline = time.monotonic() + 2
+        while hub.policy_residency.status("model")["state"] != "cancelled" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        lease = hub.policy_residency.acquire("model", "cpu", {})
+        try:
+            result = client.post("/lerobot/api/models/owner/model/release", json={"instance_id": lease.entry.instance_id})
+            assert result.status_code == 202 and result.json()["count"] == 1
+            assert result.json()["residency"]["state"] == "stopping"
+            assert client.post("/lerobot/api/models/owner/model/release").json()["count"] == 0
+            assert client.post("/lerobot/api/models/missing/release").status_code == 404
+        finally:
+            lease.release()
+        assert hub.policy_residency.status("model")["state"] == "ready"

@@ -114,9 +114,11 @@ def test_rollout_then_debug_reuses_model_after_cache_move(
 
     monkeypatch.setattr(loop_module, "predict_action_chunk", predict)
     # Exercise the real inference/cache path without starting hardware or the bus loop.
-    hub.loop.acquire_debug_lease = MagicMock(
-        return_value={"ok": True, "token": "debug-test"}
-    )
+    def acquire_debug() -> dict[str, Any]:
+        hub.loop._debug_lease_token = "debug-test"
+        return {"ok": True, "token": "debug-test"}
+
+    hub.loop.acquire_debug_lease = MagicMock(side_effect=acquire_debug)
     hub.loop.release_debug_lease = MagicMock()
     old = (
         tmp_path / "old-hub" / snapshot.parent.parent.name / "snapshots" / snapshot.name

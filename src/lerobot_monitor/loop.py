@@ -876,19 +876,34 @@ class ControlLoop:
         joints: dict[str, float],
         images_rgb: dict[str, Any],
         chunk_size: int,
+        debug_token: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> ActionChunk:
         """Load or reuse a policy and infer without touching the follower bus."""
+        def check_request() -> None:
+            if (debug_token is not None and self._debug_lease_token != debug_token) or (cancel_event is not None and cancel_event.is_set()):
+                raise RuntimeError("model debug was cancelled")
+
+        check_request()
         wait_started = time.perf_counter()
-        lease = self.policy_residency.acquire(path, device, extra)
+        lease = self.policy_residency.acquire(path, device, extra, cancel_event=cancel_event)
+        # Cancellation discards the result but ownership lasts through the native call.
+        lease.set_stop_callback(lambda: None)
         model_wait_ms = (time.perf_counter() - wait_started) * 1000.0
         try:
+            lease.check_cancelled()
+            check_request()
             assert lease.loaded is not None
             apply_requested_overrides(lease.loaded, extra)
             lease.loaded.task = task
             with _POLICY_INFER_LOCK:
+                lease.check_cancelled()
+                check_request()
                 compute_started = time.perf_counter()
                 result = predict_action_chunk(lease.loaded, joints, images_rgb, chunk_size)
                 compute_ms = (time.perf_counter() - compute_started) * 1000.0
+            lease.check_cancelled()
+            check_request()
             result.cache_hit = lease.cache_hit
             result.model_wait_ms = model_wait_ms
             result.model_load_ms = 0.0 if lease.cache_hit else float(lease.entry.load_ms or 0.0)
@@ -938,8 +953,8 @@ class ControlLoop:
                 if generation_stale or replaced:
                     lease.release()
                     return
-            job.lease = lease
-            job.result = lease.loaded
+                job.lease = lease
+                job.result = lease.loaded
             if lease.cache_hit:
                 self.log("info", f"policy {path}: reused resident model")
             elif lease.entry.load_ms is not None:
@@ -960,6 +975,9 @@ class ControlLoop:
         base_fps, effective_fps = self.validate_rollout_rates(payload)
         self._end_rollout()
         self._active_policy_lease = lease
+        if lease is not None:
+            lease.set_stop_callback(lambda: self.submit_nowait("policy_owner_release", {"lease": lease}))
+            lease.check_cancelled()
         loaded.task = str(payload.get("task") or loaded.task)
         self.loaded_policy = loaded
         self.rollout_task = loaded.task
@@ -1776,6 +1794,7 @@ class ControlLoop:
                     "estop",
                     "task_stop",
                     "debug_lease_release",
+                    "policy_owner_release",
                 }:
                     if isinstance(token, int):
                         self.clear_pending(token)
@@ -2176,6 +2195,21 @@ class ControlLoop:
         elif kind == "estop":
             self.request_estop()
             self._reply(cmd, ok=True)
+        elif kind == "policy_owner_release":
+            lease = p.get("lease")
+            if lease is not None and self._active_policy_lease is lease:
+                self.loaded_policy = None
+                self._end_rollout()
+                self.pending = None
+                self.mode = "idle" if self.follower.connected else "offline"
+                if self.joints:
+                    self.latched = dict(self.joints)
+                self._close_writer()
+                self._touch_bus()
+                self.log("info", "rollout stopped; model remains resident")
+                self._reply(cmd, ok=True, released=True)
+            else:
+                self._reply(cmd, ok=True, released=False)
         elif kind == "task_stop":
             self._clear_live_control()
             self._clear_debug_lease()

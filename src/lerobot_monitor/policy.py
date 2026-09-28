@@ -31,6 +31,10 @@ from .types import JOINT_ORDER, observation_to_pose
 logger = logging.getLogger(__name__)
 
 
+class PolicyLoadCancelled(RuntimeError):
+    """A requested model operation was cancelled at a safe boundary."""
+
+
 @contextmanager
 def _prefer_hub_cache() -> Iterator[None]:
     """Hint newly imported Hub modules; existing imports still need local paths/options."""
@@ -301,6 +305,9 @@ def load_policy(
             progress=report,
             load_id=load_id,
         )
+    except PolicyLoadCancelled:
+        logger.info("model load [%s] cancelled during %s", load_id, current_phase)
+        raise
     except Exception:
         logger.exception(
             "model load [%s] FAILED %s after %.3fs (total %.3fs): source=%s device=%s",
@@ -484,6 +491,8 @@ def _load_policy(
     try:
         with _prefer_hub_cache():
             return _load(local_only=True)
+    except PolicyLoadCancelled:
+        raise
     except Exception as exc:
         logger.info(
             "model load [%s] local-only attempt failed during %s (%s: %s); allowing Hugging Face download for %s",

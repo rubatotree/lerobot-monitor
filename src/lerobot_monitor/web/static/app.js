@@ -8900,6 +8900,7 @@ async function deleteEpisode(kind, sourceId, index) {
 const MODEL_RESIDENCY_LABELS = {
   unloaded: "Not loaded", queued: "Queued", loading: "Loading", ready: "Ready",
   in_use: "In use", stopping: "Stopping", unloading: "Unloading", error: "Load failed",
+  cancelling: "Cancelling", cancelled: "Cancelled",
 };
 
 const MODEL_LOAD_PHASES = {
@@ -8915,9 +8916,105 @@ function modelResidencyOrEmpty(model) {
   return model.residency || { state: "unloaded", instances: [], gpu_bytes: 0, can_unload: false };
 }
 
-async function requestModelLoad(model) {
-  await api(`/api/models/${encodeURIComponent(model.id)}/load`, {});
-  localLog(`model load requested: ${libraryDisplayName("model", model)}`);
+// Requests are tracked outside card DOM because status pushes rebuild cards.
+const modelResidencyRequests = new Map();
+const modelResidencyMessages = new Map();
+const modelResidencyRevisions = new Map();
+
+function modelResidencyKey(model) { return String(model.path || model.id); }
+
+function findModelResidency(statuses, path) {
+  return statuses?.[path] || Object.values(statuses || {}).find(status => status.source_paths?.includes(path));
+}
+
+function modelResidencyCanAct(model, action, instanceId = null) {
+  const status = modelResidencyOrEmpty(model);
+  const scope = instanceId == null ? status : (status.instances || []).find(item => item.id === instanceId);
+  if (!scope || modelResidencyRequests.has(modelResidencyKey(model))) return false;
+  if (action === "load") return !!model.path && !!model.playable && ["unloaded", "ready", "error", "cancelled"].includes(status.state);
+  if (action === "cancel-load") return scope.can_cancel_load === true;
+  if (action === "release") return scope.can_release === true;
+  if (action === "unload") return typeof scope.can_unload === "boolean"
+    ? scope.can_unload : instanceId != null && ["ready", "error", "cancelled"].includes(scope.state);
+  return false;
+}
+
+function refreshModelResidencyCards(model) {
+  document.querySelectorAll("#md-list .library-item[data-model-id]").forEach(row => {
+    const current = modelsCache.find(item => String(item.id) === row.dataset.modelId);
+    if (!current || modelResidencyKey(current) !== modelResidencyKey(model)) return;
+    const host = row.querySelector(".model-residency");
+    if (host) renderModelResidency(host, current, latestStatus?.model_gpu_process || []);
+  });
+}
+
+async function runModelResidencyAction(model, action, instanceId = null) {
+  const current = modelsCache.find(item => String(item.id) === String(model.id));
+  if (!current || !modelResidencyCanAct(current, action, instanceId)) return;
+  const key = modelResidencyKey(current);
+  let revision = modelResidencyRevisions.get(key) || 0;
+  modelResidencyRequests.set(key, { action, instanceId });
+  modelResidencyMessages.delete(key);
+  refreshModelResidencyCards(current);
+  try {
+    const body = instanceId == null ? {} : { instance_id: instanceId };
+    const result = await api(`/api/models/${encodeURIComponent(current.id)}/${action}`, body);
+    if (result?.ok === false) throw new Error(result.error || "Model request was not accepted");
+    let residency = result?.residency;
+    // Existing Load/Unload responses predate residency snapshots. A read refresh
+    // reconciles those endpoints while keeping the request guard in place.
+    if (!residency) {
+      revision = modelResidencyRevisions.get(key) || 0;
+      try {
+        const status = await api("/api/status", undefined, "GET");
+        residency = findModelResidency(status?.model_residency, current.path);
+      } catch { /* The next status push reconciles an accepted request. */ }
+    }
+    if (residency && revision === (modelResidencyRevisions.get(key) || 0)) {
+      modelsCache.filter(item => modelResidencyKey(item) === key).forEach(item => { item.residency = residency; });
+    }
+    if (result?.count === 0) {
+      modelResidencyMessages.set(key, { text: "No matching operation remains. Status refreshed.", error: false });
+    } else {
+      const label = { load: "Model load requested", unload: "Model unload requested",
+        "cancel-load": "Load cancellation requested", release: "Owning task stop requested; model stays loaded" }[action];
+      localLog(`${label}: ${libraryDisplayName("model", current)}`);
+    }
+  } catch (error) {
+    modelResidencyMessages.set(key, { text: error.message || "Model request failed", error: true });
+    toastError(error);
+  } finally {
+    modelResidencyRequests.delete(key);
+    refreshModelResidencyCards(current);
+  }
+}
+
+function modelResidencyActionButton(model, action, scope, instanceId = null) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.residencyAction = instanceId == null ? action : `${action}-${instanceId}`;
+  const pending = modelResidencyRequests.get(modelResidencyKey(model));
+  const matching = pending?.action === action && (pending.instanceId == null || pending.instanceId === instanceId);
+  const state = scope.state;
+  const labels = { load: ["error", "cancelled"].includes(state) ? "Retry" : "Load",
+    unload: "Unload", "cancel-load": "Cancel load", release: "Release" };
+  const pendingState = { "cancel-load": "cancelling", release: "stopping", unload: "unloading" }[action];
+  const busy = !!(matching || (pendingState && (state === pendingState
+    || (instanceId == null && scope.instances?.some(item => item.state === pendingState)))));
+  button.textContent = busy ? { load: "Requesting…", unload: "Unloading…", "cancel-load": "Cancelling…", release: "Stopping…" }[action] : labels[action];
+  button.disabled = busy || !modelResidencyCanAct(model, action, instanceId);
+  button.setAttribute("aria-busy", String(busy));
+  const target = instanceId == null ? "model" : `${scope.device || "model"} instance`;
+  button.setAttribute("aria-label", `${button.textContent.replace("…", "")} ${target}`);
+  button.title = { load: "Load model weights into memory",
+    unload: "Free idle model weights from memory. Release an active task first.",
+    "cancel-load": "Cancel queued loading, or finish cancelling when the current loading step returns.",
+    release: "Stop the rollout or debug task using this model. Keep weights loaded; Unload frees memory." }[action];
+  button.addEventListener("click", event => {
+    event.stopPropagation();
+    runModelResidencyAction(model, action, instanceId);
+  });
+  return button;
 }
 
 function renderModelResidency(host, model, processGpu = []) {
@@ -8926,7 +9023,9 @@ function renderModelResidency(host, model, processGpu = []) {
   const processSummary = selected
     ? processGpu.map((item) => [item.device_index, Math.round(item.allocated_bytes / 1048576), Math.round(item.reserved_bytes / 1048576)])
     : [];
-  const fingerprint = JSON.stringify([status, processSummary, selected]);
+  const request = modelResidencyRequests.get(modelResidencyKey(model));
+  const actionMessage = modelResidencyMessages.get(modelResidencyKey(model));
+  const fingerprint = JSON.stringify([status, processSummary, selected, request, actionMessage]);
   if (host.dataset.fingerprint === fingerprint) return;
   const focusedAction = host.contains(document.activeElement) ? document.activeElement.dataset.residencyAction : "";
   host.dataset.fingerprint = fingerprint;
@@ -8943,41 +9042,33 @@ function renderModelResidency(host, model, processGpu = []) {
     ? `${fmtBytes(status.gpu_bytes)} GPU tensors${devices ? ` · ${devices}` : ""}`
     : (cpuResident ? "CPU RAM resident" : (devices || ""));
   memory.title = "Persistent model tensor storage; excludes temporary inference memory and CUDA context.";
-  const load = document.createElement("button");
-  load.type = "button";
-  load.dataset.residencyAction = "load";
-  load.textContent = status.state === "error" ? "Retry" : "Load";
-  load.disabled = !model.path || !model.playable;
-  load.addEventListener("click", async (event) => {
-    event.stopPropagation();
-    load.disabled = true;
-    try {
-      await requestModelLoad(model);
-    } catch (err) {
-      toastError(err);
-    } finally {
-      load.disabled = !model.path || !model.playable;
-    }
-  });
-  const unload = document.createElement("button");
-  unload.type = "button";
-  unload.dataset.residencyAction = "unload";
-  unload.textContent = "Unload";
-  unload.disabled = !status.can_unload;
-  unload.title = unload.disabled && status.instances?.length ? "Stop inference or wait for loading to finish" : "Release this model's idle instances";
-  unload.addEventListener("click", async (event) => {
-    event.stopPropagation();
-    unload.disabled = true;
-    try {
-      await api(`/api/models/${encodeURIComponent(model.id)}/unload`, {});
-    } catch (err) {
-      toastError(err);
-      unload.disabled = false;
-    }
-  });
-  line.append(badge, memory, load, unload);
+  line.append(badge, memory, modelResidencyActionButton(model, "load", status));
+  const instances = status.instances || [];
+  const cancelling = status.state === "cancelling" || instances.some(item => item.state === "cancelling");
+  const stopping = status.state === "stopping" || instances.some(item => item.state === "stopping");
+  if (status.can_cancel_load || cancelling || instances.some(item => ["queued", "loading"].includes(item.state))) {
+    line.appendChild(modelResidencyActionButton(model, "cancel-load", status));
+  }
+  if (status.can_release || stopping || instances.some(item => item.state === "in_use")) {
+    line.appendChild(modelResidencyActionButton(model, "release", status));
+  }
+  line.appendChild(modelResidencyActionButton(model, "unload", status));
   const children = [line];
-  const working = (status.instances || []).find((item) => ["loading", "queued"].includes(item.state));
+  if (cancelling || stopping || request?.action === "cancel-load" || request?.action === "release") {
+    const note = document.createElement("p");
+    note.className = "model-residency-note";
+    note.textContent = stopping || request?.action === "release"
+      ? "Stopping the owning task. Model weights stay loaded."
+      : "Cancelling load. Cleanup waits for the current loading step to finish.";
+    children.push(note);
+  }
+  if (actionMessage) {
+    const message = document.createElement("p");
+    message.className = actionMessage.error ? "model-residency-error" : "model-residency-note";
+    message.textContent = actionMessage.text;
+    children.push(message);
+  }
+  const working = instances.find(item => ["loading", "queued", "cancelling"].includes(item.state));
   if (working) {
     const progress = document.createElement("div");
     progress.className = "model-residency-progress";
@@ -8986,7 +9077,7 @@ function renderModelResidency(host, model, processGpu = []) {
     // indeterminate and report only stages that have actually completed.
     bar.setAttribute("aria-label", "Model loading in progress");
     const label = document.createElement("span");
-    label.textContent = `${MODEL_LOAD_PHASES[working.phase] || working.phase} · ${working.completed_steps}/${working.total_steps} stages`;
+    label.textContent = `${MODEL_LOAD_PHASES[working.phase] || working.phase || "Waiting"} · ${working.completed_steps ?? 0}/${working.total_steps ?? "—"} stages`;
     if (Number.isFinite(working.elapsed_ms)) {
       label.textContent += ` · ${(working.elapsed_ms / 1000).toFixed(1)}s elapsed`;
     }
@@ -9015,23 +9106,14 @@ function renderModelResidency(host, model, processGpu = []) {
       summary.textContent = `${item.device} · ${MODEL_RESIDENCY_LABELS[item.state] || item.state} · ${memoryLabel}${overrides ? ` · ${overrides}` : " · model defaults"}`;
       summary.title = summary.textContent;
       row.appendChild(summary);
-      if (item.state === "ready" || item.state === "error") {
-        const remove = document.createElement("button");
-        remove.type = "button";
-        remove.dataset.residencyAction = `unload-${item.id}`;
-        remove.textContent = "Unload";
-        remove.setAttribute("aria-label", `Unload ${item.device} instance`);
-        remove.addEventListener("click", async (event) => {
-          event.stopPropagation();
-          remove.disabled = true;
-          try {
-            await api(`/api/models/${encodeURIComponent(model.id)}/unload`, { instance_id: item.id });
-          } catch (err) {
-            toastError(err);
-            remove.disabled = false;
-          }
-        });
-        row.appendChild(remove);
+      if (item.can_cancel_load || ["queued", "loading", "cancelling"].includes(item.state)) {
+        row.appendChild(modelResidencyActionButton(model, "cancel-load", item, item.id));
+      }
+      if (item.can_release || ["in_use", "stopping"].includes(item.state)) {
+        row.appendChild(modelResidencyActionButton(model, "release", item, item.id));
+      }
+      if (["ready", "error", "cancelled", "unloading"].includes(item.state)) {
+        row.appendChild(modelResidencyActionButton(model, "unload", item, item.id));
       }
       details.appendChild(row);
     });
@@ -9043,7 +9125,10 @@ function renderModelResidency(host, model, processGpu = []) {
     children.push(details);
   }
   host.replaceChildren(...children);
-  if (focusedAction) host.querySelector(`[data-residency-action="${focusedAction}"]`)?.focus();
+  if (focusedAction) {
+    [...host.querySelectorAll("[data-residency-action]")]
+      .find(button => button.dataset.residencyAction === focusedAction && !button.disabled)?.focus({ preventScroll: true });
+  }
 }
 
 function syncModelResidency(statuses, processGpu = []) {
@@ -9052,7 +9137,9 @@ function syncModelResidency(statuses, processGpu = []) {
       .map((row) => [row.dataset.modelId, row]),
   );
   modelsCache.forEach((model) => {
-    const status = statuses[model.path] || { state: "unloaded", instances: [], gpu_bytes: 0, can_unload: false };
+    const key = modelResidencyKey(model);
+    modelResidencyRevisions.set(key, (modelResidencyRevisions.get(key) || 0) + 1);
+    const status = findModelResidency(statuses, model.path) || { state: "unloaded", instances: [], gpu_bytes: 0, can_unload: false };
     model.residency = status;
     model.metadata ||= {};
     model.metadata.gpu_memory = status.gpu_bytes ? `${(status.gpu_bytes / 1048576).toFixed(1)} MiB` : "—";

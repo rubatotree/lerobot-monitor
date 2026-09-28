@@ -3570,3 +3570,10 @@ body.dragging-row { cursor: row-resize; user-select: none; }
 
 #rollout-speed-panel { grid-template-columns: minmax(0, 1fr); }
 #rollout-speed-panel > * { grid-column: 1 / -1; }
+
+.model-residency-note { margin: 5px 0 0; color: var(--muted); font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.model-residency-badge.cancelling, .model-residency-badge.stopping { color: #e8bb75; }
+.model-residency-progress progress { flex: 0 1 56px; }
+.model-residency-progress span { flex: 1 1 100px; min-width: 0; overflow-wrap: anywhere; }
+.model-residency button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.model-residency button[aria-busy="true"] { color: var(--muted); }

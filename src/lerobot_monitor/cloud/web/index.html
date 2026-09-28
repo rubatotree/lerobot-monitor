@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Cloud Models · LeRobot</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script type="module" src="/static/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳至模型管理</a>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="LeRobot 云端模型管理首页"><span class="brand-mark" aria-hidden="true">L<span>↗</span></span><span>LeRobot <strong>Cloud Models</strong></span></a>
+    <div class="topbar-right"><span id="mode-label" class="eyebrow">模型管理</span><span class="badge neutral">独立服务</span></div>
+  </header>
+  <div class="shell">
+    <aside id="sidebar" class="sidebar" aria-label="服务器管理">
+      <div class="section-heading"><h2>服务器</h2><button id="add-host" class="icon-button" title="添加服务器" aria-label="添加服务器">+</button></div>
+      <nav id="host-list" aria-label="服务器列表"><p class="muted small">正在读取服务器…</p></nav>
+      <div class="sidebar-note"><span class="eyebrow">连接方式</span><p>使用本机 SSH 配置中的别名连接。模型、权重和运行环境保存在远端。</p><p>选择服务器后，手动连接或初始化服务。</p></div>
+    </aside>
+    <main id="main" tabindex="-1">
+      <div class="page-heading"><div><div class="eyebrow">MODEL WORKSPACE</div><h1 id="server-title">云端模型</h1><p id="server-description" class="muted">通过 SSH 管理远端模型与 GPU。</p></div><button id="refresh" class="secondary">刷新状态</button></div>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <section id="auth-panel" class="panel auth-panel" aria-labelledby="auth-title" hidden>
+        <h2 id="auth-title">连接此云端服务</h2><p class="muted">输入服务访问令牌。令牌仅保存在当前页面内存中，关闭或刷新后清除。</p>
+        <form id="auth-form" class="inline-form"><label class="grow">访问令牌<input name="token" type="password" required autocomplete="off" spellcheck="false"></label><button type="submit" class="primary">验证并连接</button></form>
+      </section>
+      <section id="host-panel" class="panel host-panel" aria-label="服务器连接" hidden></section>
+      <div id="workspace" hidden>
+        <p id="runtime-status" class="runtime-status muted small" role="status"></p>
+        <section class="panel" aria-labelledby="gpu-heading"><div class="section-heading"><div><h2 id="gpu-heading">GPU 资源</h2><p class="muted small">加载模型时明确选择一张可用 GPU。</p></div><span id="gpu-summary" class="mono muted small"></span></div><div id="gpu-list" class="gpu-grid"></div></section>
+        <section class="panel" aria-labelledby="model-heading"><div class="section-heading"><div><h2 id="model-heading">模型部署 <span id="model-count" class="count">0</span></h2><p class="muted small">下载权重后按需加载；空闲 15 分钟自动释放显存，保留磁盘权重。</p></div><button id="add-model" class="primary">+ 添加模型</button></div><div id="model-list"></div></section>
+      </div>
+      <section id="jobs-panel" class="panel" aria-labelledby="jobs-heading"><div class="section-heading"><h2 id="jobs-heading">最近任务</h2><span id="updated-at" class="muted small"></span></div><div id="job-list"><p class="empty">连接服务器后查看部署和加载任务。</p></div></section>
+      <footer>Cloud Models <span>·</span> 独立模型管理工作区 <span>·</span> 机械臂控制由本地 Monitor 管理</footer>
+    </main>
+  </div>
+  <dialog id="form-dialog" aria-labelledby="dialog-title"><form id="dialog-form"><div class="dialog-heading"><h2 id="dialog-title"></h2><button type="button" class="icon-button" data-close aria-label="关闭对话框">×</button></div><div id="dialog-body"></div><p id="dialog-error" class="error-text" role="alert" hidden></p><div class="dialog-actions"><button type="button" class="secondary" data-close>取消</button><button id="dialog-submit" type="submit" class="primary">确认</button></div></form></dialog>
+  <dialog id="log-dialog" aria-labelledby="log-title"><div class="dialog-heading"><h2 id="log-title">模型日志</h2><button id="close-logs" class="icon-button" aria-label="关闭日志">×</button></div><pre id="log-content" tabindex="0"></pre></dialog>
+</body>
+</html>

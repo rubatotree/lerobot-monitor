@@ -1110,3 +1110,27 @@ note 即时过滤。底部实时图表不再把模式切换当作数据边界：
 
 验证：lerobot 侧 rollout 测试 115 passed；lerobot-monitor 全套 324 passed、1 skipped；虚拟从臂 + 缓存 SmolVLA 的 HTTP 冒烟覆盖了被拒启动清 pending、冷加载一次后 `using cached policy` 复用、每次停止只有一条 `Stopping...`/`RTC inference thread stopped` 且无 `did not join`、引擎失败后约 4.5 秒自动退出并熄灭顶栏灯。
 未验证：超过 3 秒的单次推理下 `wait_stopped()` 的实机阻塞时长；实体机械臂上的 rollout 收尾行为。
+
+## 2026-09-28：独立云端模型服务与本地云端管理页面
+
+架构：独立云端 FastAPI 管理与推理服务、每模型独立进程；本地独立 cloud-manager 使用 SSH 隧道和现有 SSH 别名，代理管理 API 并托管同一套原生 JavaScript 管理页面。服务监听回环地址、令牌鉴权，模型与环境放独立数据目录。
+
+边界：本阶段不改动 Monitor 应用入口、模型注册表、Rollout、Debug、RTC 或相邻 LeRobot 仓库。本地 Monitor 集成明确等待用户手动确认。
+
+里程碑：
+1. [x] scope：独立工作树、架构与接口契约落盘。
+2. [x] cloud：部署、任务、GPU、驻留模型进程、推理会话与独立页面。
+3. [x] manager：SSH 探测、隔离初始化、连接与代理、本地上传和独立管理页面。
+4. [x] verify：单元与 API 测试、4090 管理与 ACT/SmolVLA 推理冒烟、页面验证；A6000 未连接、未安装、未测试。
+5. [x] review：独立审查、修复、记录测试证据与运行限制。
+6. [ ] later：等待用户手动确认后另行接入本地 Monitor。
+
+技术难点：SSH 跳板机与隧道生命周期；云端依赖及模型运行环境；服务进程所有权验证；上传路径和删除边界；令牌不出现在日志、页面和持久化主机列表中。无用户级 systemd 时采用服务自己的受控后台进程；失败如实保留任务错误，不影响已有项目。
+
+完成验证：4090 初始化及两次升级成功；完整模型运行环境安装成功。ACT 返回 select_action [1,6]、debug_chunk [8,6]；SmolVLA 返回 select_action [1,6]、debug_chunk [8,6]、RTC [50,6]，包含 guided 前缀推理。两个模型均在验证后卸载。真实上传样例通过清单/哈希校验、托管登记与删除验证，staging 和 asset 均已回收，原有外部缓存权重保留。
+
+自动验证：远端 Linux cloud + manager + smoke-harness 79 passed；既有本地完整回归 357 passed、4 skipped；UI 12 项测试与 4 个视口检查通过。原生导入缺少 datasets 的早期实测失败已修复并由上述最终成功结果覆盖。
+
+当前交付：独立分支 codex/cloud-model-manager，管理页面 http://127.0.0.1:8095，云端专用根目录 /data/zhuyutian/lerobot-monitor。运行与复测说明见 docs/cloud_models.md。
+
+剩余边界：PI profile 已实现，但没有缓存 PI checkpoint 可供本轮实测；零状态与黑色 PNG 仅验证管理和推理链路，不代表实体机械臂任务表现。实体机械臂与本地 Monitor 集成继续等待用户手动确认。

@@ -767,3 +767,28 @@
 - 新进程、关闭摄像头、临时 store 且禁止网络：未预载时启动加 config/factory 导入共 14.998 秒（3.941 + 8.748 秒）；预载后共 14.544 秒，预载 12.047 秒，加载线程重复导入 config/factory 为 3.5 / 2.1 微秒。此对比只验证预载没有把数分钟原封不动移到启动期，不等同于真实摄像头负载下的完整 A/B。
 - 真实缓存 SmolVLA 在独立 CPU 进程加载成功，禁止所有 socket connect；预载 12.267 秒，后续加载约 49 秒，进程到就绪共 63.009 秒。为避免干扰在线 GPU rollout，该冒烟用 CPU、PyTorch 2 个计算线程，不作 CUDA 性能结论。
 - 在线服务正在 rollout，本次未重启；修改将在下次服务启动生效。真实摄像头/控制负载下的重启后 CUDA 全链路时间仍待验证。
+
+## 2026-09-28：独立云端管理（阶段记录）
+
+- 用户要求先完成云端服务及本地独立云端管理页面；本地 Monitor 接入需要用户手动确认。本轮工作放在独立 worktree，未触及原仓库及相邻 LeRobot 的源码。
+- 新增 standalone cloud manager：回环 Host/Origin 保护、主机配置、SSH 探测、隔离 wheel 初始化、隧道、后台任务、令牌留在后端的代理、带 SHA256 清单的 checkpoint 上传及独立 CUDA runtime profile 安装。
+- 两个主机保留配置；依照用户最新约束，仅允许 8x4090-server 远端操作，8A6000-server 不连接、不初始化、不测试。
+- 管理服务和模型运行时分别放于专用数据根目录，使用当前 package wheel、固定 CUDA/Transformers 版本、runtime 哈希锁文件。升级先安装，再请求旧 daemon 停机；活动会话拒绝升级，新版启动失败尝试回滚。
+- 当前验证：manager 24 项测试通过、远端 Python 脚本语法检查通过、临时目录构建 wheel 成功。测试覆盖真实双 FastAPI 应用之间的 session 路由契约；此结果不代表已经完成真实 GPU 推理。
+- 下一步：4090 初始化与真实模型推理验证、云端与 UI 汇总审查，记录最终证据；本地 Monitor 接入仍等待用户手动确认。
+- 审查修复：主机连接状态与管理作业忙碌状态分离，后台任务期间仍保留云端模型面板；runtime.json 改为保留多个 profile 并迁移旧配置，避免后装 PI 覆盖 SmolVLA 环境。manager 验证增至 30 项通过。
+- 上传回收审查修复：提取/校验/登记前失败以及明确 4xx 拒绝只删除本次生成且经过父路径校验的 UUID staging；登记超时或 5xx 保留文件并报告恢复路径，避免误删已被服务登记的模型。
+- 新增可重复运行的 scripts/smoke-cloud-models.py：显式部署 ID 与 GPU，metadata 驱动零状态和黑色 PNG，原生 select/debug/RTC 模式及租约/epoch/重复请求验证，finally 关闭会话并卸载，输出 JSON。尚未由此子任务执行远程冒烟。
+- manager 与 smoke-harness 本地验证累计 39 项通过；ROADMAP 末尾空行已修复。
+- 4090 实测 ACT 首次加载暴露运行环境缺失 datasets；已将所有 profile 加上 LeRobot dataset extra，并把运行环境 ready 检查扩大到原生 policy factory、processor、rollout/RTC 和 profile 对应模型类导入。需求组合测试覆盖 ACT/SmolVLA/PI，manager+harness 累计 42 项通过；等待主线程重新安装与实测。
+- 文档修正：外部 runtime 使用自身依赖，仅以 importlib 固定 Monitor worker 包到活动 release；推理图像传输明确只支持 PNG。
+
+### 2026-09-28 最终验收与交付状态
+
+- 独立工作树 `C:\Users\Admin\.codex\worktrees\cloud-model-manager\lerobot-monitor`、分支 `codex/cloud-model-manager` 完成本阶段；未改动原 Monitor 应用或相邻 LeRobot 源码。接入原 Monitor、实体机械臂验证仍等待用户手动确认。
+- 4090 管理服务 bootstrap 成功，随后两次升级成功（各约 14 秒）；专用目录 `/data/zhuyutian/lerobot-monitor`。本地独立管理页面 `http://127.0.0.1:8095` 正在运行，使用原轻量 Python 可执行文件加 worktree/src 的 PYTHONPATH；可复用启动与复测命令已写入 `docs/cloud_models.md`。
+- 模型运行时采用 LeRobot `79f1e10d` 的 0.6.2 wheel，SHA256 `5d8af18eaf294a690b4325f6f335c4a92cdbd375a9a313f1dbfcba63bb60fdcd`。首次 ACT 暴露的 datasets 依赖缺失已修复，新的含 dataset profile 成功安装；早期轻量环境中的回归依赖失败也已由完整依赖环境重新验证解决。
+- 真实 ACT 验证 `.tmp_cloud_results/act.json` 为 passed：select_action `[1,6]`、debug_chunk `[8,6]`。真实 SmolVLA 验证 `.tmp_cloud_results/smolvla.json` 为 passed：select_action `[1,6]`、debug_chunk `[8,6]`、RTC `[50,6]`，并验证 guided 前缀推理。覆盖独占会话、使用中拒绝卸载、心跳、重复请求、reset 与过期 epoch；两个模型最终均卸载。
+- 本地上传样例实测完成 manifest/SHA256 校验、托管登记、delete_files 删除，远端 staging 和 asset 均确认不存在。既有 ACT、SmolVLA 外部缓存权重保留。
+- 最终测试：远端 Linux cloud + manager + smoke-harness **79 passed**；既有本地完整回归在完整重依赖环境与固定 LeRobot archive 下 **357 passed、4 skipped**；UI **12 项测试及 4 个视口检查通过**。
+- 验收边界：输入为零状态与黑色 PNG，未连接实体机器人，不表示策略任务准确率或实机性能。PI profile 已实现，但无缓存 PI checkpoint，因此未完成 PI 实际推理验收。A6000 本轮未连接、未安装、未测试。本地 Monitor 集成的手动确认门禁继续保留。

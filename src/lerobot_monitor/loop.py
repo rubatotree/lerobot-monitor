@@ -105,7 +105,10 @@ class _UiLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         name = record.name
-        if any(name.startswith(prefix) for prefix in _LOG_SKIP_PREFIXES):
+        # Loading runs before an inference session exists. Forward these two
+        # producers, while keeping loop.log's own logger excluded to avoid recursion.
+        is_loading_log = name in {"lerobot_monitor.policy", "lerobot_monitor.policy_residency"}
+        if not is_loading_log and any(name.startswith(prefix) for prefix in _LOG_SKIP_PREFIXES):
             return
         if record.levelno < logging.WARNING and any(
             name.startswith(prefix) for prefix in _LOG_QUIET_PREFIXES
@@ -279,6 +282,7 @@ class ControlLoop:
         self._rtc_native_events = False
         self._rtc_preview: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         self._rtc_goal_chunk: int | None = None
+        self._rtc_goal_index: int | None = None
         self._active_policy_owner: LoadedPolicy | None = None
         self._active_policy_lease: PolicyLease | None = None
         self._rollout_from: dict[str, float] | None = None
@@ -2738,9 +2742,9 @@ class ControlLoop:
             self.mode = "idle"
             return
         now = time.perf_counter()
-        if not self._rtc_native_events:
+        if not self._rtc_native_events and self._inference_worker is None:
             self._observe_rollout_queue()
-        else:
+        elif self._rtc_native_events:
             try:
                 self._rollout_prediction = self._rtc_preview.get_nowait()
             except queue.Empty:
@@ -2767,7 +2771,9 @@ class ControlLoop:
                 if error:
                     raise RuntimeError(f"policy inference failed: {error}")
                 self._rollout_infer_ms = self._timeline_latency_ms(fallback_infer_ms)
-                self._note_sync_chunk_ready()
+                if action is not None:
+                    self._rtc_goal_chunk = worker.latest_token
+                    self._rtc_goal_index = worker.latest_index
                 if queued and now >= self._next_prediction_t:
                     self._record_rollout_prediction(queued)
                     self._next_prediction_t = now + self._prediction_interval
@@ -2781,6 +2787,7 @@ class ControlLoop:
                 action = engine.get_action(None)
                 if self._rtc_native_events and action is not None:
                     self._rtc_goal_chunk = engine.dispatched_chunk_id
+                    self._rtc_goal_index = getattr(engine, "dispatched_action_index", None)
                 elif not self._rtc_native_events:
                     self._observe_rollout_queue()
                 measured_infer_ms = (time.perf_counter() - started) * 1000.0
@@ -2815,9 +2822,9 @@ class ControlLoop:
             else:
                 pose = dict(self._rollout_goal)
             sent = self._send_pose(pose, hold=self._rollout_waiting)
-            if sent and self._rtc_native_events:
+            if sent and (self._rtc_native_events or worker is not None):
                 try:
-                    self._rollout_timeline.note_dispatched(self._rtc_goal_chunk)
+                    self._rollout_timeline.note_dispatched(self._rtc_goal_chunk, index=self._rtc_goal_index)
                 except Exception as exc:  # noqa: BLE001 - charts cannot stop a rollout
                     self._rollout_telemetry_error(exc)
             self.action = dict(pose)
@@ -2938,9 +2945,18 @@ class ControlLoop:
             elif event.kind in {"ready", "failed", "discarded"}:
                 timeline.note_inference_end(
                     event.chunk_id, ok=event.kind == "ready", steps=event.steps or None,
+                    discarded=event.kind == "discarded",
                 )
+            elif event.kind == "consumed":
+                timeline.note_consumed(event.chunk_id, index=event.action_index)
             elif event.kind == "accepted":
-                timeline.note_chunk_accepted(event.chunk_id, steps=event.steps)
+                receipt = getattr(event, "merge", None)
+                timeline.note_chunk_accepted(
+                    event.chunk_id, steps=event.steps,
+                    prefix_trimmed=0 if receipt is None else receipt.prefix_trimmed,
+                    replaced=() if receipt is None else receipt.replaced,
+                    timestamp=None if receipt is None else receipt.timestamp,
+                )
                 payload = {
                     "id": event.chunk_id, "t_s": round(time.perf_counter() - origin, 3),
                     "step_s": round(step_s, 6), "strategy": "policy_queue", "degraded": False,
@@ -2954,6 +2970,9 @@ class ControlLoop:
                 preview.put_nowait(payload)
 
         engine.chunk_observer = observe
+        profiler = getattr(engine, "profiler", None)
+        if profiler is not None:
+            profiler.observer = lambda stage: timeline.note_stage(stage.chunk_id, stage)
 
     def _start_inference_engine(self, loaded: LoadedPolicy) -> bool:
         """Build and start LeRobot's sync or RTC inference engine."""
@@ -2964,7 +2983,7 @@ class ControlLoop:
             # timeline so they cannot attach events to a subsequent model/run.
             self._rollout_timeline.set_enabled(False)
             self._rollout_timeline = RolloutTimeline()
-            self._rollout_timeline.set_enabled(True)
+            self._rollout_timeline.set_enabled(True, epoch_monotonic=self.task_t0)
             # RTC now reports its own producer lifecycle. The synchronous worker
             # already times calls; neither path needs to monkey-patch the policy.
             state = getattr(loaded.policy, "_monitor_timeline_state", None)
@@ -3034,6 +3053,7 @@ class ControlLoop:
         self._inference_worker = None
         self._rtc_native_events = False
         self._rtc_goal_chunk = None
+        self._rtc_goal_index = None
         self._active_policy_owner = None
         self._active_policy_lease = None
         self._inference_engine = None

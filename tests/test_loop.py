@@ -1081,7 +1081,7 @@ def test_rtc_tick_observes_queue_handoff_and_uses_timeline_latency(
     assert loop._rollout_infer_ms == 62.5
 
 
-def test_sync_tick_marks_chunk_ready_and_uses_timeline_latency(
+def test_sync_tick_tracks_source_token_and_uses_timeline_latency(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1102,7 +1102,9 @@ def test_sync_tick_marks_chunk_ready_and_uses_timeline_latency(
 
     loop._tick_rollout()
 
-    assert timeline.chunk_ready == [(1, 0.05)]
+    assert timeline.chunk_ready == []
+    assert loop._rtc_goal_chunk == worker.latest_token
+    assert loop._rtc_goal_index == worker.latest_index
     assert loop._rollout_infer_ms == 42.0
     worker.submit.assert_called_once()
 

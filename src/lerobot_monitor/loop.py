@@ -181,6 +181,22 @@ class _PolicyLoadJob:
     lease: PolicyLease | None = None
 
 
+def _wait_policy_result(ready: threading.Event, seconds: float) -> None:
+    """Wait for a result with the same final-spin precision as bus scheduling."""
+    if seconds <= 0:
+        return
+    if sys.platform not in {"win32", "darwin"}:
+        ready.wait(seconds)
+        return
+    deadline = time.perf_counter() + seconds
+    while not ready.is_set():
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        if remaining > 0.010 and ready.wait(max(0.0, remaining - 0.005)):
+            return
+
+
 class ControlLoop:
     def __init__(
         self,
@@ -269,9 +285,13 @@ class ControlLoop:
         self.loaded_policy: LoadedPolicy | None = None
         self.rollout_task = ""
         self.policy_fps = float(config.rollout.default_fps)
+        self.execution_speed = 1.0
         self.effective_policy_fps = self.policy_fps
         self._policy_interval = 1.0 / max(1.0, self.effective_policy_fps)
         self._next_policy_t = 0.0
+        self._rollout_goal_sent = True
+        self._rollout_request_pending = False
+        self._rollout_pending_result: tuple[Any, ...] | None = None
         # Latest rollout action-chunk preview for the charts (telemetry only).
         self._rollout_prediction: dict[str, Any] | None = None
         self._rollout_timeline = RolloutTimeline()
@@ -398,6 +418,8 @@ class ControlLoop:
             "effective_hz": self._control_hz(mode),
             "source": "task" if self._task_rate_mode == mode and self._task_rate is not None else "mode" if self.rate_settings[mode].kind != "inherit" else "global",
             "policy_hz": self.policy_fps if self.mode == "rollout" else None,
+            "execution_speed": self.execution_speed if self.mode == "rollout" else None,
+            "effective_policy_hz": self.effective_policy_fps if self.mode == "rollout" else None,
             "dataset_hz": self.record_session.fps if self.record_session is not None else None,
             "video_hz": float(getattr(self.writer, "video_fps", 0) or 0) or (
                 float(self.record_session.fps) if self.mode == "record" and self.record_session is not None else None
@@ -935,6 +957,7 @@ class ControlLoop:
             self.pending = None
             self.log("info", "rollout cancelled")
             return False
+        base_fps, effective_fps = self.validate_rollout_rates(payload)
         self._end_rollout()
         self._active_policy_lease = lease
         loaded.task = str(payload.get("task") or loaded.task)
@@ -943,7 +966,8 @@ class ControlLoop:
         duration = float(payload.get("duration_s") or self.config.rollout.default_duration_s)
         self.task_t0 = time.perf_counter()
         self.task_deadline = None if duration <= 0 else self.task_t0 + duration
-        self.policy_fps, self.effective_policy_fps = self._policy_rates(payload)
+        self.policy_fps, self.effective_policy_fps = base_fps, effective_fps
+        self.execution_speed = float(payload.get("execution_speed", 1.0))
         self._rollout_interpolation = bool(payload.get("interpolation", True))
         task_rate = self._task_setting("rollout", payload, self.policy_fps)
         self._policy_interval = 1.0 / self.effective_policy_fps
@@ -1123,6 +1147,7 @@ class ControlLoop:
                 "policy_path": None if self.loaded_policy is None else self.loaded_policy.path,
                 "policy_fps": self.policy_fps if self.loaded_policy is not None else None,
                 "effective_policy_fps": self.effective_policy_fps if self.loaded_policy is not None else None,
+                "execution_speed": self.execution_speed if self.loaded_policy is not None else None,
                 "task": self.rollout_task,
                 "message": self.last_error,
                 "record": self._record_snapshot(),
@@ -1344,7 +1369,34 @@ class ControlLoop:
             raise ValueError("policy_fps must be positive")
         if requested > 240:
             raise ValueError("policy_fps must be at most 240")
-        return requested, requested
+        raw_speed = payload.get("execution_speed", 1.0)
+        if isinstance(raw_speed, bool):
+            raise ValueError("execution_speed must be positive and finite")
+        try:
+            speed = float(raw_speed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("execution_speed must be positive and finite") from exc
+        if not math.isfinite(speed) or speed <= 0:
+            raise ValueError("execution_speed must be positive and finite")
+        effective = requested * speed
+        if not math.isfinite(effective) or not 0.1 <= effective <= 240:
+            raise ValueError("effective policy rate (policy_fps × execution_speed) must be between 0.1 and 240 Hz")
+        return requested, effective
+
+    def validate_rollout_rates(self, payload: dict[str, Any]) -> tuple[float, float]:
+        """Validate pace without changing the independently configured Arm output."""
+        base, effective = self._policy_rates(payload)
+        setting = self._task_setting("rollout", payload, base) or self.rate_settings["rollout"]
+        self._require_execution_output(effective, setting.resolve(self.default_control_hz, base))
+        return base, effective
+
+    @staticmethod
+    def _require_execution_output(execution_hz: float, output_hz: float) -> None:
+        if execution_hz > output_hz + 1e-9:
+            raise ValueError(
+                f"execution pace {execution_hz:g} Hz exceeds Arm output {output_hz:g} Hz; "
+                "raise the Arm rate or lower execution speed"
+            )
 
     def _open_recorder(self, kind: str, payload: dict[str, Any] | None = None) -> DatasetRecorder:
         self.recording_mutation_lock.acquire()
@@ -1521,7 +1573,7 @@ class ControlLoop:
                 self._output_due = time.perf_counter() >= self._next_output_t
                 read_hz = max(
                     30.0,
-                    self.policy_fps if self.mode == "rollout" else 0.0,
+                    max(self.policy_fps, self.effective_policy_fps) if self.mode == "rollout" else 0.0,
                     float(self.record_session.fps) if self.mode == "record" and self.record_session else 0.0,
                     float(getattr(self.writer, "video_fps", 0) or 0),
                     float(getattr(self.writer, "action_fps", 0) or 0),
@@ -1547,11 +1599,16 @@ class ControlLoop:
                     self.on_snapshot(self.snapshot())
                     next_snapshot_t = now + 0.1
                 deadlines = [self._next_output_t, self._next_read_t]
-                if self.mode == "rollout":
+                if self.mode == "rollout" and (self._next_policy_t > now or not self._rollout_request_pending):
                     deadlines.append(self._next_policy_t)
                 if self.mode == "record" and self.record_phase == "recording":
                     deadlines.append(self._next_action_t)
-                _precise_sleep(max(0.0, min(deadlines) - time.perf_counter()))
+                wait_s = max(0.0, min(deadlines) - time.perf_counter())
+                if self._rollout_request_pending and isinstance(self._inference_worker, PolicyWorker):
+                    # Wake on a completed cached action without advancing bus/read cadence.
+                    _wait_policy_result(self._inference_worker.result_ready, wait_s)
+                else:
+                    _precise_sleep(wait_s)
                 self._last_control_error = None
             except Exception as exc:  # noqa: BLE001 - one bad iteration must not kill the loop
                 self._recover_control_loop(exc)
@@ -1860,6 +1917,11 @@ class ControlLoop:
                 if setting.kind != "multiplier" or self._source_hz(selected) is not None:
                     setting.resolve(default_hz, self._source_hz(selected))
                 new_settings[selected] = setting
+            if self.mode == "rollout":
+                active_setting = self._task_rate if self._task_rate_mode == "rollout" and self._task_rate is not None else new_settings["rollout"]
+                self._require_execution_output(
+                    self.effective_policy_fps, active_setting.resolve(default_hz, self.policy_fps),
+                )
             old_hz = self._control_hz()
             self.default_control_hz = default_hz
             self.rate_settings = new_settings
@@ -2395,7 +2457,7 @@ class ControlLoop:
             path = str(p.get("policy_path") or "")
             if not path:
                 raise ValueError("policy_path is required")
-            requested_policy_fps, effective_policy_fps = self._policy_rates(p)
+            requested_policy_fps, effective_policy_fps = self.validate_rollout_rates(p)
             p["policy_fps"] = requested_policy_fps
             p["effective_policy_fps"] = effective_policy_fps
             extra = p.get("extra") or {}
@@ -2764,25 +2826,39 @@ class ControlLoop:
             raise RuntimeError(engine.failure_traceback or "rollout inference engine failed")
         action = None
         worker = self._inference_worker
+        observation = dict(self.joints or {})
+        observation["_monitor_observed_at"] = self._read_at
+        # RTC sees fresh observations at bus/read cadence even when playback is slow.
+        engine.notify_observation(observation)
+        can_advance = self._rollout_goal is None or self._rollout_goal_sent
+        source_due = now >= self._next_policy_t
         if worker is not None:
-            result = worker.latest()
-            if result is not None:
-                fallback_infer_ms, action, error, queued = result
-                if error:
-                    raise RuntimeError(f"policy inference failed: {error}")
+            if self._rollout_pending_result is None:
+                result = worker.latest()
+                if result is not None:
+                    if result[2]:
+                        raise RuntimeError(f"policy inference failed: {result[2]}")
+                    self._rollout_pending_result = (*result, worker.latest_token, worker.latest_index)
+            if self._rollout_pending_result is not None and can_advance and (source_due or self._rollout_goal is None):
+                fallback_infer_ms, action, _error, queued, token, index = self._rollout_pending_result
+                self._rollout_pending_result = None
+                self._rollout_request_pending = False
                 self._rollout_infer_ms = self._timeline_latency_ms(fallback_infer_ms)
                 if action is not None:
-                    self._rtc_goal_chunk = worker.latest_token
-                    self._rtc_goal_index = worker.latest_index
+                    self._rtc_goal_chunk, self._rtc_goal_index = token, index
                 if queued and now >= self._next_prediction_t:
                     self._record_rollout_prediction(queued)
                     self._next_prediction_t = now + self._prediction_interval
-        if now >= self._next_policy_t:
+            # Capture the next observation only when its source deadline arrives.
+            # One outstanding request prevents stale lookahead and cached-action bursts.
+            if not self._rollout_request_pending and self._rollout_pending_result is None and source_due and can_advance and action is None:
+                if worker.submit(observation, dict(self.joints)):
+                    self._rollout_request_pending = True
+                else:
+                    self._note_control_event("policy_request_skipped", now)
+        elif source_due:
             self._next_policy_t = self._advance_deadline(self._next_policy_t, self._policy_interval, now)
-            observation = dict(self.joints or {})
-            observation["_monitor_observed_at"] = self._read_at
-            engine.notify_observation(observation)
-            if worker is None:
+            if can_advance:
                 started = time.perf_counter()
                 action = engine.get_action(None)
                 if self._rtc_native_events and action is not None:
@@ -2792,14 +2868,15 @@ class ControlLoop:
                     self._observe_rollout_queue()
                 measured_infer_ms = (time.perf_counter() - started) * 1000.0
                 self._rollout_infer_ms = self._timeline_latency_ms(measured_infer_ms)
-            elif not worker.submit(observation, dict(self.joints)):
-                self._note_control_event("policy_request_skipped", now)
         if action is not None:
             pose = action if worker is not None else pose_from_action_tensor(self.loaded_policy, action, self.joints)
             self._rollout_from = dict(self.action or self.joints or pose)
             self._rollout_goal = dict(pose)
             self._rollout_segment_t = now
             self._rollout_last_action_t = now
+            self._rollout_goal_sent = False
+            if worker is not None:
+                self._next_policy_t = now + self._policy_interval
             if self._rollout_waiting:
                 self._note_control_event("policy_resumed", now)
             self._rollout_waiting = False
@@ -2809,10 +2886,11 @@ class ControlLoop:
         ):
             self._rollout_waiting = True
             self._note_control_event("policy_waiting", now)
-        if now - max(self.task_t0, self._rollout_last_action_t) > self.config.rollout.inference_timeout_s:
+        timeout = self.config.rollout.inference_timeout_s + (self._policy_interval if self._rollout_goal is not None else 0.0)
+        if now - max(self.task_t0, self._rollout_last_action_t) > timeout:
             raise RuntimeError("rollout inference timed out without a usable action")
         if self._output_due and self._rollout_goal is not None:
-            if self._rollout_interpolation and self._control_hz() > self.policy_fps and self._rollout_from is not None:
+            if self._rollout_interpolation and self._control_hz() > self.effective_policy_fps and self._rollout_from is not None:
                 alpha = min(1.0, max(0.0, (now - self._rollout_segment_t) / self._policy_interval))
                 pose = {
                     name: float(self._rollout_from.get(name, goal))
@@ -2822,6 +2900,8 @@ class ControlLoop:
             else:
                 pose = dict(self._rollout_goal)
             sent = self._send_pose(pose, hold=self._rollout_waiting)
+            if sent:
+                self._rollout_goal_sent = True
             if sent and (self._rtc_native_events or worker is not None):
                 try:
                     self._rollout_timeline.note_dispatched(self._rtc_goal_chunk, index=self._rtc_goal_index)
@@ -3060,6 +3140,9 @@ class ControlLoop:
         self._rollout_hw_feature_spec = {}
         self._rollout_from = None
         self._rollout_goal = None
+        self._rollout_goal_sent = True
+        self._rollout_request_pending = False
+        self._rollout_pending_result = None
         self._rollout_waiting = False
         self._rollout_last_action_t = 0.0
         if isinstance(worker, PolicyWorker):
@@ -3090,7 +3173,7 @@ class ControlLoop:
         self._rollout_prediction = None
 
     def _prediction_step_s(self) -> float:
-        return 1.0 / max(1.0, float(self.policy_fps))
+        return 1.0 / float(self.effective_policy_fps)
 
     def _rollout_telemetry_error(self, exc: Exception) -> None:
         if self._rollout_timeline_debugged:

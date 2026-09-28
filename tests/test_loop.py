@@ -983,6 +983,7 @@ def test_rollout_prediction_reads_lerobot_rtc_queue(tmp_path: Path, monkeypatch)
     loop.mode = "rollout"
     loop.task_t0 = 10.0
     loop.policy_fps = 20.0
+    loop.effective_policy_fps = 20.0
     loop._next_policy_t = 0.0
     loop._next_prediction_t = 0.0
     loop._inference_engine = FakeInferenceEngine(
@@ -1017,6 +1018,7 @@ def test_rollout_prediction_reads_sync_policy_queue(tmp_path: Path, monkeypatch)
     loop.mode = "rollout"
     loop.task_t0 = 10.0
     loop.policy_fps = 20.0
+    loop.effective_policy_fps = 20.0
     loop._next_policy_t = 0.0
     loop._next_prediction_t = 0.0
     loop._inference_engine = FakeInferenceEngine({"gripper": 0.0})
@@ -1056,6 +1058,7 @@ def test_rtc_tick_observes_queue_handoff_and_uses_timeline_latency(
     loop.mode = "rollout"
     loop.task_t0 = 10.0
     loop.policy_fps = 20.0
+    loop.effective_policy_fps = 20.0
     loop._next_policy_t = 0.0
     loop._next_prediction_t = time.perf_counter() + 1000.0
     queue_state = SimpleNamespace(remaining=2, index=0)
@@ -1089,6 +1092,7 @@ def test_sync_tick_tracks_source_token_and_uses_timeline_latency(
     loop.loaded_policy = SimpleNamespace(policy=SimpleNamespace())
     loop.mode = "rollout"
     loop.policy_fps = 20.0
+    loop.effective_policy_fps = 20.0
     loop._next_policy_t = 0.0
     loop._next_prediction_t = time.perf_counter() + 1000.0
     loop._inference_engine = FakeInferenceEngine({"gripper": 1.0})
@@ -1106,7 +1110,7 @@ def test_sync_tick_tracks_source_token_and_uses_timeline_latency(
     assert loop._rtc_goal_chunk == worker.latest_token
     assert loop._rtc_goal_index == worker.latest_index
     assert loop._rollout_infer_ms == 42.0
-    worker.submit.assert_called_once()
+    worker.submit.assert_not_called()
 
 
 def test_timeline_telemetry_failure_does_not_interrupt_rollout(
@@ -1127,6 +1131,7 @@ def test_timeline_telemetry_failure_does_not_interrupt_rollout(
     loop.loaded_policy = SimpleNamespace(policy=SimpleNamespace())
     loop.mode = "rollout"
     loop.policy_fps = 20.0
+    loop.effective_policy_fps = 20.0
     loop._next_policy_t = 0.0
     loop._next_prediction_t = time.perf_counter() + 1000.0
     loop._inference_engine = FakeInferenceEngine({"gripper": 1.0})
@@ -1141,11 +1146,14 @@ def test_timeline_telemetry_failure_does_not_interrupt_rollout(
 
     assert loop._rollout_infer_ms == 200.0
     assert loop._rollout_timeline_debugged is True
-    worker.submit.assert_called_once()
+    worker.submit.assert_not_called()
 
 
 def test_start_inference_engine_uses_hw_features_method(tmp_path: Path, monkeypatch) -> None:
     loop = _loop(tmp_path)
+    loop.policy_fps = 30.0
+    loop.execution_speed = 1.5
+    loop.effective_policy_fps = 45.0
     loaded = SimpleNamespace(task="pick cube", policy=MagicMock())
     loaded.policy.config = SimpleNamespace()
     engine = MagicMock()
@@ -1167,6 +1175,10 @@ def test_start_inference_engine_uses_hw_features_method(tmp_path: Path, monkeypa
     engine.start.assert_called_once_with()
     engine.resume.assert_called_once_with()
     assert captured["hw_features"] == {"observation.state": {"names": []}}
+    assert captured["fps"] == 45.0
+    assert loop._prediction_step_s() == pytest.approx(1 / 45)
+    loop._rollout_timeline.note_inference_start(kind="rtc", step_s=loop._prediction_step_s())
+    assert loop._rollout_timeline.snapshot()["step_s"] == pytest.approx(1 / 45, abs=1e-6)
 
 
 def test_rollout_legacy_fps_is_policy_rate_without_silent_cap(tmp_path: Path) -> None:
@@ -1176,6 +1188,197 @@ def test_rollout_legacy_fps_is_policy_rate_without_silent_cap(tmp_path: Path) ->
     assert loop._policy_rates({"fps": 120}) == (120.0, 120.0)
     with pytest.raises(ValueError, match="policy_fps must be positive"):
         loop._policy_rates({"fps": 0})
+
+
+@pytest.mark.parametrize("speed", [0, -1, float("nan"), float("inf"), True, None, "bad"])
+def test_rollout_speed_rejects_invalid_values(tmp_path: Path, speed: object) -> None:
+    with pytest.raises(ValueError, match="execution_speed"):
+        _loop(tmp_path)._policy_rates({"policy_fps": 30, "execution_speed": speed})
+
+
+def test_rollout_speed_validation_keeps_base_and_arm_independent(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    assert loop._policy_rates({"policy_fps": 30, "execution_speed": 0.5}) == (30.0, 15.0)
+    assert loop._policy_rates({"policy_fps": 1, "execution_speed": 0.1}) == (1.0, 0.1)
+    for speed in (0.001, 9):
+        with pytest.raises(ValueError, match="between 0.1 and 240"):
+            loop._policy_rates({"policy_fps": 30, "execution_speed": speed})
+    with pytest.raises(ValueError, match="raise the Arm rate"):
+        loop.validate_rollout_rates({"policy_fps": 30, "execution_speed": 2})
+    assert loop.validate_rollout_rates({
+        "policy_fps": 30, "execution_speed": 2,
+        "control_rate": {"kind": "multiplier", "value": 2},
+    }) == (30.0, 60.0)
+    assert loop.policy_fps == 15 and loop.default_control_hz == 30
+
+
+def test_rollout_speed_is_validated_before_current_state_changes(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loaded = SimpleNamespace(task="previous")
+    loop.loaded_policy = loaded
+    with pytest.raises(ValueError, match="raise the Arm rate"):
+        loop._begin_rollout(loaded, {"policy_fps": 30, "execution_speed": 2, "task": "new"}, "policy")
+    assert loaded.task == "previous" and loop.loaded_policy is loaded
+    assert loop._rollout_timeline is not None
+
+
+def test_arm_rate_changed_during_load_releases_incoming_lease(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    lease = MagicMock()
+    thread = MagicMock()
+    thread.is_alive.return_value = False
+    loop._policy_job = loop_module._PolicyLoadJob(
+        generation=loop._policy_generation,
+        payload={"policy_path": "policy", "policy_fps": 30, "execution_speed": 2},
+        result=SimpleNamespace(path="policy", task="", policy=MagicMock()),
+        thread=thread,
+        lease=lease,
+    )
+    with pytest.raises(ValueError, match="raise the Arm rate"):
+        loop._complete_rollout_load()
+    lease.release.assert_called_once()
+    assert loop._policy_job is None and loop.loaded_policy is None
+
+
+def test_active_rollout_rejects_arm_reduction_before_mutation(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.mode = "rollout"
+    loop.policy_fps = 30
+    loop.effective_policy_fps = 30
+    loop._next_output_t = 123.0
+    before = dict(loop.rate_settings)
+    with pytest.raises(ValueError, match="raise the Arm rate"):
+        loop._handle(Command("control_rates", {"default_hz": 15, "trace": True}))
+    assert loop.default_control_hz == 30 and loop.rate_settings == before
+    assert loop._next_output_t == 123.0 and loop._rate_save_jobs.empty()
+    assert loop._trace_control is False
+
+
+def test_slow_rtc_keeps_observations_and_output_cadence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    loop = _loop(tmp_path)
+    engine = FakeInferenceEngine({"gripper": 1.0})
+    loaded = SimpleNamespace(path="policy", task="", policy=MagicMock())
+    monkeypatch.setattr(loop, "_start_inference_engine", lambda _loaded: setattr(loop, "_inference_engine", engine) or True)
+    clock = [100.0]
+    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: clock[0])
+    assert loop._begin_rollout(loaded, {"record": False, "policy_fps": 30, "execution_speed": 0.5}, "policy")
+    for step in range(6):
+        clock[0] = 100.0 + step / 30
+        loop._tick_rollout()
+    assert engine.notify_observation.call_count == 6
+    assert loop.follower.send_pose.call_count == 6
+    assert engine.get_action.call_count == 3
+    assert loop._prediction_step_s() == pytest.approx(1 / 15)
+    assert loop.rates_snapshot()["source_hz"] == 30
+    assert loop.rates_snapshot()["effective_policy_hz"] == 15
+    assert loop.snapshot()["task"]["execution_speed"] == 0.5
+
+
+@pytest.mark.parametrize("speed", [0.5, 1.0, 2.0, 0.75])
+def test_execution_speed_paces_ordered_actions_and_interpolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, speed: float,
+) -> None:
+    loop = _loop(tmp_path)
+    engine = FakeInferenceEngine({"gripper": 10.0})
+    engine.get_action.side_effect = [{"gripper": 10.0 * (index + 1)} for index in range(6)]
+    loaded = SimpleNamespace(path="policy", task="", policy=MagicMock())
+    monkeypatch.setattr(loop, "_start_inference_engine", lambda _loaded: setattr(loop, "_inference_engine", engine) or True)
+    clock = [100.0]
+    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: clock[0])
+    assert loop._begin_rollout(loaded, {"record": False, "policy_fps": 10, "execution_speed": speed}, "policy")
+    interval = 1 / (10 * speed)
+    loop.action = {"gripper": 0.0}
+    loop._tick_rollout()
+    clock[0] = 100.0 + interval / 2
+    loop._tick_rollout()
+    assert engine.get_action.call_count == 1
+    assert loop.follower.send_pose.call_args.args[0]["gripper"] == pytest.approx(5.0)
+    assert loop._control_hz() == 30
+    for index in range(1, 6):
+        clock[0] = 100.0 + index * interval + 1e-8
+        loop._tick_rollout()
+        assert loop._rollout_goal["gripper"] == 10.0 * (index + 1)
+    assert engine.get_action.call_count == 6
+    assert loop._next_policy_t == pytest.approx(100.0 + 6 * interval)
+    loop._record_rollout_prediction([{"gripper": 70.0}])
+    assert loop._rollout_prediction["step_s"] == pytest.approx(interval, abs=1e-6)
+
+
+def test_rtc_does_not_drain_an_unsent_goal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    loop = _loop(tmp_path)
+    loop.loaded_policy = SimpleNamespace(policy=MagicMock())
+    loop.mode = "rollout"
+    loop._inference_engine = FakeInferenceEngine({"gripper": 1.0})
+    clock = [100.0]
+    loop.task_t0 = 100.0
+    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: clock[0])
+    loop._output_due = False
+    loop._tick_rollout()
+    clock[0] += 0.1
+    loop._tick_rollout()
+    assert loop._inference_engine.get_action.call_count == 1
+    loop._output_due = True
+    loop._tick_rollout()
+    clock[0] += 0.1
+    loop._tick_rollout()
+    assert loop._inference_engine.get_action.call_count == 2
+
+
+def test_sync_requests_use_fresh_deadline_observations_without_bursts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    loop = _loop(tmp_path)
+    loop.loaded_policy = SimpleNamespace(policy=MagicMock())
+    loop.mode = "rollout"
+    loop._inference_engine = FakeInferenceEngine({"gripper": 1.0})
+    worker = MagicMock()
+    worker.submit.return_value = True
+    worker.latest.return_value = None
+    worker.latest_token, worker.latest_index = 1, 0
+    loop._inference_worker = worker
+    loop.task_t0 = 100.0
+    loop._policy_interval = 10.0
+    loop._next_policy_t = 100.0
+    clock = [100.0]
+    monkeypatch.setattr(loop_module.time, "perf_counter", lambda: clock[0])
+    loop._tick_rollout()
+    assert worker.submit.call_count == 1
+    clock[0] = 101.0
+    worker.latest.return_value = (1000.0, {"gripper": 1.0}, None, [])
+    loop._tick_rollout()
+    assert loop._next_policy_t == 111.0
+    assert worker.submit.call_count == 1
+    worker.latest.return_value = None
+    clock[0] = 110.9
+    loop._tick_rollout()
+    assert worker.submit.call_count == 1
+    loop.joints = {"gripper": 2.0}
+    clock[0] = 111.0
+    loop._tick_rollout()
+    assert worker.submit.call_count == 2
+    assert worker.submit.call_args.args[0]["gripper"] == 2.0
+    clock[0] = 112.0
+    worker.latest.return_value = (1000.0, {"gripper": 3.0}, None, [])
+    loop._tick_rollout()
+    assert loop._next_policy_t == 122.0
+    assert worker.submit.call_count == 2
+
+
+def test_policy_result_wait_preserves_short_deadline_precision(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [0.0]
+    def now() -> float:
+        clock[0] += 0.001
+        return clock[0]
+    ready = MagicMock()
+    ready.is_set.return_value = False
+    monkeypatch.setattr(loop_module.sys, "platform", "win32")
+    monkeypatch.setattr(loop_module.time, "perf_counter", now)
+    loop_module._wait_policy_result(ready, 1 / 240)
+    ready.wait.assert_not_called()
+    assert clock[0] >= 1 / 240
+    clock[0] = 0.0
+    ready.wait.return_value = True
+    loop_module._wait_policy_result(ready, 0.1)
+    ready.wait.assert_called_once()
+    assert 0 < ready.wait.call_args.args[0] < 0.1
 
 
 def test_ui_log_handler_keeps_traceback_and_is_removed_on_stop(tmp_path: Path, monkeypatch) -> None:

@@ -5,7 +5,53 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 from lerobot_monitor.policy_worker import PolicyWorker
+
+
+def test_result_notification_is_set_and_consumption_clears_it() -> None:
+    class Engine:
+        def get_action(self, _observation: dict) -> dict[str, float]:
+            return {"gripper": 1.0}
+
+        def stop(self) -> None:
+            pass
+
+    worker = PolicyWorker(Engine(), threading.Lock())
+    try:
+        assert worker.submit({}, {})
+        assert worker.result_ready.wait(2)
+        assert worker.latest() is not None
+        assert not worker.result_ready.is_set()
+    finally:
+        assert worker.stop_async().wait(2)
+
+
+def test_result_published_around_empty_read_keeps_wakeup(monkeypatch: pytest.MonkeyPatch) -> None:
+    import queue
+    from types import SimpleNamespace
+
+    worker = PolicyWorker(SimpleNamespace(stop=lambda: None), threading.Lock())
+    original_get = worker._results.get_nowait
+    result = (1.0, {"gripper": 1.0}, None, [])
+
+    def race() -> None:
+        # A producer publishes immediately after an empty observation. Its
+        # notification must survive the consumer's empty-result path.
+        worker._results.put_nowait(result)
+        worker.result_ready.set()
+        raise queue.Empty
+
+    try:
+        monkeypatch.setattr(worker._results, "get_nowait", race)
+        assert worker.latest() is None
+        assert worker.result_ready.is_set()
+        monkeypatch.setattr(worker._results, "get_nowait", original_get)
+        assert worker.latest() == result
+        assert not worker.result_ready.is_set()
+    finally:
+        assert worker.stop_async().wait(2)
 
 
 def test_camera_preparation_and_conversion_run_off_the_submitter_thread() -> None:

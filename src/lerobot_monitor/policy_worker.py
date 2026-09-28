@@ -41,6 +41,7 @@ class PolicyWorker:
         self._results: queue.Queue[
             tuple[float, Any, str | None, list[dict[str, float]]]
         ] = queue.Queue(maxsize=1)
+        self.result_ready = threading.Event()
         self.latest_token: int | None = None
         self.latest_index: int | None = None
         self._result_tokens: dict[int, tuple[int | None, int]] = {}
@@ -89,23 +90,25 @@ class PolicyWorker:
             return False
 
     def latest(self) -> tuple[float, Any, str | None, list[dict[str, float]]] | None:
+        # Clear before checking the queue: a later publication keeps its wakeup.
+        self.result_ready.clear()
         try:
             result = self._results.get_nowait()
-            self.latest_token, self.latest_index = self._result_tokens.pop(
-                id(result), (None, 0)
-            )
-            if (
-                self.timeline is not None
-                and result[1] is not None
-                and not self._native_events
-            ):
-                try:
-                    self.timeline.note_consumed(self.latest_token, index=0)
-                except Exception:
-                    logger.debug("Could not record worker telemetry", exc_info=True)
-            return result
         except queue.Empty:
             return None
+        self.latest_token, self.latest_index = self._result_tokens.pop(
+            id(result), (None, 0)
+        )
+        if (
+            self.timeline is not None
+            and result[1] is not None
+            and not self._native_events
+        ):
+            try:
+                self.timeline.note_consumed(self.latest_token, index=0)
+            except Exception:
+                logger.debug("Could not record worker telemetry", exc_info=True)
+        return result
 
     def stop_async(self) -> threading.Event:
         self._stop.set()
@@ -208,6 +211,7 @@ class PolicyWorker:
                 except queue.Empty:
                     pass
                 self._results.put_nowait(result)
+            self.result_ready.set()
             if self._generated_this_request:
                 self._stage(token, "publish", published, time.perf_counter())
 

@@ -154,6 +154,7 @@ class RolloutStartBody(BaseModel):
     auto_record: bool | None = None
     fps: int | None = None
     policy_fps: int | None = None
+    execution_speed: float = Field(default=1.0, gt=0, allow_inf_nan=False, strict=True)
     interpolation: bool = True
     action_fps: int | None = None
     video_fps: int | None = None
@@ -813,8 +814,10 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             payload["policy_fps"] = (
                 payload["fps"] if payload.get("fps") is not None else hub.config.rollout.default_fps
             )
-        if int(payload["policy_fps"]) <= 0:
-            raise HTTPException(400, "policy_fps must be positive")
+        try:
+            _, payload["effective_policy_fps"] = hub.loop.validate_rollout_rates(payload)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         return _enqueue("rollout_start", f"rollout requested — loading {path}", payload)
 
     @router.post("/api/rollout/stop")

@@ -1235,7 +1235,7 @@ def test_capture_legacy_fps_sets_both_rates_and_rejects_over_capacity(tmp_path: 
         app.state.hub.loop.submit_nowait = submit_nowait
         rollout = client.post(
             "/lerobot/api/rollout/start",
-            json={"policy_path": "missing", "fps": 120, "record": False},
+            json={"policy_path": "missing", "fps": 120, "record": False, "control_rate": {"kind": "hz", "value": 120}},
         )
         assert rollout.status_code == 200
         rollout_payload = queued["payload"]
@@ -1243,6 +1243,28 @@ def test_capture_legacy_fps_sets_both_rates_and_rejects_over_capacity(tmp_path: 
         assert rollout_payload["policy_fps"] == 120
         assert rollout_payload["action_fps"] is None
         assert rollout_payload["video_fps"] is None
+        assert rollout_payload["execution_speed"] == 1.0
+        assert rollout_payload["effective_policy_fps"] == 120.0
+
+        fast = client.post("/lerobot/api/rollout/start", json={
+            "policy_path": "missing", "policy_fps": 30, "execution_speed": 2,
+            "control_rate": {"kind": "hz", "value": 60},
+        })
+        assert fast.status_code == 200
+        assert queued["payload"]["policy_fps"] == 30
+        assert queued["payload"]["effective_policy_fps"] == 60.0
+        previous = dict(queued)
+        too_fast = client.post("/lerobot/api/rollout/start", json={
+            "policy_path": "missing", "policy_fps": 30, "execution_speed": 2,
+        })
+        assert too_fast.status_code == 400
+        assert "raise the Arm rate" in too_fast.json()["detail"]
+        for speed in [0, -1, True, "nan", "inf", "0.5"]:
+            invalid_speed = client.post("/lerobot/api/rollout/start", json={
+                "policy_path": "missing", "execution_speed": speed,
+            })
+            assert invalid_speed.status_code == 422
+        assert queued == previous
 
 
 def test_snapshot_routes(tmp_path: Path, monkeypatch) -> None:

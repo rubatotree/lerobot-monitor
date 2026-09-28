@@ -220,6 +220,7 @@ class PolicyResidencyManager:
 
     def request(self, path: str, device: str, extra: dict[str, str]) -> _Entry:
         key = self.identity(path, device, extra)
+        queued = False
         with self._lock:
             if self._closed:
                 raise RuntimeError("policy manager is closed")
@@ -228,52 +229,89 @@ class PolicyResidencyManager:
             entry = self._entries.get(key)
             if entry is not None:
                 if entry.state == "unloading":
-                    raise PolicyBusyError("model instance is unloading; retry loading after it is released")
+                    raise PolicyBusyError(
+                        "model instance is unloading; retry loading after it is released"
+                    )
                 if entry.state == "error":
                     entry.state, entry.phase, entry.error = "queued", "queued", ""
                     entry.completed_steps = 0
                     entry.requested_at = time.monotonic()
-                    if not self._worker_started:
-                        self._worker.start()
-                        self._worker_started = True
-                    self._jobs.put(entry)
-                    self._changed()
-                return entry
-            entry = _Entry(key, path, device, dict(extra), _instance_id(key))
-            self._entries[key] = entry
-            if not self._worker_started:
-                self._worker.start()
-                self._worker_started = True
-            self._jobs.put(entry)
-            self._changed()
-            return entry
+                    queued = True
+            else:
+                entry = _Entry(key, path, device, dict(extra), _instance_id(key))
+                self._entries[key] = entry
+                queued = True
+            if queued:
+                if not self._worker_started:
+                    self._worker.start()
+                    self._worker_started = True
+                self._jobs.put(entry)
+                self._changed()
+            state, instance_id = entry.state, entry.instance_id
+        # Handlers can inspect status or deliver UI messages; never call them under the state lock.
+        logger.info(
+            "model instance [%s] %s: source=%s resolved=%s device=%s state=%s",
+            instance_id,
+            "queued cold load" if queued else "reuse existing request",
+            path,
+            key[0],
+            device,
+            state,
+        )
+        return entry
 
-    def acquire_ready(self, path: str, device: str, extra: dict[str, str]) -> PolicyLease | None:
+    def acquire_ready(
+        self, path: str, device: str, extra: dict[str, str]
+    ) -> PolicyLease | None:
         key = self.identity(path, device, extra)
         with self._lock:
             if key[0] in self._blocked_sources:
                 return None
             entry = self._entries.get(key)
-            if entry is None or entry.state != "ready" or entry.busy or entry.loaded is None:
+            if (
+                entry is None
+                or entry.state != "ready"
+                or entry.busy
+                or entry.loaded is None
+            ):
                 return None
             entry.busy = True
             self._changed()
-            return PolicyLease(self, entry, cache_hit=True)
+            lease = PolicyLease(self, entry, cache_hit=True)
+        logger.info(
+            "model instance [%s] resident cache hit: source=%s device=%s",
+            entry.instance_id,
+            path,
+            device,
+        )
+        return lease
 
-    def ready(self, path: str, device: str, extra: dict[str, str]) -> LoadedPolicy | None:
+    def ready(
+        self, path: str, device: str, extra: dict[str, str]
+    ) -> LoadedPolicy | None:
         key = self.identity(path, device, extra)
         with self._lock:
             entry = self._entries.get(key)
-            return entry.loaded if entry is not None and entry.state == "ready" and not entry.busy else None
+            return (
+                entry.loaded
+                if entry is not None and entry.state == "ready" and not entry.busy
+                else None
+            )
 
     def acquire(
-        self, path: str, device: str, extra: dict[str, str], *, timeout: float | None = None
+        self,
+        path: str,
+        device: str,
+        extra: dict[str, str],
+        *,
+        timeout: float | None = None,
     ) -> PolicyLease:
         entry = self.request(path, device, extra)
         # Only a lease that is waiting for a previous owner to let go is bounded: a cold
         # load is a legitimate multi-minute wait, while a thread that will not exit is
         # something the caller must be told about instead of hanging on `pending` forever.
         deadline: float | None = None
+        owner_wait_started: float | None = None
         with self._lock:
             cache_hit = entry.state in {"ready", "stopping"}
         while True:
@@ -282,11 +320,38 @@ class PolicyResidencyManager:
                     raise RuntimeError("policy load was invalidated")
                 if entry.state == "error":
                     raise RuntimeError(entry.error)
-                if entry.state == "ready" and not entry.busy and entry.loaded is not None:
+                if (
+                    entry.state == "ready"
+                    and not entry.busy
+                    and entry.loaded is not None
+                ):
                     entry.busy = True
                     self._changed()
-                    return PolicyLease(self, entry, cache_hit=cache_hit)
+                    lease = PolicyLease(self, entry, cache_hit=cache_hit)
+                else:
+                    lease = None
                 stopping = entry.state == "stopping"
+                waiting_for_owner = stopping or entry.busy and lease is None
+            if lease is not None:
+                logger.info(
+                    "model instance [%s] acquired (%s): source=%s device=%s owner_wait=%.3fs",
+                    entry.instance_id,
+                    "resident cache hit" if cache_hit else "cold load",
+                    path,
+                    device,
+                    0.0
+                    if owner_wait_started is None
+                    else time.perf_counter() - owner_wait_started,
+                )
+                return lease
+            if waiting_for_owner and owner_wait_started is None:
+                owner_wait_started = time.perf_counter()
+                logger.info(
+                    "model instance [%s] waiting for previous inference owner to release: source=%s device=%s",
+                    entry.instance_id,
+                    path,
+                    device,
+                )
             if timeout is not None and stopping:
                 if deadline is None:
                     deadline = time.monotonic() + max(0.0, timeout)
@@ -330,21 +395,44 @@ class PolicyResidencyManager:
                 entry.stage_durations_ms.clear()
                 self._changed()
             started = time.perf_counter()
+            logger.info(
+                "model instance [%s] START cold load after %.3fs queued: source=%s device=%s; waiting for shared loader",
+                entry.instance_id,
+                time.monotonic() - entry.requested_at,
+                entry.source_path,
+                entry.device,
+            )
 
             def progress(phase: str, completed: int, target: _Entry = entry) -> None:
+                previous: tuple[str, float] | None = None
                 with self._lock:
-                    if not target.invalidated:
-                        now = time.perf_counter()
-                        if target.phase_started_at is not None:
-                            elapsed = (now - target.phase_started_at) * 1000.0
-                            target.stage_durations_ms[target.phase] = (
-                                target.stage_durations_ms.get(target.phase, 0.0) + elapsed
-                            )
-                            logger.info("model load %s: %s took %.3fs", target.source_path, target.phase, elapsed / 1000)
-                        target.phase_started_at = now
-                        target.phase = phase
-                        target.completed_steps = completed
-                        self._changed()
+                    if target.invalidated:
+                        return
+                    now = time.perf_counter()
+                    if target.phase_started_at is not None:
+                        elapsed = (now - target.phase_started_at) * 1000.0
+                        target.stage_durations_ms[target.phase] = (
+                            target.stage_durations_ms.get(target.phase, 0.0) + elapsed
+                        )
+                        previous = (target.phase, elapsed)
+                    target.phase_started_at = now
+                    target.phase = phase
+                    target.completed_steps = completed
+                    self._changed()
+                if previous is not None:
+                    logger.info(
+                        "model instance [%s] %s took %.3fs",
+                        target.instance_id,
+                        previous[0],
+                        previous[1] / 1000,
+                    )
+                logger.info(
+                    "model instance [%s] START %s: source=%s device=%s",
+                    target.instance_id,
+                    phase,
+                    target.source_path,
+                    target.device,
+                )
 
             loaded: LoadedPolicy | None = None
             failed = False
@@ -361,22 +449,36 @@ class PolicyResidencyManager:
                         extra=entry.extra,
                         progress=progress,
                     )
+                progress("finalizing", entry.total_steps)
                 storages = _tensor_storages(loaded)
                 byte_count = sum(storages.values())
-                resolved_key = self.identity(entry.source_path, entry.device, entry.extra)
-                progress("finalizing", entry.total_steps)
+                resolved_key = self.identity(
+                    entry.source_path, entry.device, entry.extra
+                )
             except Exception as exc:  # noqa: BLE001 - failures belong to one entry
+                failure_phase = entry.phase
+                failure_elapsed = 0.0
                 with self._lock:
                     if not entry.invalidated:
                         if entry.phase_started_at is not None:
-                            elapsed = (time.perf_counter() - entry.phase_started_at) * 1000.0
+                            elapsed = (
+                                time.perf_counter() - entry.phase_started_at
+                            ) * 1000.0
                             entry.stage_durations_ms[entry.phase] = (
                                 entry.stage_durations_ms.get(entry.phase, 0.0) + elapsed
                             )
-                        logger.exception("model load failed during %s: %s", entry.phase, entry.source_path)
+                            failure_elapsed = elapsed
                         entry.state, entry.phase = "error", "error"
                         entry.error = f"{type(exc).__name__}: {exc}"
                         self._changed()
+                logger.exception(
+                    "model instance [%s] FAILED %s after %.3fs: source=%s device=%s",
+                    entry.instance_id,
+                    failure_phase,
+                    failure_elapsed / 1000,
+                    entry.source_path,
+                    entry.device,
+                )
                 with entry.condition:
                     entry.condition.notify_all()
                 failed = True
@@ -398,12 +500,26 @@ class PolicyResidencyManager:
                     entry.loaded = loaded
                     entry.bytes = byte_count
                     entry.storages = storages
+                    if entry.phase_started_at is not None:
+                        entry.stage_durations_ms[entry.phase] = (
+                            entry.stage_durations_ms.get(entry.phase, 0.0)
+                            + (time.perf_counter() - entry.phase_started_at) * 1000.0
+                        )
                     entry.state, entry.phase = "ready", "ready"
                     entry.completed_steps = entry.total_steps
                     entry.load_ms = (time.perf_counter() - started) * 1000.0
-                    logger.info("model ready in %.3fs: %s", entry.load_ms / 1000, entry.source_path)
                     self._changed()
                     stored = True
+            if stored:
+                logger.info(
+                    "model instance [%s] DONE finalizing in %.3fs; model ready in %.3fs: source=%s device=%s resident_gpu_bytes=%d",
+                    entry.instance_id,
+                    entry.stage_durations_ms.get("finalizing", 0.0) / 1000,
+                    entry.load_ms / 1000,
+                    entry.source_path,
+                    entry.device,
+                    byte_count,
+                )
             with entry.condition:
                 entry.condition.notify_all()
             loaded = None

@@ -166,7 +166,8 @@ def test_load_is_coalesced_and_ready_model_skips_other_cold_load(tmp_path: Path)
         manager.close()
 
 
-def test_load_status_reports_imports_and_stage_timings(tmp_path: Path) -> None:
+def test_load_status_reports_imports_and_stage_timings(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO)
     path = _model(tmp_path / "model")
     entered = threading.Event()
     release = threading.Event()
@@ -182,6 +183,9 @@ def test_load_status_reports_imports_and_stage_timings(tmp_path: Path) -> None:
     try:
         manager.request(str(path), "cpu", {})
         assert entered.wait(2)
+        assert "START imports" in caplog.text
+        assert "queued cold load" in caplog.text
+        assert "model ready" not in caplog.text
         active = manager.status(str(path))["instances"][0]
         assert active["phase"] == "imports"
         assert active["completed_steps"] == 0
@@ -194,8 +198,96 @@ def test_load_status_reports_imports_and_stage_timings(tmp_path: Path) -> None:
         assert ready["elapsed_ms"] == ready["load_ms"]
         assert ready["stage_durations_ms"]["imports"] >= active["phase_elapsed_ms"]
         assert ready["stage_durations_ms"]["weights"] >= 0
+        assert ready["stage_durations_ms"]["finalizing"] >= 0
     finally:
         release.set()
+        manager.close()
+
+
+def test_loading_logs_never_hold_residency_lock(tmp_path: Path) -> None:
+    """A UI handler may need another thread to read status before it can finish."""
+    path = _model(tmp_path / "model")
+    manager = _manager(lambda source, **kwargs: (kwargs["progress"]("weights", 1), _loaded(source))[1])
+    blocked: list[str] = []
+
+    class StatusHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            finished = threading.Event()
+
+            def read_status() -> None:
+                manager.status(str(path))
+                finished.set()
+
+            thread = threading.Thread(target=read_status, daemon=True)
+            thread.start()
+            if not finished.wait(1):
+                blocked.append(record.getMessage())
+
+    handler = StatusHandler()
+    old_level = residency_module.logger.level
+    residency_module.logger.setLevel(logging.INFO)
+    residency_module.logger.addHandler(handler)
+    try:
+        manager.acquire(str(path), "cpu", {}).release()
+        manager.acquire_ready(str(path), "cpu", {}).release()
+        assert not blocked
+    finally:
+        residency_module.logger.removeHandler(handler)
+        residency_module.logger.setLevel(old_level)
+        manager.close()
+
+
+def test_failed_stage_is_logged_with_duration_and_no_ready(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    path = _model(tmp_path / "model")
+
+    def loader(source: str, **kwargs: Any) -> Any:
+        kwargs["progress"]("processors", 3)
+        raise ValueError("tokenizer files missing")
+
+    manager = _manager(loader)
+    try:
+        with pytest.raises(RuntimeError, match="tokenizer files missing"):
+            manager.acquire(str(path), "cpu", {})
+        assert "FAILED processors after" in caplog.text
+        assert "device=cpu" in caplog.text
+        assert "model ready" not in caplog.text
+        assert manager.status(str(path))["instances"][0]["stage_durations_ms"]["processors"] >= 0
+    finally:
+        manager.close()
+
+
+def test_owner_wait_and_cache_reuse_are_logged_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    path = _model(tmp_path / "model")
+    manager = _manager(lambda source, **kwargs: _loaded(source))
+    first = manager.acquire(str(path), "cpu", {})
+    acquired = threading.Event()
+
+    def wait_for_owner() -> None:
+        lease = manager.acquire(str(path), "cpu", {})
+        lease.release()
+        acquired.set()
+
+    waiter = threading.Thread(target=wait_for_owner, daemon=True)
+    waiter.start()
+    try:
+        deadline = time.monotonic() + 3
+        while "waiting for previous inference owner" not in caplog.text and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "waiting for previous inference owner" in caplog.text
+        assert not acquired.is_set()
+        first.release()
+        assert acquired.wait(3)
+        assert "resident cache hit" in caplog.text
+        assert caplog.text.count("waiting for previous inference owner") == 1
+    finally:
+        first.release()
+        waiter.join(timeout=3)
         manager.close()
 
 

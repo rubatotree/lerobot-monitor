@@ -11,6 +11,8 @@ import logging
 import os
 import re
 import sys
+import time
+import uuid
 from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
@@ -261,7 +263,87 @@ def load_policy(
     extra: Mapping[str, str] | None = None,
     progress: Callable[[str, int], None] | None = None,
 ) -> LoadedPolicy:
+    """Load a bundle with stage logs even outside the residency manager."""
+    load_id = uuid.uuid4().hex[:12]
+    started = time.perf_counter()
+    phase_started = started
+    current_phase = "requested"
+
     def report(phase: str, completed: int) -> None:
+        nonlocal phase_started, current_phase
+        now = time.perf_counter()
+        logger.info(
+            "model load [%s] %s elapsed %.3fs",
+            load_id,
+            current_phase,
+            now - phase_started,
+        )
+        phase_started, current_phase = now, phase
+        logger.info(
+            "model load [%s] START %s: source=%s device=%s",
+            load_id,
+            phase,
+            path,
+            device,
+        )
+        if progress is not None:
+            progress(phase, completed)
+
+    logger.info("model load [%s] requested: source=%s device=%s", load_id, path, device)
+    try:
+        loaded = _load_policy(
+            path,
+            device=device,
+            task=task,
+            robot_type=robot_type,
+            rename_map=rename_map,
+            extra=extra,
+            progress=report,
+            load_id=load_id,
+        )
+    except Exception:
+        logger.exception(
+            "model load [%s] FAILED %s after %.3fs (total %.3fs): source=%s device=%s",
+            load_id,
+            current_phase,
+            time.perf_counter() - phase_started,
+            time.perf_counter() - started,
+            path,
+            device,
+        )
+        raise
+    logger.info(
+        "model load [%s] DONE %s in %.3fs",
+        load_id,
+        current_phase,
+        time.perf_counter() - phase_started,
+    )
+    logger.info(
+        "model load [%s] bundle ready in %.3fs: source=%s device=%s",
+        load_id,
+        time.perf_counter() - started,
+        path,
+        device,
+    )
+    return loaded
+
+
+def _load_policy(
+    path: str,
+    *,
+    device: str,
+    task: str,
+    robot_type: str,
+    rename_map: dict[str, str] | None,
+    extra: Mapping[str, str] | None,
+    progress: Callable[[str, int], None],
+    load_id: str,
+) -> LoadedPolicy:
+    current_phase = "imports"
+
+    def report(phase: str, completed: int) -> None:
+        nonlocal current_phase
+        current_phase = phase
         if progress is not None:
             progress(phase, completed)
 
@@ -276,14 +358,29 @@ def load_policy(
     report("imports_factory", 0)
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
     from lerobot.utils.constants import ACTION
+    from lerobot.utils.loading import model_load_context
 
     report("cache", 0)
-    requested_revision = str((extra or {}).get("policy.pretrained_revision", "")).strip()
+    requested_revision = str(
+        (extra or {}).get("policy.pretrained_revision", "")
+    ).strip()
     cached_path = resolve_cached_policy_path(path, requested_revision)
     load_path = cached_path or path
     is_local_source = cached_path is not None or Path(path).expanduser().is_dir()
     if cached_path is not None:
-        logger.info("using cached policy snapshot for %s: %s", path, cached_path)
+        logger.info(
+            "model load [%s] resolved local policy snapshot: source=%s cache=%s",
+            load_id,
+            path,
+            cached_path,
+        )
+    else:
+        logger.info(
+            "model load [%s] no complete local policy snapshot: source=%s revision=%s",
+            load_id,
+            path,
+            requested_revision or "default",
+        )
 
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(
@@ -303,11 +400,19 @@ def load_policy(
         apply_policy_overrides(cfg, extra)
         vlm_model_name = getattr(cfg, "vlm_model_name", None)
         if isinstance(vlm_model_name, str) and vlm_model_name:
+            report("vlm_cache", 0)
             cached_vlm = resolve_cached_vlm_path(
-                vlm_model_name, require_weights=getattr(cfg, "load_vlm_weights", True),
+                vlm_model_name,
+                require_weights=getattr(cfg, "load_vlm_weights", True),
             )
             if cached_vlm is not None:
-                logger.info("using cached VLM snapshot for %s: %s", vlm_model_name, cached_vlm)
+                logger.info(
+                    "model load [%s] resolved VLM dependency: source=%s cache=%s weights_required=%s",
+                    load_id,
+                    vlm_model_name,
+                    cached_vlm,
+                    getattr(cfg, "load_vlm_weights", True),
+                )
                 cfg.vlm_model_name = cached_vlm
             elif local_only and cfg.type == "smolvla":
                 # The policy's local_files_only flag is not forwarded into its
@@ -321,8 +426,16 @@ def load_policy(
         report("imports_policy", 1)
         policy_cls = get_policy_class(cfg.type)
         report("weights", 1)
-        policy = policy_cls.from_pretrained(load_path, config=cfg, local_files_only=local_only)
+        with model_load_context(load_id):
+            policy = policy_cls.from_pretrained(
+                load_path, config=cfg, local_files_only=local_only
+            )
         report("device", 2)
+        logger.info(
+            "model load [%s] ensuring final device=%s and evaluation mode (native loader may already place weights)",
+            load_id,
+            device,
+        )
         policy = policy.to(device)
         policy.eval()
         report("processors", 3)
@@ -354,7 +467,11 @@ def load_policy(
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             dataset_features={
-                ACTION: {"dtype": "float32", "shape": (len(ordered),), "names": ordered},
+                ACTION: {
+                    "dtype": "float32",
+                    "shape": (len(ordered),),
+                    "names": ordered,
+                },
             },
             ordered_action_keys=ordered,
             robot_type=robot_type,
@@ -368,7 +485,14 @@ def load_policy(
         with _prefer_hub_cache():
             return _load(local_only=True)
     except Exception as exc:
-        logger.info("policy not fully cached (%s); allowing Hugging Face download for %s", exc, path)
+        logger.info(
+            "model load [%s] local-only attempt failed during %s (%s: %s); allowing Hugging Face download for %s",
+            load_id,
+            current_phase,
+            type(exc).__name__,
+            exc,
+            path,
+        )
         return _load(local_only=False)
 
 

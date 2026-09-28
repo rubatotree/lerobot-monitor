@@ -3128,7 +3128,134 @@ const RATE_HZ_MIN = 1;
 const RATE_HZ_MAX = 240;
 let ratePanelAnchor = null;
 
+function rolloutSpeedSelection() {
+  return window.RolloutSpeed.inspect($("pol-fps")?.value ?? 15, $("pol-execution-speed")?.value ?? 1);
+}
+
+function rolloutSpeedSummary(base, speed) {
+  const value = window.RolloutSpeed.inspect(base, speed);
+  if (value.error) return value.error;
+  const format = window.RolloutSpeed.format;
+  return `${format(value.baseHz)} Hz × ${format(value.multiplier)} → ${format(value.effectiveHz)} Hz target`;
+}
+
+function syncRolloutSpeedUi(status = last || {}) {
+  const selected = rolloutSpeedSelection();
+  const format = window.RolloutSpeed.format;
+  const running = status.mode === "rollout";
+  const pending = status.task?.pending === "rollout_start";
+  const nextRun = running || pending;
+  $("rollout-speed-label").textContent = `${nextRun ? "Next " : ""}${format(selected.multiplier)}×`;
+  $("rollout-speed-preview").textContent = `${nextRun ? "Next: " : ""}${rolloutSpeedSummary(selected.baseHz, selected.multiplier)}`;
+  const liveText = running
+    ? `Running: ${format(Number(status.rates?.execution_speed ?? status.task?.execution_speed ?? 1))}× · target ${format(Number(status.rates?.effective_policy_hz ?? status.task?.effective_policy_fps ?? status.rates?.policy_hz))} Hz. Changes apply next rollout.`
+    : pending ? "Loading rollout keeps its starting speed. Changes apply next rollout." : "";
+  ["rollout-speed-live", "rollout-speed-panel-live"].forEach(id => {
+    const node = $(id);
+    node.textContent = liveText;
+    node.hidden = !liveText;
+  });
+  const warning = window.RolloutSpeed.startError(selected.baseHz, selected.multiplier, status.rates);
+  $("rollout-speed-warning").textContent = warning;
+  $("rollout-speed-warning").hidden = !warning;
+  document.querySelectorAll("[data-rollout-speed]").forEach(button => {
+    button.setAttribute("aria-pressed", String(Number(button.dataset.rolloutSpeed) === selected.multiplier));
+  });
+  if (!$("rollout-speed-panel").classList.contains("hidden")) updateRolloutSpeedDraft();
+}
+
+function positionRolloutSpeedPanel() {
+  const panel = $("rollout-speed-panel");
+  if (panel.classList.contains("hidden")) return;
+  const anchor = $("rollout-speed");
+  if (!anchor.getClientRects().length) {
+    closeRolloutSpeedPanel(false);
+    return;
+  }
+  const rect = anchor.getBoundingClientRect();
+  const size = panel.getBoundingClientRect();
+  const maxLeft = Math.max(8, innerWidth - size.width - 8);
+  const maxTop = Math.max(8, innerHeight - size.height - 8);
+  const top = rect.bottom + 6 <= maxTop ? rect.bottom + 6 : rect.top - size.height - 6;
+  panel.style.left = `${Math.max(8, Math.min(rect.left, maxLeft))}px`;
+  panel.style.top = `${Math.max(8, Math.min(top, maxTop))}px`;
+}
+
+function updateRolloutSpeedDraft() {
+  const input = $("rollout-speed-custom");
+  const inspected = window.RolloutSpeed.inspect($("pol-fps").value, input.value);
+  $("rollout-speed-draft").textContent = inspected.error ? "" : rolloutSpeedSummary(inspected.baseHz, inspected.multiplier);
+  $("rollout-speed-error").textContent = inspected.error
+    || window.RolloutSpeed.startError(inspected.baseHz, inspected.multiplier, last?.rates);
+  input.setAttribute("aria-invalid", String(!!inspected.error));
+  positionRolloutSpeedPanel();
+}
+
+function openRolloutSpeedPanel() {
+  closeRatePanel({ restoreFocus: false });
+  $("rollout-speed-custom").value = $("pol-execution-speed").value;
+  $("rollout-speed-panel").classList.remove("hidden");
+  $("rollout-speed").setAttribute("aria-expanded", "true");
+  syncRolloutSpeedUi();
+  positionRolloutSpeedPanel();
+  $("rollout-speed-panel").focus({ preventScroll: true });
+}
+
+function closeRolloutSpeedPanel(restoreFocus = true) {
+  $("rollout-speed-panel").classList.add("hidden");
+  $("rollout-speed").setAttribute("aria-expanded", "false");
+  if (restoreFocus) $("rollout-speed").focus({ preventScroll: true });
+}
+
+function applyRolloutSpeed(value) {
+  const inspected = window.RolloutSpeed.inspect($("pol-fps").value, value);
+  if (inspected.error) {
+    $("rollout-speed-custom").value = String(value);
+    $("rollout-speed-error").textContent = inspected.error;
+    $("rollout-speed-custom").setAttribute("aria-invalid", "true");
+    positionRolloutSpeedPanel();
+    $("rollout-speed-custom").focus();
+    return;
+  }
+  // This is next-run configuration. Arm output settings and an active run stay independent.
+  $("pol-execution-speed").value = String(inspected.multiplier);
+  syncRolloutSpeedUi();
+  updateTaskInfo();
+  persistUi();
+  closeRolloutSpeedPanel();
+}
+
+$("rollout-speed").addEventListener("click", () => {
+  if ($("rollout-speed-panel").classList.contains("hidden")) openRolloutSpeedPanel();
+  else closeRolloutSpeedPanel();
+});
+$("rollout-speed-close").addEventListener("click", () => closeRolloutSpeedPanel());
+$("rollout-speed-apply").addEventListener("click", () => applyRolloutSpeed($("rollout-speed-custom").value));
+$("rollout-speed-custom").addEventListener("input", updateRolloutSpeedDraft);
+$("rollout-speed-custom").addEventListener("keydown", event => {
+  if (event.key === "Enter") { event.preventDefault(); applyRolloutSpeed(event.currentTarget.value); }
+});
+$("pol-fps").addEventListener("input", () => { syncRolloutSpeedUi(); updateTaskInfo(); });
+document.querySelectorAll("[data-rollout-speed]").forEach(button => {
+  button.addEventListener("click", () => applyRolloutSpeed(button.dataset.rolloutSpeed));
+});
+document.addEventListener("pointerdown", event => {
+  if (!event.target.closest?.("#rollout-speed-panel, #rollout-speed")) closeRolloutSpeedPanel(false);
+}, true);
+document.addEventListener("keydown", event => {
+  if (event.key !== "Escape" || $("rollout-speed-panel").classList.contains("hidden")) return;
+  event.stopImmediatePropagation();
+  event.preventDefault();
+  closeRolloutSpeedPanel();
+});
+window.addEventListener("resize", positionRolloutSpeedPanel);
+window.addEventListener("scroll", event => {
+  if (event.target instanceof Node && $("rollout-speed-panel").contains(event.target)) return;
+  positionRolloutSpeedPanel();
+}, { capture: true, passive: true });
+
 function updateRateDisplay(d) {
+  syncRolloutSpeedUi(d);
   const rates = d.rates || {};
   const cadence = d.cadence || {};
   const output = Number(cadence.actual_hz || 0);
@@ -3169,7 +3296,7 @@ function updateRateStats(d, rates, cadence) {
   const policy = !!rates.policy_hz;
   row("policy", policy);
   if (policy) {
-    set("rate-stat-policy", `${rates.policy_hz} Hz · ${d.rollout_inference_ms?.toFixed(1) || "—"} ms${d.rollout_waiting ? " · waiting" : ""}`);
+    set("rate-stat-policy", `${rates.policy_hz} base → ${rates.effective_policy_hz ?? rates.policy_hz} Hz target @${rates.execution_speed ?? 1}× · ${d.rollout_inference_ms?.toFixed(1) || "—"} ms${d.rollout_waiting ? " · waiting" : ""}`);
   }
   const dataset = !!(rates.dataset_hz || rates.video_hz);
   row("dataset", dataset);
@@ -4144,7 +4271,8 @@ function rolloutFields() {
     task: $("pol-task").value,
     duration_s: Number($("pol-dur").value),
     device: $("pol-dev").value.trim() || "cuda",
-    policy_fps: Number($("pol-fps") && $("pol-fps").value) || 15,
+    policy_fps: Number($("pol-fps")?.value ?? 15),
+    execution_speed: Number($("pol-execution-speed")?.value ?? 1),
     interpolation: !!$("pol-interpolation")?.checked,
     auto_record: autoRecord,
     extra: kvPairs(),
@@ -4158,6 +4286,8 @@ function applyRolloutFields(p) {
   if (p.device != null) $("pol-dev").value = p.device;
   const policyFps = p.policy_fps ?? p.fps;
   if (policyFps != null && $("pol-fps")) $("pol-fps").value = policyFps;
+  $("pol-execution-speed").value = String(p.execution_speed ?? 1);
+  syncRolloutSpeedUi();
   if (p.interpolation != null && $("pol-interpolation")) $("pol-interpolation").checked = !!p.interpolation;
   if (p.extra != null) setKvPairs(p.extra);
   populateModelSelects();
@@ -4456,7 +4586,8 @@ function updateTaskInfo() {
     ...robotFlags,
     flag("task", roll.task || ""),
     flag("duration", roll.duration_s),
-    flag("fps", roll.policy_fps),
+    `# execution: ${rolloutSpeedSummary(roll.policy_fps, roll.execution_speed)}`,
+    flag("fps", Number((roll.policy_fps * roll.execution_speed).toPrecision(12))),
     autoRecord ? flag("dataset.repo_id", rec.repo_id || "") : null,
     autoRecord ? flag("dataset.single_task", roll.task || rec.task || "") : null,
     autoRecord ? flag("dataset.fps", actionFps) : null,
@@ -4839,6 +4970,9 @@ bind("btn-hdr-rollout", () => {
     localLog("rollout is active — use Stop");
     return;
   }
+  const selectedSpeed = rolloutSpeedSelection();
+  const speedError = window.RolloutSpeed.startError(selectedSpeed.baseHz, selectedSpeed.multiplier, last?.rates);
+  if (speedError) { toastError(new Error(speedError)); return; }
   exitReplayForControl();
   const path = ($("pol-path") && $("pol-path").value.trim()) || "(no policy)";
   return runAction("btn-hdr-rollout", `rollout requested — loading ${path}`, () => {

@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
-  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260928-rollout-ribbons"/>
+  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260928-execution-speed"/>
   <script src="/lerobot/static/vendor/chart/chart.umd.min.js"></script>
   <script type="importmap">
     {
@@ -488,9 +488,20 @@
                 <label>Duration s
                   <input id="pol-dur" type="number" value="60" min="0" step="1"/>
                 </label>
-                <label>Policy FPS
-                  <input id="pol-fps" type="number" value="15" min="1" step="1"/>
+                <label>Base policy FPS
+                  <input id="pol-fps" type="number" value="15" min="1" max="240" step="1"/>
                 </label>
+              </div>
+              <div class="rate-field rollout-speed-field">
+                <span>Execution speed</span>
+                <input id="pol-execution-speed" type="hidden" value="1"/>
+                <button type="button" class="rate-chip" id="rollout-speed" aria-haspopup="dialog" aria-controls="rollout-speed-panel" aria-expanded="false">
+                  <span id="rollout-speed-label" class="rate-chip-value">1×</span>
+                  <span class="rate-chip-source" aria-hidden="true">▾</span>
+                </button>
+                <p id="rollout-speed-preview" class="rate-hint">15 Hz × 1 → 15 Hz target</p>
+                <p id="rollout-speed-live" class="rate-hint" hidden></p>
+                <p id="rollout-speed-warning" class="rate-hint rollout-speed-warning" role="status" hidden></p>
               </div>
               <div class="rate-field">
                 <span>Arm rate</span>
@@ -718,6 +729,32 @@
     </footer>
   </div>
 
+  <div id="rollout-speed-panel" class="rate-popover hidden" role="dialog" tabindex="-1" aria-labelledby="rollout-speed-title">
+    <header class="rate-panel-head">
+      <h2 id="rollout-speed-title">Execution speed</h2>
+      <button type="button" id="rollout-speed-close" class="rate-close" aria-label="Close execution speed settings">×</button>
+    </header>
+    <p id="rollout-speed-panel-live" class="rate-hint" hidden></p>
+    <div class="rollout-speed-presets" role="group" aria-label="Execution speed presets">
+      <button type="button" data-rollout-speed="0.25">0.25×</button>
+      <button type="button" data-rollout-speed="0.5">0.5×</button>
+      <button type="button" data-rollout-speed="0.75">0.75×</button>
+      <button type="button" data-rollout-speed="1">1×</button>
+      <button type="button" data-rollout-speed="1.5">1.5×</button>
+      <button type="button" data-rollout-speed="2">2×</button>
+      <button type="button" data-rollout-speed="4">4×</button>
+      <button type="button" data-rollout-speed="8">8×</button>
+    </div>
+    <label class="rate-row" for="rollout-speed-custom">
+      <span>Custom multiplier</span>
+      <span class="rate-entry"><input id="rollout-speed-custom" type="number" step="any" value="1" aria-describedby="rollout-speed-draft rollout-speed-error"/><span class="rate-unit">×</span></span>
+    </label>
+    <p id="rollout-speed-draft" class="rate-hint"></p>
+    <p class="rate-hint">Applies when the next rollout starts. Effective execution rate: 0.1–240 Hz.</p>
+    <p id="rollout-speed-error" class="rate-error" role="status" aria-live="polite"></p>
+    <footer class="rate-panel-foot"><span></span><button type="button" id="rollout-speed-apply">Use custom speed</button></footer>
+  </div>
+
   <div id="library-modal" class="library-modal hidden" role="dialog" aria-modal="true" aria-labelledby="library-modal-title">
     <div class="library-modal-card">
       <header class="library-modal-head">
@@ -731,7 +768,8 @@
   </div>
 
   <script type="module" src="/lerobot/static/rollout-lanes.js?v=20260928-rollout-ribbons"></script>
-  <script src="/lerobot/static/app.js?v=20260928-rollout-ribbons"></script>
+  <script src="/lerobot/static/rollout-speed.js?v=20260928-execution-speed"></script>
+  <script src="/lerobot/static/app.js?v=20260928-execution-speed"></script>
   <script type="module" src="/lerobot/static/robot-preview.js?v=20260923-arm-preview-2"></script>
 </body>
 </html>

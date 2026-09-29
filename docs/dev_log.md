@@ -1,5 +1,14 @@
 # Dev log
 
+## 2026-09-29：Rollout 虚线预测适配队列耗尽型策略
+
+- 现象：SmolVLA rollout 的动作图始终没有虚线预测（本机与云端 sync 一致），ACT 正常。根因：两个 SmolVLA 检查点均为 `n_action_steps=1 / chunk_size=50`，`select_action` 入队 1 步随即弹出，预览读取时队列恒为空；既有预览链（RTC 队列 → ACT temporal ensembler → policy 队列）无法看到被丢弃的其余 49 步。
+- 修复：新增 `PredictedChunkCapture`，在 `load_policy` 时包装策略的 chunk 生产者（`_get_action_chunk` 优先，否则 `predict_action_chunk`），记录最近一次原始 chunk；`reset` / `drop_queued_actions` 同步清空，超过 10 s 的记录视为过期。消费量由策略自身队列推出（`min(n_action_steps, T) - len(queue)`），`inference_leftover_poses` 将其作为队列之后的最终回退；队列可用时行为完全不变。
+- 通用性：现有全部 chunking policy 的生成都路由到这两个函数之一（仅 SmolVLA/XVLA 绕过公开 API 走 `_get_action_chunk`），未来遵循任一约定的策略自动获得虚线预览；无 chunk 生产者的策略保持原行为。遥测失败一律静默降级为空预览，不影响控制。
+- 云端：`NativePolicyBackend._queued_actions` 在队列空时回退到同一捕获尾部；**需要重新准备 4090 的推理运行时**（worker 代码哈希已变）才会生效。
+- 验证：本机 RTX 4060 真实加载 `rubatotree/classify-blocks-2-smolvla`，sync 引擎每 tick `preview_steps` 由 0 变为 49；`rubatotree/so101_classify_the_blocks_act_512` 回归 99→98→97 逐步收缩（队列路径不变）。新增 7 项回归测试（捕获安装/幂等/reset/drop 清空/过期拒绝/队列优先/worker 回退与过期）。`test_loop + test_monitor_cloud + test_cloud_worker + test_policy` 合计 151 passed / 1 skipped；剩余 2 项失败是本机 HF 缓存污染的既有问题（`registry.list()` 扫到 8 个真实模型）。Ruff 与基线一致（新增 0 项）。
+- 边界：渲染链路未改动（虚线前端早已就绪），本轮未跑浏览器 smoke，未在真实 4090 云服务上验证。
+
 ## 2026-09-28：模型加载取消与占用释放
 
 - 在功能实现前补充 ROADMAP。目标为模型卡片增加取消加载和释放占用实例，统一复用当前常驻管理器、实例身份及 Rollout / Debug 停止协议。
@@ -809,3 +818,31 @@
 - 旧 `cloud://...?...gpu=` 地址仍可解析；模型注册表启动时保留原模型 ID，自动清除旧 GPU 字段并写成稳定地址。
 - 浏览器验收确认添加窗口仅选择主机／部署，模型卡 Load 才显示实时 GPU；GPU 5 空闲，其余忙卡显示占用者并禁用。ACT 在 GPU 5 的真实 Load 成功，随后 Unload 成功，模型条目与稳定地址继续保留；未执行推理或机械臂动作。
 - 最终受影响回归 **233 passed、2 skipped、1 deselected**；定向云模型身份、迁移与 Load 选择测试 **12 passed**，Python／JavaScript 语法和差异检查通过。
+
+## 2026-09-29：Cloud manager 合并进 Monitor 主页
+
+- 用户要求把独立 `lerobot-cloud-manager`（端口 8095）的功能全部并入 Monitor 主页作为 Cloud 面板。新增 `cloud_api.py`，把主机注册／探测／连接／断开／初始化／升级／上传／运行环境／任务和云端 API 代理统一挂到 Monitor 的 `/api/cloud/*`，后端仍复用 `CloudManager`、`SSHTransport` 与 `MonitorCloudClient`，浏览器不接触令牌。
+- 前端新增 `cloud-panel.js`（ES 模块）与 index.html 的 `cloud` 侧栏页签，复刻服务器、GPU、Cloud models、Recent jobs 四个区块和新增／加载／日志／移除对话框；轮询只在面板可见且标签页活动时进行。`app.js` 在 Cloud 页签隐藏 preset 工具栏；六个 tab 的 `min-width` 调整到 54px，保证默认侧栏宽度下 Cloud 页签完整可见。
+- 模型库接入保持原有 `cloud://<host>/<deployment>` 流程，面板的 Use 按钮复用 `POST /api/models/cloud`，把部署登记到普通模型库供 Rollout／Debug 选择。
+- 合并时发现既有健壮性问题：`CloudManager` 构造会直接读取 `~/.lerobot-cloud-manager/hosts.json` 与 `credentials.json`，本机 `credentials.json` 被 ACL 锁定导致 Monitor 完全无法启动。改为「不可读或损坏即降级为空集合」，主机行逐条跳过损坏条目；损坏的 hosts.json 不再回退到默认主机。
+- `MonitorCloudClient.request` 新增 `params` 透传并携带上游状态码，使代理能把远端 409（重名部署）与网关 502 区分开；代理继续复用独立管理器的 `safe_proxy_path` 白名单，请求体上限 64 MiB。Monitor 面向可信网络且可绑定 `0.0.0.0`，因此未照搬独立管理器的回环 Host／同源校验，并在文档中写明信任边界。
+- 测试：新增 `tests/test_cloud_api.py`（hosts／probe／bootstrap／upload 校验／runtime／代理参数与状态／不可用 manager），`test_cloud_manager.py` 增加损坏状态降级用例，`test_monitor_cloud.py` 增加请求参数与状态用例；新增 `scripts/test-cloud-panel.mjs`（纯函数边界 + jsdom DOM 渲染/加载/上传/日志/错误对话框）与 `scripts/verify-cloud-panel.cjs`（启动真实 Monitor + Chromium 四视口）。
+- 验证结果：cloud 相关后端 94 passed、1 skipped；Cloud 面板 JS 7 passed；原独立 cloud UI 12 passed；Chromium 390／768／1440／1920 全部通过，无横向溢出、无 console 错误，Add 对话框在轮询期间保持输入，Load 走同源代理 `POST .../pi/load`。本机 .venv 缺少 `torch`／`huggingface_hub`，`test_native_rollout_profiling.py` 及 8 个依赖这两者的既有用例无法运行，属环境缺口；`test_status_without_hardware` 的 `Deploy` HTML 断言随面板文案（+ Add）调整后通过。
+- 未验证：未连接真实 8x4090-server，未执行真实 SSH bootstrap／upload／runtime／推理；独立服务仍在，真实远端链路沿用此前验收记录。
+
+### Library「Add model」改为本地／云端双页签
+
+- 用户反馈：添加模型弹窗把来源做成下拉框，云端和本地字段同时出现，云端还要求填本地地址。
+- 根因：`openDownloadModal` 只对 `.library-modal-grid`／`.library-modal-search` 切换 `hidden` 类，而样式表里没有这个类的通用规则，所以两个来源的表单一直同时显示，「Source」下拉只改了按钮文案。
+- 改为顶部两枚 `role=tab` 分段控件 Local／Cloud：本地页签保留搜索、Address、Revision；云端页签只保留 SSH host、Deployment、Connect and refresh。Name 提到页签下方，两个来源共用。切换页签会隐藏整块 pane 并清空旧的状态/错误提示，支持左右方向键切换与 roving tabindex。
+- 补充 `.library-modal-pane.hidden` 与 `.library-modal-tabs` 样式（沿用产品既有的 10px 大写、`--accent` 下划线、`--line` 边框语言），并给 `.library-modal-body > label input/select` 补上输入框样式——该规则同时修好了此前同样未套用样式的云端 Load 弹窗 GPU 选择框。
+- 校验：新增 `scripts/verify-library-model-tabs.cjs`，在真实 Monitor ＋ Chromium 中断言本地校验不再触发云端登记、切到 Cloud 后 Address 完全不可见、Connect 后出现 2 个部署、提交只发出一次 `POST /api/models/cloud`（`host_id`／`deployment_id` 正确），并在 390／768／1440 三个宽度确认无横向溢出、无 console 错误。
+
+### 云模型侧栏加载状态与云端 rollout 动作预测线
+
+- 现象一：Models 侧栏的云模型加载时没有进度条，完成后也不显示 Ready。根因：`MonitorCloudClient.residency()` 只读 `_deployments` 缓存，而缓存只在 catalog／`deployment()` 请求时刷新；`submit_load` 之后没有任何刷新，状态一直是 unloaded，也没有 loading 状态。
+- 修复：`submit_load` 立即把缓存写成 loading；`residency()` 触发限流（loading/unloading 时 1s，否则 3s）的后台线程刷新已连接主机的部署列表（不连接的主机不会因状态推送而被建立 SSH 隧道），并用 `_local_changes` 代数丢弃提交前发出的过期应答。新增 loading／unloading／error 状态及带 `remote`、`elapsed_ms` 的实例；侧栏对云实例显示「Loading on cloud GPU · Ns elapsed」，并隐藏对云端无意义的 Cancel load 按钮。云端不提供阶段信息，进度条保持不确定态。
+- 现象二：云端 SmolVLA rollout 时动作曲线没有本机推理时的虚线预测。根因：云 sync 的 `PolicyWorker.preview` 恒为空列表，云 RTC 走本机 tensor 映射读不到远端队列。
+- 修复：云 worker 的 `select_action` 响应新增 `queued_actions`（策略队列或 ACT temporal ensembler 中剩余动作经 postprocessor 处理后的绝对值，失败则为空，不影响推理）；`RemoteSyncInferenceEngine`／`RemoteRTCInferenceEngine` 新增 `leftover_poses`，`inference_leftover_poses` 优先使用引擎自带钩子。旧版云服务不返回该字段时预测线为空，行为与之前一致。
+- **需要重新升级 4090 上的云服务**才能让 worker 回传 `queued_actions`（worker 代码哈希已变）。
+- 测试：新增 worker 队列预览／失败降级、sync／RTC 引擎预览、residency loading→ready、失败加载、未连接主机不刷新共 9 项；相关回归通过。已知与本次无关的失败：`ModelRegistry.list()` 会扫到本机真实 HF 缓存模型导致两个云模型注册用例断言 `len == 1`／`== []` 不成立，以及缺少 `huggingface_hub` 的用例。未在真实 4090 上验证。

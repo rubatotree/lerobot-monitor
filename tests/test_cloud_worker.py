@@ -91,6 +91,70 @@ def test_select_preserves_history_drops_old_task_and_uses_amp(backend: NativePol
     assert backend.session["task"] == "new task"
 
 
+def test_select_reports_queued_actions_for_the_chart_preview(backend: NativePolicyBackend) -> None:
+    from collections import deque
+
+    assert backend.infer(request())["queued_actions"] == []
+    queue = deque([tensor([[3, 4]]), tensor([[5, 6]])])
+    backend.loaded.policy._queues = {"action": queue}
+    result = backend.infer(request())
+    assert result["queued_actions"] == [[13, 14], [15, 16]]
+    # Previewing processes clones, so the policy's own queue keeps its raw values.
+    assert [item.tolist() for item in queue] == [[[3, 4]], [[5, 6]]]
+
+
+def test_queued_action_preview_failure_never_breaks_inference(backend: NativePolicyBackend) -> None:
+    from collections import deque
+
+    backend.loaded.policy._queues = {"action": deque([tensor([[1, 2, 3]])])}
+    result = backend.infer(request())
+    assert result["actions"] == [[11, 12]]
+    assert result["queued_actions"] == []
+
+
+def test_queued_actions_fall_back_to_the_captured_chunk(backend: NativePolicyBackend) -> None:
+    import time
+    from collections import deque
+
+    from lerobot_monitor.policy import PredictedChunkCapture
+
+    # n_action_steps=1 (SmolVLA-style): the select_action pop drains the queue,
+    # so the preview must come from the recorded chunk producer output.
+    policy = backend.loaded.policy
+    policy.config.n_action_steps = 1
+    policy._queues = {"action": deque(maxlen=1)}
+    capture = PredictedChunkCapture("_get_action_chunk")
+    capture.chunk = tensor([[[1, 2], [3, 4], [5, 6]]])
+    capture.recorded_at = time.perf_counter()
+    policy._monitor_chunk_capture = capture
+
+    result = backend.infer(request())
+
+    assert result["actions"] == [[11, 12]]
+    assert result["queued_actions"] == [[13, 14], [15, 16]]
+
+
+def test_queued_actions_ignore_a_stale_captured_chunk(backend: NativePolicyBackend) -> None:
+    from collections import deque
+
+    from lerobot_monitor.policy import PredictedChunkCapture
+
+    policy = backend.loaded.policy
+    policy.config.n_action_steps = 1
+    policy._queues = {"action": deque(maxlen=1)}
+    capture = PredictedChunkCapture("_get_action_chunk")
+    capture.chunk = tensor([[[1, 2], [3, 4]]])
+    capture.recorded_at -= 3600.0
+    policy._monitor_chunk_capture = capture
+
+    assert backend.infer(request())["queued_actions"] == []
+
+
+def test_chunk_modes_do_not_report_a_queue(backend: NativePolicyBackend) -> None:
+    backend.session["mode"] = "debug_chunk"
+    assert "queued_actions" not in backend.infer(request(chunk_size=1))
+
+
 def test_debug_chunk_resets_and_returns_cpu_absolute_and_raw(backend: NativePolicyBackend) -> None:
     backend.session["mode"] = "debug_chunk"
     result = backend.infer(request(chunk_size=1))

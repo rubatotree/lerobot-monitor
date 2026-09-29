@@ -482,6 +482,9 @@ def _load_policy(
         )
         policy = policy.to(device)
         policy.eval()
+        # Record predicted chunks at the producer so the rollout chart's dashed
+        # preview also works for policies that drain their queue every step.
+        install_predicted_chunk_capture(policy)
         report("processors", 3)
         preprocessor_overrides = {
             "device_processor": {"device": device},
@@ -668,6 +671,146 @@ def _policy_action_queue(policy: Any) -> deque | None:
     return None
 
 
+_PREDICTED_CHUNK_MAX_AGE_S = 10.0
+_PREDICTED_CHUNK_MAX_STEPS = 512
+# ``select_action`` of most chunking policies routes through ``predict_action_chunk``;
+# SmolVLA/XVLA bypass it via ``_get_action_chunk``, so the inner producer wins.
+_CHUNK_PRODUCER_NAMES = ("_get_action_chunk", "predict_action_chunk")
+
+
+class PredictedChunkCapture:
+    """Records the last action chunk a policy generated (chart telemetry only).
+
+    Chunking policies enqueue at most ``n_action_steps`` steps per generation and
+    discard the rest of the prediction.  With ``n_action_steps == 1`` the queue is
+    empty again right after ``select_action`` pops, so queue-based previews (the
+    rollout chart's dashed overlay) can never see such a policy's future — SmolVLA
+    checkpoints commonly train with ``n_action_steps: 1``.  Recording the chunk at
+    the producer keeps the preview available for every chunking policy, present and
+    future, without extra inference passes.
+    """
+
+    __slots__ = ("chunk", "producer", "recorded_at")
+
+    def __init__(self, producer: str) -> None:
+        self.chunk: Any | None = None
+        self.recorded_at: float = 0.0
+        self.producer = producer
+
+    def record(self, value: Any) -> None:
+        try:
+            self.chunk = _as_action_chunk_tensor(value)
+            self.recorded_at = time.perf_counter()
+        except Exception:  # noqa: BLE001 - telemetry must not affect inference
+            self.chunk = None
+
+    def clear(self) -> None:
+        self.chunk = None
+        self.recorded_at = 0.0
+
+
+def install_predicted_chunk_capture(policy: Any) -> PredictedChunkCapture | None:
+    """Wrap the policy's chunk producer so rollout previews can read the prediction.
+
+    Also clears the recording on ``reset``/``drop_queued_actions`` so a stale chunk
+    from an earlier episode or task never reaches the charts.  Idempotent per policy
+    instance; policies without a chunk producer keep queue-based previews only.
+    """
+    existing = getattr(policy, "_monitor_chunk_capture", None)
+    if isinstance(existing, PredictedChunkCapture):
+        return existing
+    try:
+        producer_name = next(
+            (name for name in _CHUNK_PRODUCER_NAMES if callable(getattr(policy, name, None))),
+            None,
+        )
+        if producer_name is None:
+            return None
+        producer = getattr(policy, producer_name)
+        capture = PredictedChunkCapture(producer_name)
+
+        @wraps(producer)
+        def recording_producer(*args: Any, **kwargs: Any) -> Any:
+            result = producer(*args, **kwargs)
+            capture.record(result)
+            return result
+
+        setattr(policy, producer_name, recording_producer)
+
+        for clearer_name in ("reset", "drop_queued_actions"):
+            clearer = getattr(policy, clearer_name, None)
+            if not callable(clearer):
+                continue
+
+            @wraps(clearer)
+            def clearing(*args: Any, _clearer: Any = clearer, **kwargs: Any) -> Any:
+                capture.clear()
+                return _clearer(*args, **kwargs)
+
+            setattr(policy, clearer_name, clearing)
+
+        policy._monitor_chunk_capture = capture
+        return capture
+    except Exception as exc:  # noqa: BLE001 - telemetry must not break policy loading
+        logger.debug("could not install predicted-chunk capture: %s", exc)
+        return None
+
+
+def predicted_chunk_tail(
+    policy: Any,
+    *,
+    max_age_s: float = _PREDICTED_CHUNK_MAX_AGE_S,
+    max_steps: int = _PREDICTED_CHUNK_MAX_STEPS,
+) -> Any | None:
+    """Unconsumed tail ``(B, T', A)`` of the policy's last recorded chunk, or None.
+
+    Consumption is derived from the policy's own action queue: a chunking policy
+    keeps ``min(n_action_steps, chunk)`` steps per generation and pops one per
+    ``select_action`` call, so ``kept - len(queue)`` steps are already dispatched.
+    Raw (pre-postprocessor) values; callers map steps through the postprocessor.
+    """
+    capture = getattr(policy, "_monitor_chunk_capture", None)
+    if not isinstance(capture, PredictedChunkCapture):
+        return None
+    chunk = capture.chunk
+    if chunk is None:
+        return None
+    if time.perf_counter() - capture.recorded_at > max_age_s:
+        return None
+    try:
+        total = int(chunk.shape[1])
+        configured = getattr(getattr(policy, "config", None), "n_action_steps", None)
+        kept = min(int(configured), total) if configured else total
+        queue = _policy_action_queue(policy)
+        consumed = kept - len(queue) if queue is not None else kept
+        consumed = min(max(consumed, 0), total)
+        if consumed >= total:
+            return None
+        return chunk[:, consumed : consumed + max_steps, :]
+    except Exception:  # noqa: BLE001 - telemetry must not affect control
+        return None
+
+
+def predicted_chunk_tail_poses(
+    loaded: LoadedPolicy,
+    fallback_joints: Mapping[str, float],
+    *,
+    max_age_s: float = _PREDICTED_CHUNK_MAX_AGE_S,
+) -> list[dict[str, float]]:
+    """Project the recorded chunk tail into joint poses for the rollout chart."""
+    tail = predicted_chunk_tail(loaded.policy, max_age_s=max_age_s)
+    if tail is None:
+        return []
+    poses: list[dict[str, float]] = []
+    for index in range(int(tail.shape[1])):
+        try:
+            poses.append(_action_pose(loaded.postprocessor(tail[:, index, :]), loaded, fallback_joints))
+        except Exception as exc:  # noqa: BLE001 - chart telemetry must not affect control
+            logger.debug("could not project predicted chunk step for the rollout chart: %s", exc)
+            break
+    return poses
+
+
 def action_queue_state(target: Any) -> tuple[int | None, int | None]:
     """Return ``(remaining, index)`` for a policy or inference-engine queue."""
     try:
@@ -811,10 +954,15 @@ def inference_leftover_poses(
     fallback_joints: Mapping[str, float],
 ) -> list[dict[str, float]]:
     """Return future actions from the active LeRobot engine, without extra inference."""
+    # Cloud engines already hold joint-space poses; LeRobot's tensor mapping does not apply.
+    remote = getattr(engine, "leftover_poses", None)
+    if callable(remote):
+        return remote(fallback_joints)
     return (
         rtc_leftover_poses(engine, loaded, fallback_joints)
         or temporal_ensemble_poses(loaded, fallback_joints)
         or sync_leftover_poses(loaded, fallback_joints)
+        or predicted_chunk_tail_poses(loaded, fallback_joints)
     )
 
 

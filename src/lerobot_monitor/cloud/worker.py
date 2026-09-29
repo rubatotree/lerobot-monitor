@@ -301,6 +301,7 @@ class NativePolicyBackend:
                 processed = self.loaded.postprocessor(raw)
                 raw = original.reshape(1, 1, -1)
                 processed = processed.reshape(1, 1, -1)
+                queued_actions = self._queued_actions(torch)
             else:
                 kwargs: dict[str, Any] = {}
                 if mode == "rtc_chunk":
@@ -331,8 +332,53 @@ class NativePolicyBackend:
             raw_array = raw.squeeze(0).detach().to(device="cpu", dtype=torch.float32).tolist()
             actions = processed.squeeze(0).detach().to(device="cpu", dtype=torch.float32).tolist()
             self.session["task"] = task
-        return {"raw_actions": raw_array, "actions": actions, "action_keys": self.metadata["action_keys"],
-                "shape": [len(actions), self.metadata["action_dim"]], "compute_seconds": time.monotonic() - started}
+        result = {"raw_actions": raw_array, "actions": actions, "action_keys": self.metadata["action_keys"],
+                  "shape": [len(actions), self.metadata["action_dim"]], "compute_seconds": time.monotonic() - started}
+        if mode == "select_action":
+            result["queued_actions"] = queued_actions
+        return result
+
+    def _queued_actions(self, torch: Any) -> list[list[float]]:
+        """Processed actions the policy still holds after ``select_action``, for chart previews.
+
+        The client only sees one action per request, so it cannot see the rest of
+        the server-side queue that a local rollout would draw as the dashed line.
+        Failures here must never affect control, so they yield an empty preview.
+        """
+        policy = self.loaded.policy
+        try:
+            ensembled = getattr(getattr(policy, "temporal_ensembler", None), "ensembled_actions", None)
+            if getattr(ensembled, "ndim", None) == 3 and ensembled.shape[0] >= 1:
+                pending = [ensembled[:, index, :] for index in range(ensembled.shape[1])]
+            else:
+                pending = []
+                for attr in getattr(policy, "_action_queue_attrs", ("_queues", "_action_queue")):
+                    queue_ = getattr(policy, attr, None)
+                    if isinstance(queue_, dict):
+                        queue_ = queue_.get("action")
+                    if isinstance(queue_, (list, tuple)) or hasattr(queue_, "popleft"):
+                        pending = list(queue_)
+                        break
+            if not pending:
+                # Policies with n_action_steps=1 (e.g. SmolVLA checkpoints) drain the
+                # queue with the very pop that returned the current action, so the
+                # preview can only come from the recorded chunk producer output.
+                from lerobot_monitor.policy import predicted_chunk_tail
+
+                tail = predicted_chunk_tail(policy)
+                if tail is not None:
+                    pending = [tail[:, index, :] for index in range(int(tail.shape[1]))]
+            rows: list[list[float]] = []
+            for action in pending[:1024]:
+                processed = self.loaded.postprocessor(action.clone())
+                row = processed.detach().to(device="cpu", dtype=torch.float32).reshape(-1).tolist()
+                if len(row) != self.metadata["action_dim"]:
+                    break
+                rows.append(row)
+            return rows
+        except Exception as exc:  # noqa: BLE001 - chart telemetry must not affect control
+            print(f"queued action preview skipped: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            return []
 
     def _rtc_prefix(self, payload: dict[str, Any], device: Any) -> Any:
         """Re-anchor absolute prefix [T,A] to current state, then normalize length."""

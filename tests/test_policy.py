@@ -27,6 +27,7 @@ from lerobot_monitor.policy import (
     inference_config_from_extra,
     inference_leftover_poses,
     install_inference_timeline,
+    install_predicted_chunk_capture,
     predict_action_chunk,
     resolve_cached_policy_path,
     tensor_steps,
@@ -239,6 +240,119 @@ def test_temporal_ensemble_actions_are_projected_without_extra_inference(fake_le
     assert len(result) == 3
     assert result[0]["shoulder_pan"] == pytest.approx(0.0)
     assert result[2]["gripper"] == pytest.approx(17.0)
+
+
+class DrainingChunkPolicy:
+    """SmolVLA-shaped double: ``_queues`` dict, inner ``_get_action_chunk`` producer.
+
+    With ``n_action_steps=1`` the queue is drained by the same ``select_action``
+    pop that returns the current action, so queue-based previews stay empty.
+    """
+
+    def __init__(self, chunk, n_action_steps: int = 1) -> None:
+        self.config = SimpleNamespace(n_action_steps=n_action_steps)
+        self.chunk = chunk
+        self.resets = 0
+        self.drops = 0
+        self.reset()
+
+    def reset(self) -> None:
+        self.resets += 1
+        self._queues = {"action": deque(maxlen=self.config.n_action_steps)}
+
+    def drop_queued_actions(self) -> None:
+        self.drops += 1
+        self._queues["action"].clear()
+
+    def _get_action_chunk(self, _prepared):
+        return self.chunk
+
+    def predict_action_chunk(self, prepared):
+        return self._get_action_chunk(prepared)
+
+    def select_action(self, prepared):
+        queue = self._queues["action"]
+        if not queue:
+            actions = self._get_action_chunk(prepared)
+            for index in range(min(self.config.n_action_steps, actions.shape[1])):
+                queue.append(actions[:, index, :])
+        return queue.popleft()
+
+
+def drained_chunk_policy(n_action_steps: int = 1) -> DrainingChunkPolicy:
+    chunk = FakeTensor(np.arange(1 * 50 * 6, dtype=np.float32).reshape(1, 50, 6))
+    return DrainingChunkPolicy(chunk, n_action_steps=n_action_steps)
+
+
+def test_drained_queue_policy_preview_uses_captured_chunk(fake_lerobot) -> None:
+    policy = drained_chunk_policy()
+    loaded = loaded_policy(policy)
+
+    capture = install_predicted_chunk_capture(policy)
+    assert capture is not None
+    assert capture.producer == "_get_action_chunk"
+    policy.select_action({})  # what the sync engine does every control tick
+
+    result = inference_leftover_poses(SimpleNamespace(), loaded, observation_joints())
+
+    # Step 0 was dispatched by select_action; the preview serves the remaining 49.
+    assert len(result) == 49
+    assert result[0]["shoulder_pan"] == pytest.approx(6.0)
+    assert result[-1]["gripper"] == pytest.approx(49 * 6 + 5)
+
+
+def test_queue_preview_wins_over_captured_chunk(fake_lerobot) -> None:
+    policy = drained_chunk_policy(n_action_steps=3)
+    loaded = loaded_policy(policy)
+    install_predicted_chunk_capture(policy)
+    policy.select_action({})
+
+    result = inference_leftover_poses(SimpleNamespace(), loaded, observation_joints())
+
+    # The live queue (steps 1 and 2) is the source of truth, not the 49-step tail.
+    assert len(result) == 2
+    assert result[0]["shoulder_pan"] == pytest.approx(6.0)
+    assert result[1]["shoulder_pan"] == pytest.approx(12.0)
+
+
+def test_captured_chunk_preview_is_cleared_on_reset_and_drop(fake_lerobot) -> None:
+    policy = drained_chunk_policy()
+    loaded = loaded_policy(policy)
+    install_predicted_chunk_capture(policy)
+    policy.select_action({})
+    assert inference_leftover_poses(SimpleNamespace(), loaded, observation_joints())
+
+    policy.reset()
+    assert inference_leftover_poses(SimpleNamespace(), loaded, observation_joints()) == []
+
+    policy.select_action({})
+    policy.drop_queued_actions()
+    assert inference_leftover_poses(SimpleNamespace(), loaded, observation_joints()) == []
+
+
+def test_captured_chunk_preview_rejects_stale_recordings(fake_lerobot) -> None:
+    policy = drained_chunk_policy()
+    loaded = loaded_policy(policy)
+    capture = install_predicted_chunk_capture(policy)
+    policy.select_action({})
+
+    capture.recorded_at -= 3600.0
+
+    assert inference_leftover_poses(SimpleNamespace(), loaded, observation_joints()) == []
+
+
+def test_chunk_capture_install_is_idempotent_and_optional(fake_lerobot) -> None:
+    policy = drained_chunk_policy()
+    first = install_predicted_chunk_capture(policy)
+    second = install_predicted_chunk_capture(policy)
+    assert first is second
+    policy.select_action({})
+    assert first.recorded_at > 0.0
+
+    producerless = SimpleNamespace(config=SimpleNamespace(n_action_steps=1))
+    assert install_predicted_chunk_capture(producerless) is None
+    loaded = loaded_policy(producerless)
+    assert inference_leftover_poses(SimpleNamespace(), loaded, observation_joints()) == []
 
 
 def test_missing_native_chunk_degrades_to_sequential_select_action(fake_lerobot) -> None:

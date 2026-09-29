@@ -1379,7 +1379,9 @@ const rolloutLanesPlugin = {
     chart.$hoveredRibbon = hit?.ribbon.id ?? null;
     const stageColors = { observation: "#83b9ff", observation_prepare: "#83b9ff", preprocessing: "#91c9e8",
       preprocess: "#91c9e8", model: "#58a8ff", model_call: "#58a8ff", postprocessing: "#b8b8ee",
-      postprocess: "#b8b8ee", cpu_transfer: "#b5c5e2", publish: "#7fcfd4", lock_wait: "#c4b4a4", rtc_prefix: "#799ccc" };
+      postprocess: "#b8b8ee", cpu_transfer: "#b5c5e2", publish: "#7fcfd4", lock_wait: "#c4b4a4", rtc_prefix: "#799ccc",
+      // Cloud inference phases: local encode, network legs, and remote GPU compute.
+      cloud_encode: "#91c9e8", cloud_upload: "#e0a35c", cloud_compute: "#58a8ff", cloud_download: "#c98bd4" };
     ctx.save();
     ctx.beginPath(); ctx.rect(area.left, area.bottom + 1, area.right-area.left, 63); ctx.clip();
     ctx.fillStyle = "rgba(15, 22, 32, .55)";
@@ -5286,6 +5288,8 @@ initTabList("side-tabs", "lerobot-monitor-side-tab", "joints", (kind) => {
   // The rate panel is anchored to a control inside one pane, so a tab switch
   // must not leave it floating next to a hidden trigger.
   closeRatePanel({ restoreFocus: false });
+  const presetToolbar = $("preset-toolbar");
+  if (presetToolbar) presetToolbar.classList.toggle("hidden", kind === "cloud");
   selectPresetKind(PRESET_KIND_BY_TAB[kind] || "pose");
 });
 document.querySelectorAll(".panel.side-tab-panel").forEach((panel) => {
@@ -8925,6 +8929,111 @@ const modelResidencyRevisions = new Map();
 
 function modelResidencyKey(model) { return String(model.path || model.id); }
 
+// Cloud loads are submitted and then tracked here, so the main view stays usable
+// while weights stream onto the GPU.
+const cloudLoadWatch = new Map();
+
+function hideLoadProgress() {
+  const host = $("load-progress");
+  if (host) host.classList.add("hidden");
+}
+
+function renderLoadProgress() {
+  const host = $("load-progress");
+  if (!host) return;
+  const active = [...cloudLoadWatch.values()].filter(item => !item.settled);
+  if (!active.length) { host.classList.add("hidden"); return; }
+  const item = active[active.length - 1];
+  host.classList.remove("hidden");
+  host.dataset.state = item.error ? "error" : "running";
+  const label = $("load-progress-label");
+  if (label) label.textContent = item.error
+    ? `Load failed · ${item.name}`
+    : `Loading ${item.name} on GPU ${item.gpuIndex ?? "—"}`;
+  const phase = $("load-progress-phase");
+  if (phase) phase.textContent = item.error
+    || MODEL_LOAD_PHASES[item.phase] || item.phase || "Starting load…";
+  const elapsed = $("load-progress-elapsed");
+  if (elapsed) elapsed.textContent = Number.isFinite(item.elapsedMs)
+    ? `${(item.elapsedMs / 1000).toFixed(1)}s elapsed` : "";
+  const bar = $("load-progress-bar");
+  if (bar) {
+    // Cloud loads report phases rather than byte progress, so leave the bar
+    // indeterminate and let the phase text carry the real state.
+    bar.removeAttribute("value");
+  }
+}
+
+async function pollCloudLoad(item) {
+  const started = Date.now();
+  let misses = 0;
+  while (cloudLoadWatch.has(item.key)) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    if (!cloudLoadWatch.has(item.key)) return;
+    try {
+      const jobs = await api("/api/cloud/jobs", undefined, "GET");
+      const rows = Array.isArray(jobs) ? jobs : (jobs?.jobs || []);
+      const job = rows.find(row => String(row.id) === String(item.jobId))
+        || rows.find(row => String(row.deployment_id || "") === String(item.deploymentId));
+      if (job) {
+        misses = 0;
+        item.phase = String(job.phase || job.status || "");
+        // Cloud jobs expose timestamps, not durations; derive the elapsed time.
+        const createdMs = Number(job.created_at) * 1000;
+        item.elapsedMs = Number.isFinite(job.elapsed_ms)
+          ? job.elapsed_ms
+          : (Number.isFinite(createdMs) && createdMs > 0 ? Date.now() - createdMs : Date.now() - started);
+        if (job.status === "failed" || job.error) {
+          item.error = String(job.error || "load failed");
+          item.settled = true;
+          renderLoadProgress();
+          toastError(new Error(item.error));
+          localLog(`Model load failed: ${item.name} — ${item.error}`);
+          setTimeout(() => { cloudLoadWatch.delete(item.key); renderLoadProgress(); }, 8000);
+          return;
+        }
+      } else if (++misses > 90) {
+        // The job list only keeps recent entries; stop rather than poll forever.
+        item.settled = true;
+        renderLoadProgress();
+        cloudLoadWatch.delete(item.key);
+        return;
+      }
+      // A loaded deployment is the authoritative completion signal.
+      const status = await api("/api/status", undefined, "GET");
+      const residency = findModelResidency(status?.model_residency, item.path);
+      if (residency?.state === "ready" || residency?.state === "in_use") {
+        item.settled = true;
+        item.phase = "ready";
+        renderLoadProgress();
+        localLog(`Model loaded: ${item.name}${item.gpuIndex != null ? ` on GPU ${item.gpuIndex}` : ""}`);
+        modelsCache.filter(entry => modelResidencyKey(entry) === String(item.path))
+          .forEach(entry => { entry.residency = residency; });
+        refreshLibrarySection("models").catch(() => {});
+        setTimeout(() => { cloudLoadWatch.delete(item.key); renderLoadProgress(); }, 6000);
+        return;
+      }
+      item.elapsedMs = Date.now() - started;
+      renderLoadProgress();
+    } catch {
+      item.elapsedMs = Date.now() - started;
+      renderLoadProgress();
+    }
+  }
+}
+
+function watchCloudLoad({ model, jobId, gpuUuid, gpuIndex }) {
+  const key = modelResidencyKey(model);
+  const item = {
+    key, jobId, name: libraryDisplayName("model", model), path: String(model.path || ""),
+    deploymentId: String(model.cloud_deployment_id || ""), gpuUuid, gpuIndex,
+    phase: "queued", elapsedMs: 0, error: "", settled: false,
+  };
+  cloudLoadWatch.set(key, item);
+  renderLoadProgress();
+  pollCloudLoad(item).catch(() => {});
+}
+
 function findModelResidency(statuses, path) {
   return statuses?.[path] || Object.values(statuses || {}).find(status => status.source_paths?.includes(path));
 }
@@ -8985,7 +9094,8 @@ async function runModelResidencyAction(model, action, instanceId = null, extraBo
         "cancel-load": "Load cancellation requested", release: "Owning task stop requested; model stays loaded" }[action];
       localLog(`${label}: ${libraryDisplayName("model", current)}`);
     }
-    return true;
+    // Callers of an accepted load need its job id to follow progress.
+    return result || {};
   } catch (error) {
     modelResidencyMessages.set(key, { text: error.message || "Model request failed", error: true });
     toastError(error);
@@ -9057,7 +9167,9 @@ function renderModelResidency(host, model, processGpu = []) {
   const instances = status.instances || [];
   const cancelling = status.state === "cancelling" || instances.some(item => item.state === "cancelling");
   const stopping = status.state === "stopping" || instances.some(item => item.state === "stopping");
-  if (status.can_cancel_load || cancelling || instances.some(item => ["queued", "loading"].includes(item.state))) {
+  // Cloud loads cannot be cancelled once submitted, so no dead button.
+  if (model.source !== "cloud"
+    && (status.can_cancel_load || cancelling || instances.some(item => ["queued", "loading"].includes(item.state)))) {
     line.appendChild(modelResidencyActionButton(model, "cancel-load", status));
   }
   if (status.can_release || stopping || instances.some(item => item.state === "in_use")) {
@@ -9088,7 +9200,10 @@ function renderModelResidency(host, model, processGpu = []) {
     // indeterminate and report only stages that have actually completed.
     bar.setAttribute("aria-label", "Model loading in progress");
     const label = document.createElement("span");
-    label.textContent = `${MODEL_LOAD_PHASES[working.phase] || working.phase || "Waiting"} · ${working.completed_steps ?? 0}/${working.total_steps ?? "—"} stages`;
+    // A cloud host reports only that a load is running, not its stages.
+    label.textContent = working.remote
+      ? `Loading on cloud GPU${working.device ? ` ${working.device.slice(0, 12)}` : ""}`
+      : `${MODEL_LOAD_PHASES[working.phase] || working.phase || "Waiting"} · ${working.completed_steps ?? 0}/${working.total_steps ?? "—"} stages`;
     if (Number.isFinite(working.elapsed_ms)) {
       label.textContent += ` · ${(working.elapsed_ms / 1000).toFixed(1)}s elapsed`;
     }
@@ -9587,15 +9702,23 @@ function openCloudLoadModal(model) {
         libraryModalStatus(body, "Choose an available GPU first", true);
         return;
       }
+      const gpuIndex = (gpu.selectedOptions[0]?.textContent || "").match(/GPU\s*(\d+)/)?.[1];
       load.disabled = true;
       refresh.disabled = true;
-      libraryModalStatus(body, `Loading on ${gpu.selectedOptions[0]?.textContent || gpu.value}…`);
-      const ok = await runModelResidencyAction(model, "load", null, { device: gpu.value });
-      if (ok) closeLibraryModal();
-      else {
+      libraryModalStatus(body, "Submitting load…");
+      const result = await runModelResidencyAction(model, "load", null, { device: gpu.value });
+      if (!result) {
         load.disabled = false;
         refresh.disabled = false;
+        return;
       }
+      // The server only enqueues the load, so leave the modal right away and let the
+      // sidebar report progress instead of holding the operator on a spinner.
+      closeLibraryModal();
+      watchCloudLoad({
+        model, jobId: result.job_id, gpuUuid: gpu.value,
+        gpuIndex: gpuIndex == null ? null : Number(gpuIndex),
+      });
     });
     loadCatalog();
   });
@@ -9604,17 +9727,6 @@ function openCloudLoadModal(model) {
 function openDownloadModal(kind) {
   const isModel = kind === "model";
   openLibraryModal(isModel ? "Add model" : "Download dataset", (body) => {
-    const sourceKind = document.createElement("select");
-    if (isModel) {
-      sourceKind.setAttribute("aria-label", "Model source");
-      [["hub", "Hugging Face or local path"], ["cloud", "Cloud deployment"]].forEach(([value, label]) => {
-        const option = document.createElement("option");
-        option.value = value;
-        option.textContent = label;
-        sourceKind.appendChild(option);
-      });
-      body.appendChild(modalField("Source", sourceKind));
-    }
     const search = document.createElement("div");
     search.className = "library-modal-search";
     const query = document.createElement("input");
@@ -9644,13 +9756,9 @@ function openDownloadModal(kind) {
     name.type = "text";
     name.placeholder = "display name (optional)";
     name.setAttribute("aria-label", "Display name");
-    grid.append(
-      modalField("Address", remote),
-      modalField("Revision", revision),
-      ...(isModel ? [modalField("Name", name)] : []),
-    );
+    grid.append(modalField("Address", remote), modalField("Revision", revision));
     const cloudPanel = document.createElement("div");
-    cloudPanel.className = "library-modal-grid hidden";
+    cloudPanel.className = "library-modal-grid";
     const cloudHost = document.createElement("select");
     cloudHost.setAttribute("aria-label", "Cloud host");
     const cloudDeployment = document.createElement("select");
@@ -9670,7 +9778,66 @@ function openDownloadModal(kind) {
     submit.type = "button";
     submit.textContent = isModel ? "Add model" : "Download";
     actions.appendChild(submit);
-    body.append(search, results, grid, cloudPanel, actions);
+    // The model dialog separates the two mutually exclusive sources into tabs so
+    // only the fields that matter are visible; datasets keep the single form.
+    let source = "local";
+    if (isModel) {
+      const tabs = document.createElement("div");
+      tabs.className = "library-modal-tabs";
+      tabs.setAttribute("role", "tablist");
+      tabs.setAttribute("aria-label", "Model source");
+      const localPane = document.createElement("div");
+      localPane.className = "library-modal-pane";
+      localPane.id = "library-modal-pane-local";
+      localPane.setAttribute("role", "tabpanel");
+      localPane.append(search, results, grid);
+      const cloudPane = document.createElement("div");
+      cloudPane.className = "library-modal-pane hidden";
+      cloudPane.id = "library-modal-pane-cloud";
+      cloudPane.setAttribute("role", "tabpanel");
+      cloudPane.appendChild(cloudPanel);
+      const makeTab = (value, label) => {
+        const tab = document.createElement("button");
+        tab.type = "button";
+        tab.textContent = label;
+        tab.setAttribute("role", "tab");
+        tab.id = `library-modal-tab-${value}`;
+        tab.setAttribute("aria-controls", `library-modal-pane-${value}`);
+        return tab;
+      };
+      const localTab = makeTab("local", "Local");
+      const cloudTab = makeTab("cloud", "Cloud");
+      localPane.setAttribute("aria-labelledby", localTab.id);
+      cloudPane.setAttribute("aria-labelledby", cloudTab.id);
+      tabs.append(localTab, cloudTab);
+      const selectSource = (value) => {
+        source = value === "cloud" ? "cloud" : "local";
+        const cloud = source === "cloud";
+        localTab.setAttribute("aria-selected", String(!cloud));
+        cloudTab.setAttribute("aria-selected", String(cloud));
+        localTab.tabIndex = cloud ? -1 : 0;
+        cloudTab.tabIndex = cloud ? 0 : -1;
+        localPane.classList.toggle("hidden", cloud);
+        cloudPane.classList.toggle("hidden", !cloud);
+        submit.textContent = cloud ? "Add cloud model" : "Add model";
+        const stale = body.querySelector(".library-modal-status");
+        if (stale) stale.remove();
+      };
+      selectSource("local");
+      const moveTab = (event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        selectSource(source === "local" ? "cloud" : "local");
+        (source === "cloud" ? cloudTab : localTab).focus();
+      };
+      localTab.addEventListener("click", () => selectSource("local"));
+      cloudTab.addEventListener("click", () => selectSource("cloud"));
+      localTab.addEventListener("keydown", moveTab);
+      cloudTab.addEventListener("keydown", moveTab);
+      body.append(tabs, localPane, cloudPane, modalField("Name", name), actions);
+    } else {
+      body.append(search, results, grid, actions);
+    }
     const loadCloudCatalog = async () => {
       if (!cloudHost.value) return;
       connectCloud.disabled = true;
@@ -9702,14 +9869,6 @@ function openDownloadModal(kind) {
         });
       }).catch(() => {});
       connectCloud.addEventListener("click", loadCloudCatalog);
-      sourceKind.addEventListener("change", () => {
-        const cloud = sourceKind.value === "cloud";
-        search.classList.toggle("hidden", cloud);
-        results.classList.toggle("hidden", cloud);
-        grid.classList.toggle("hidden", cloud);
-        cloudPanel.classList.toggle("hidden", !cloud);
-        submit.textContent = cloud ? "Add cloud model" : "Add model";
-      });
     }
 
     const runSearch = async () => {
@@ -9755,14 +9914,15 @@ function openDownloadModal(kind) {
     });
     submit.addEventListener("click", async () => {
       const address = remote.value.trim();
-      if ((!isModel || sourceKind.value !== "cloud") && !address) {
+      const cloud = isModel && source === "cloud";
+      if (!cloud && !address) {
         libraryModalStatus(body, "Enter an address first", true);
         return;
       }
       submit.disabled = true;
       try {
         let saved;
-        if (isModel && sourceKind.value === "cloud") {
+        if (cloud) {
           if (!cloudHost.value || !cloudDeployment.value) {
             throw new Error("Connect a host and choose a deployment first");
           }

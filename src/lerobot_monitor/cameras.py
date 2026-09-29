@@ -68,6 +68,17 @@ def remote_camera_name(robot_id: str, camera_id: str) -> str:
     return f"blender_{safe_robot or 'robot'}_{safe_camera or 'camera'}"
 
 
+def rollout_camera_key(device: Any) -> str:
+    """Policy-facing key for a camera: its label, else its device name.
+
+    Labels are what the operator sets in the UI ("front") and what a policy's
+    ``observation.images.*`` features are named after; device names are opaque
+    indices ("0"). Falling back keeps unlabelled cameras addressable.
+    """
+    label = str(getattr(device, "label", "") or "").strip()
+    return label or str(getattr(device, "name", "") or "")
+
+
 def detect_cameras(max_probe: int = 8) -> list[int]:
     """Probe indices 0..max_probe-1 and return those that open."""
     available: list[int] = []
@@ -1031,7 +1042,12 @@ class CameraHub:
         return out
 
     def rollout_rgb_map(self, *, max_age_s: float, max_skew_s: float) -> dict[str, np.ndarray]:
-        """Build fresh policy images [H,W,3] off the bus thread; fail on stale feeds."""
+        """Build fresh policy images [H,W,3] off the bus thread; fail on stale feeds.
+
+        Keys are camera labels, falling back to device names, so they match both the
+        UI's ``cam_<label>`` video keys and the policy's ``observation.images.<label>``
+        features.
+        """
         with self._lock:
             devices = list(self.streams.items()) + list(self.remote_streams.items())
         frames: dict[str, np.ndarray] = {}
@@ -1043,7 +1059,7 @@ class CameraHub:
             if frame is None or received_at is None:
                 raise RuntimeError(f"rollout camera {name!r} has no frame")
             timestamps.append(received_at)
-            frames[name] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames[rollout_camera_key(device)] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         now = time.perf_counter()
         if timestamps and now - min(timestamps) > max_age_s:
             raise RuntimeError("rollout camera frame is stale")

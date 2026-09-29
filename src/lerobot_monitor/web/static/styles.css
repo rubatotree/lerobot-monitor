@@ -1056,9 +1056,41 @@ main.episodes-closed {
 .library-modal-body { display: flex; flex-direction: column; gap: 8px; padding: 10px; }
 .library-modal-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 .library-modal-grid label { display: flex; flex-direction: column; gap: 3px; color: var(--faint); font-size: 10px; }
+.library-modal-pane.hidden { display: none; }
+.library-modal-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 2px;
+  border: 1px solid var(--line);
+  background: #090a12;
+}
+.library-modal-tabs button {
+  min-height: 30px;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 150ms ease-out, color 150ms ease-out, box-shadow 150ms ease-out;
+}
+.library-modal-tabs button:hover { color: var(--text); }
+.library-modal-tabs button[aria-selected="true"] {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--text);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.library-modal-tabs button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
 .library-modal-grid input,
 .library-modal-grid select,
 .library-modal-search input,
+.library-modal-body > label input,
+.library-modal-body > label select,
 .library-modal-body textarea {
   min-width: 0;
   min-height: 32px;
@@ -1085,7 +1117,9 @@ main.episodes-closed {
 }
 .library-modal-body textarea:focus-visible,
 .library-modal-grid input:focus-visible,
-.library-modal-search input:focus-visible {
+.library-modal-search input:focus-visible,
+.library-modal-body > label input:focus-visible,
+.library-modal-body > label select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
@@ -1996,7 +2030,7 @@ main.episodes-closed {
 }
 .side-tabs .panel-tab {
   flex: 1 1 0;
-  min-width: 62px;
+  min-width: 54px;
   gap: 3px;
   padding-inline: 2px;
   font-size: 8px;
@@ -3332,6 +3366,58 @@ body.dragging-row { cursor: row-resize; user-select: none; }
   font-size: 11px;
   color: var(--muted);
 }
+
+/* Cloud model loads run on the server; progress lives in the sidebar so the
+   main view stays usable while a cold load streams weights onto the GPU. */
+.load-progress {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 8px;
+  padding: 8px 9px;
+  border: 1px solid rgba(255, 255, 255, .09);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, .03);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+.load-progress.hidden { display: none; }
+.load-progress-head { display: flex; align-items: center; gap: 7px; color: var(--fg, #e8eef7); }
+.load-progress-spinner {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(255, 255, 255, .22);
+  border-top-color: var(--accent, #58a8ff);
+  border-radius: 50%;
+  animation: load-progress-spin .8s linear infinite;
+}
+.load-progress[data-state="error"] .load-progress-spinner {
+  border-color: var(--err, #e06c6c);
+  border-top-color: var(--err, #e06c6c);
+  animation: none;
+}
+.load-progress[data-state="done"] .load-progress-spinner {
+  border-color: #6cc08b;
+  border-top-color: #6cc08b;
+  animation: none;
+}
+.load-progress progress { width: 100%; height: 6px; accent-color: var(--accent, #58a8ff); }
+.load-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--faint, #8b98a9);
+  font-variant-numeric: tabular-nums;
+}
+.load-progress-meta span { min-width: 0; overflow-wrap: anywhere; }
+@keyframes load-progress-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .load-progress-spinner { animation-duration: 2.4s; }
+}
+
 #log {
   flex: 1 1 auto;
   min-height: 0;
@@ -3577,3 +3663,375 @@ body.dragging-row { cursor: row-resize; user-select: none; }
 .model-residency-progress span { flex: 1 1 100px; min-width: 0; overflow-wrap: anywhere; }
 .model-residency button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .model-residency button[aria-busy="true"] { color: var(--muted); }
+
+/* ---- Cloud panel (former standalone port-8095 manager) ---- */
+#preset-toolbar.hidden { display: none; }
+.cloud-panel-body { display: flex; flex-direction: column; gap: 2px; }
+
+/* --- Section structure --- */
+.cloud-panel-body > .task-block {
+  margin-bottom: 0;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.cloud-panel-body > .task-block:last-child { border-bottom: 0; padding-bottom: 0; }
+.cloud-panel-body > .task-block > h3 {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+/* --- Collapsible cloud sub-sections --- */
+.cloud-panel-body > .task-block[data-panel] > .panel-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  min-height: 24px;
+  cursor: pointer;
+  color: inherit;
+  margin-bottom: 8px;
+}
+.cloud-panel-body > .task-block[data-panel] > .panel-toggle:hover h3 { color: var(--accent); }
+.cloud-panel-body > .task-block[data-panel] > .panel-toggle h3 { margin: 0; }
+.cloud-panel-body > .task-block[data-panel] > .panel-toggle .chevron {
+  color: var(--faint);
+  transition: transform 0.15s ease;
+  font-size: 11px;
+}
+.cloud-panel-body > .task-block[data-panel].collapsed > .panel-toggle .chevron { transform: rotate(-90deg); }
+.cloud-panel-body > .task-block[data-panel].collapsed > .panel-body { display: none; }
+
+/* --- Model toolbar (inside collapsible panel-body) --- */
+.cloud-model-toolbar { display: flex; justify-content: flex-end; margin-bottom: 6px; }
+.cloud-model-toolbar button { min-height: 26px; padding: 3px 8px; font-size: 11px; }
+
+/* --- Host selector row --- */
+.cloud-host-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 4px; align-items: center; }
+.cloud-host-row select { width: 100%; min-width: 0; min-height: 32px; padding: 5px 7px; font-size: 11px; }
+.cloud-host-row .icon-btn { min-height: 32px; min-width: 32px; padding: 5px; display: flex; align-items: center; justify-content: center; }
+.cloud-host-row .icon-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+/* --- Notice bar --- */
+.cloud-notice {
+  margin: 8px 0 0;
+  padding: 7px 10px;
+  border: 1px solid var(--accent-dim);
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface-2));
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  border-radius: 0 3px 3px 0;
+}
+.cloud-notice.error {
+  border-color: var(--err);
+  border-left-color: var(--err);
+  background: color-mix(in srgb, var(--err) 8%, var(--surface-2));
+  color: #f0a8b2;
+}
+
+/* --- Host meta --- */
+.cloud-host-meta { margin-top: 8px; }
+.cloud-host-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cloud-host-path { font-size: 10px; color: var(--faint); margin-top: 4px; overflow-wrap: anywhere; }
+.cloud-host-error { font-size: 10px; color: var(--err); margin-top: 4px; overflow-wrap: anywhere; }
+
+/* --- Host action buttons --- */
+.cloud-host-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.cloud-host-actions button {
+  min-height: 28px;
+  padding: 4px 10px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  transition: background 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;
+}
+.cloud-host-actions button:hover:not(:disabled) { background: var(--surface-2); color: var(--text); border-color: var(--accent-dim); }
+.cloud-host-actions button:disabled { opacity: 0.4; cursor: default; }
+/* Connect is the primary action — accent-tinted */
+.cloud-host-actions button:not(.ghost):last-child {
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  border-color: var(--accent-dim);
+  color: var(--text);
+}
+.cloud-host-actions button:not(.ghost):last-child:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 24%, var(--surface));
+}
+
+/* --- Badges --- */
+.cloud-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  border-radius: 2px;
+  white-space: nowrap;
+}
+.cloud-badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+.cloud-badge.good { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, transparent); background: color-mix(in srgb, var(--ok) 8%, transparent); }
+.cloud-badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.cloud-badge.bad { color: var(--err); border-color: color-mix(in srgb, var(--err) 50%, transparent); background: color-mix(in srgb, var(--err) 8%, transparent); }
+
+/* --- Section headers --- */
+.cloud-section-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 8px; }
+.cloud-section-head h3 { margin: 0; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.cloud-section-head button { min-height: 26px; padding: 3px 8px; font-size: 11px; }
+.cloud-count { font-size: 10px; color: var(--faint); text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+/* --- Hints --- */
+.cloud-hint { font-size: 10.5px; color: var(--faint); line-height: 1.5; margin: 4px 0; overflow-wrap: anywhere; }
+.cloud-hint strong { display: block; color: var(--muted); font-weight: 500; margin-bottom: 2px; }
+
+/* --- GPU grid --- */
+.cloud-gpu-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr)); gap: 6px; }
+.cloud-gpu {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  padding: 8px 10px;
+  min-width: 0;
+  border-radius: 3px;
+  transition: border-color 120ms ease-out;
+}
+.cloud-gpu:hover { border-color: var(--accent-dim); }
+.cloud-gpu.bad { border-color: color-mix(in srgb, var(--err) 60%, var(--line)); }
+.cloud-gpu-top { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.cloud-gpu-index { font-size: 10px; color: var(--muted); font-weight: 500; letter-spacing: 0.02em; }
+.cloud-gpu-name { font-size: 10px; color: var(--faint); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cloud-gpu-mem { display: flex; justify-content: space-between; align-items: baseline; font-size: 10px; color: var(--faint); margin-top: 6px; }
+.cloud-gpu-mem-used { font-variant-numeric: tabular-nums; }
+
+/* Memory meter — thicker, rounded, color-coded */
+.cloud-meter {
+  height: 6px;
+  background: var(--line);
+  margin-top: 5px;
+  overflow: hidden;
+  border-radius: 3px;
+}
+.cloud-meter > span {
+  display: block;
+  height: 100%;
+  background: var(--ok);
+  border-radius: 3px;
+  transition: width 300ms ease-out;
+}
+/* Color shifts by usage level — set via JS inline style or class */
+.cloud-meter.high > span { background: var(--warn); }
+.cloud-meter.critical > span { background: var(--err); }
+.cloud-gpu.bad .cloud-meter > span { background: var(--err); }
+
+/* GPU owner/process list */
+.cloud-gpu-owners { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.cloud-gpu-owners li {
+  display: grid;
+  grid-template-columns: minmax(0, 0.7fr) minmax(0, 1fr) auto;
+  gap: 4px;
+  font-size: 10px;
+  padding: 2px 0;
+  border-top: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
+}
+.cloud-gpu-owners li:first-child { border-top: 0; }
+.cloud-gpu-owners strong { color: var(--muted); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cloud-gpu-owners span { color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cloud-gpu-owners li > span:last-child { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+
+/* --- Model list --- */
+.cloud-model-list { display: flex; flex-direction: column; }
+.cloud-model {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  position: relative;
+}
+.cloud-model:first-child { border-top: 0; padding-top: 2px; }
+/* Status-colored left accent bar */
+.cloud-model::before {
+  content: "";
+  position: absolute;
+  left: -14px;
+  top: 10px;
+  bottom: 10px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--line);
+}
+.cloud-model:first-child::before { top: 2px; }
+.cloud-model[data-status="loaded"]::before { background: var(--ok); }
+.cloud-model[data-status="ready"]::before { background: var(--accent); }
+.cloud-model[data-status="error"]::before { background: var(--err); }
+.cloud-model[data-status="loading"]::before,
+.cloud-model[data-status="unloading"]::before,
+.cloud-model[data-status="deploying"]::before { background: var(--warn); }
+
+.cloud-model-main { display: flex; flex-direction: column; gap: 4px; }
+.cloud-model-title { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cloud-model-title h4 { font-size: 12px; font-weight: 500; color: var(--text); }
+.cloud-model-source, .cloud-model-note { font-size: 10px; color: var(--faint); overflow-wrap: anywhere; }
+.cloud-model-error { font-size: 10px; color: var(--err); overflow-wrap: anywhere; margin-top: 2px; }
+
+/* Model action buttons — primary vs secondary hierarchy */
+.cloud-model-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.cloud-model-actions button {
+  min-height: 26px;
+  padding: 3px 8px;
+  font-size: 10.5px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  transition: background 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;
+}
+.cloud-model-actions button:hover:not(:disabled) { background: var(--surface-2); color: var(--text); border-color: var(--accent-dim); }
+.cloud-model-actions button:disabled { opacity: 0.35; cursor: default; }
+/* Primary action (Load / Unload) — accent-tinted, first button */
+.cloud-model-actions button:first-child {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  border-color: var(--accent-dim);
+  color: var(--text);
+  font-weight: 500;
+}
+.cloud-model-actions button:first-child:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 22%, var(--surface));
+}
+
+/* --- Job list --- */
+.cloud-job-list { display: flex; flex-direction: column; }
+.cloud-job {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 0;
+  border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+}
+.cloud-job:first-child { border-top: 0; }
+.cloud-job-info { min-width: 0; }
+.cloud-job-name { font-size: 11px; color: var(--text); }
+.cloud-job-detail { font-size: 10px; color: var(--faint); overflow-wrap: anywhere; margin-top: 1px; }
+.cloud-job time { font-size: 9.5px; color: var(--faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* --- Dialogs --- */
+.cloud-dialog {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  padding: 0;
+  width: min(460px, calc(100vw - 32px));
+  border-radius: 4px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+.cloud-dialog::backdrop { background: rgba(2, 4, 10, 0.75); backdrop-filter: blur(2px); }
+.cloud-dialog form { display: flex; flex-direction: column; }
+.cloud-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+.cloud-dialog-head h2 { margin: 0; font-size: 12px; color: var(--text); text-transform: none; letter-spacing: 0; font-weight: 500; }
+.cloud-dialog-body { display: flex; flex-direction: column; gap: 10px; padding: 14px; }
+.cloud-field { display: flex; flex-direction: column; gap: 4px; font-size: 10px; color: var(--faint); margin: 0; }
+.cloud-field input, .cloud-field select {
+  min-height: 32px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+  border-radius: 2px;
+  transition: border-color 120ms ease-out;
+}
+.cloud-field input:focus-visible, .cloud-field select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-color: var(--accent);
+}
+.cloud-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.cloud-dialog-error {
+  color: var(--err);
+  font-size: 11px;
+  padding: 0 14px;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+.cloud-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+}
+.cloud-dialog-actions button { min-height: 32px; padding: 5px 14px; font-size: 11px; }
+.cloud-log-dialog { width: min(720px, calc(100vw - 32px)); }
+.cloud-log-dialog pre {
+  margin: 14px;
+  max-height: 60vh;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  padding: 10px;
+  border-radius: 3px;
+}
+.cloud-check { flex-direction: row; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+.cloud-check input { width: auto; min-height: 0; }
+
+/* --- Runtime status inline badge --- */
+.cloud-runtime-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--faint);
+  margin: 4px 0;
+}
+.cloud-runtime-badge.configured { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.cloud-runtime-badge.missing { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+
+/* --- Empty state --- */
+.cloud-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 20px 12px;
+  text-align: center;
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.cloud-empty-icon {
+  width: 28px;
+  height: 28px;
+  stroke: var(--faint);
+  fill: none;
+  stroke-width: 1.5;
+  opacity: 0.5;
+}
+.cloud-empty strong { color: var(--muted); font-weight: 500; }
+

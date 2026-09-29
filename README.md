@@ -1,8 +1,21 @@
 # LeRobot Monitor
 
-用于 SO-101 的本地监控与控制网页。它提供相机预览、关节控制、遥操作、录制、数据集与模型管理、策略 rollout，以及无硬件时的虚拟从臂和 3D 预览。
+用于 SO-101 的本地监控与控制网页。它提供相机预览、关节控制、遥操作、录制、数据集与模型管理、策略 rollout、云端模型管理（SSH 主机、GPU、部署与运行环境），以及无硬件时的虚拟从臂和 3D 预览。
 
 项目默认只监听 `127.0.0.1:8090`。控制接口没有登录认证；需要从其他设备访问时，请只在可信网络中使用，并在入口处配置认证。
+
+## 云端模型 Cloud 面板
+
+主页右侧的 **Cloud** 面板已合并原独立 `lerobot-cloud-manager`（端口 8095）的全部功能，浏览器只需要访问 Monitor 一个地址：
+
+- **服务器**：注册/选择 SSH 别名，Probe 探测解释器与目录，Initialize/Upgrade 安装与升级云端服务，Runtime 安装模型依赖环境，Connect/Disconnect 管理隧道。
+- **GPU**：显存、健康状态与主要占用用户/程序；Load 时只能选择真正可用的卡。
+- **Cloud models**：从 Hugging Face、服务器路径或本地上传添加部署，支持 Load / Unload / Logs / Use / Remove；**Use** 会把部署登记进普通模型库，供 Rollout 与 Debug 选择。
+- **Recent jobs**：合并本地初始化/上传/运行环境任务与远端服务任务。
+
+面板的轮询只在面板可见且浏览器标签页处于活动状态时进行。SSH 凭据与云端令牌始终只保留在 Monitor 后端；`/api/cloud/*` 与原独立管理器共用 `~/.lerobot-cloud-manager` 状态，因此两处添加的服务器互相可见。
+
+独立服务仍可运行以兼容既有脚本：`lerobot-cloud-manager --port 8095`。详细接口、运行环境与验证记录见 [docs/cloud_models.md](docs/cloud_models.md)。
 
 ## 环境
 
@@ -51,8 +64,12 @@ RTC rollout 使用 LeRobot 自带的 `RTCInferenceEngine` 与 `ActionQueue`。�
 ```powershell
 uv run pytest -q
 node --check src/lerobot_monitor/web/static/app.js
+node --check src/lerobot_monitor/web/static/cloud-panel.js
 node scripts/test-rollout-lanes.mjs
+node scripts/test-cloud-panel.mjs
 node scripts/verify-model-delete-id.cjs
+node scripts/verify-cloud-panel.cjs
+node scripts/verify-library-model-tabs.cjs
 ```
 
 应用后端位于 `src/lerobot_monitor/`，前端资源位于 `src/lerobot_monitor/web/static/`。控制循环独占机械臂总线；HTTP 接口向循环投递命令。硬件依赖按需导入，策略共享依赖默认在启动时准备；基础页面与虚拟从臂可在未安装模型依赖时独立运行。

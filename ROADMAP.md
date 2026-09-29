@@ -1167,3 +1167,35 @@ note 即时过滤。底部实时图表不再把模式切换当作数据边界：
 2. [x] Load API 要求显式 GPU UUID，已加载模型继续供 Debug／Rollout 使用。
 3. [x] 添加窗口只登记部署，Load 窗口显示资源归属并选择可用卡。
 4. [x] 回归、浏览器验收与原子提交。
+
+## 2026-09-29：Cloud manager 合并进 Monitor 主页
+
+状态：完成。原独立 `lerobot-cloud-manager`（`http://127.0.0.1:8095`）的全部功能并入 Monitor 主页右侧的 **Cloud** 面板，浏览器只需访问 Monitor。
+
+架构：`cloud_api.py` 把原管理器的 hosts／probe／connect／disconnect／bootstrap／upgrade／upload／runtime／jobs 与云端 API 代理注册到 Monitor 的同一个 FastAPI 路由器，统一挂在 `/api/cloud/*`；后端仍复用 `CloudManager`、`SSHTransport` 和 `MonitorCloudClient`，令牌只在后端注入。`cloud-panel.js` 是主页内的独立 ES 模块，按原有侧栏 tab 体系新增 `cloud` 页签，复刻服务器、GPU、部署与任务四个区块和新增／加载／日志／移除对话框，并只在面板可见且标签页活动时轮询。模型库接入保留原有 `cloud://<host>/<deployment>` 登记流程，面板的 **Use** 复用同一 API。
+
+边界：`/api/cloud/*` 与原管理器共用 `~/.lerobot-cloud-manager`；独立服务保留以兼容既有脚本。Monitor 本身面向可信网络且可在 `0.0.0.0` 提供服务，因此没有照搬独立管理器的回环 Host／同源校验，只在文档中明确该信任边界。
+
+技术难点：一个状态目录权限异常会让 `CloudManager` 构造失败，从而在合并后拖垮整个 Monitor 启动；因此 hosts.json／credentials.json 的读取改为「不可读或损坏即降级为空」并逐行跳过损坏的主机条目。代理需要转发查询参数并把远端 4xx（如重名部署 409）与网关失败区分开，`MonitorCloudClient.request` 因此携带上游状态码并新增 `params`。
+
+里程碑：
+1. [x] `cloud_api.py` 路由与 `safe_proxy_path` 复用；`MonitorCloudClient.request` 支持 `params` 并保留上游状态。
+2. [x] `index.html`／`cloud-panel.js`／`styles.css` 新增 Cloud 面板与对话框；`app.js` 在 Cloud 页签隐藏 preset 工具栏；六个 tab 在默认侧栏宽度内完整可见。
+3. [x] `CloudManager` 对损坏／不可读状态文件降级，避免拖垮 Monitor 启动。
+4. [x] 测试：新增 `tests/test_cloud_api.py`、`tests/test_cloud_manager.py` 降级用例、`test_monitor_cloud.py` 请求参数用例，以及 `scripts/test-cloud-panel.mjs`（纯函数 + jsdom DOM 行为）和 `scripts/verify-cloud-panel.cjs`（真实 Monitor + Chromium 四视口）。
+
+验证：cloud 相关后端 94 passed、1 skipped；Cloud 面板 JS 7 passed；原独立 cloud UI 12 passed；Chromium 在 390／768／1440／1920 四个宽度通过且无横向溢出、无 console 错误，Cloud 页签完整可见，Add 对话框在轮询期间保持输入，Load 走同源代理 `POST .../pi/load`。受限环境缺少 `torch`／`huggingface_hub`，`test_native_rollout_profiling.py` 与 8 个依赖这两者的既有用例无法在本机运行，属于环境缺口而非回归；`test_status_without_hardware` 的 HTML 断言已按面板文案调整后通过。
+
+未验证：未连接真实 8x4090-server，未执行真实 SSH bootstrap／upload／runtime／推理；面板对这些动作只做了接口与 mock 层验证。实体机械臂验证仍待执行。
+
+### 2026-09-29：Add model 本地／云端双页签
+
+状态：完成。Library 的「Add model」弹窗把来源从下拉框改为 Local／Cloud 两枚页签，云端页签不再显示 Address／Revision，只保留 SSH host、Deployment 与 Connect and refresh；Name 为两来源共用。
+
+问题：旧实现用 `hidden` 类切换两组字段，但样式表没有该类的通用规则，导致本地与云端表单同时显示，云端也要求本地地址；「Source」下拉实际只改按钮文案。
+
+改动：`app.js` 用 `role=tablist`／`role=tabpanel`＋`aria-selected`＋roving tabindex 实现页签，支持左右方向键；切页签隐藏整块 pane 并清空旧状态提示；`styles.css` 新增 `.library-modal-pane.hidden`／`.library-modal-tabs`（沿用 10px 大写与 `--accent` 下划线的既有语言），并补齐 `.library-modal-body > label input/select` 的输入框样式（连带修好云端 Load 弹窗的 GPU 下拉样式）。
+
+验证：新增 `scripts/verify-library-model-tabs.cjs`（真实 Monitor ＋ Chromium）：本地校验不触发云端登记、切到 Cloud 后 Address 不可见、Connect 后 2 个部署、提交仅一次 `POST /api/models/cloud` 且 `host_id`／`deployment_id` 正确，390／768／1440 无横向溢出与 console 错误。
+
+未验证：未连接真实 8x4090-server，云端登记仍为 mock 层验证。

@@ -3047,6 +3047,18 @@ class ControlLoop:
                 payload["elapsed_s"] = self._playback_elapsed(when)
             self._run_diag.event(name, payload, when=when)
 
+    def _rollout_camera_names(self) -> list[str]:
+        """Policy keys of cameras that must supply a frame for this rollout.
+
+        Must match the keys ``CameraHub.rollout_rgb_map`` produces, or the cloud
+        would receive frames under names the model does not declare.
+        """
+        return sorted(
+            str(camera.get("label") or camera["name"])
+            for camera in self.cameras.snapshots()
+            if camera.get("enabled") and camera.get("feed_robot")
+        )
+
     def _rollout_hw_features(self) -> dict:
         """Describe the raw observation keys consumed by LeRobot's engine."""
         from lerobot.utils.constants import OBS_STR
@@ -3056,7 +3068,7 @@ class ControlLoop:
         for camera in self.cameras.snapshots():
             if not (camera.get("enabled") and camera.get("feed_robot")):
                 continue
-            hardware[str(camera["name"])] = (
+            hardware[str(camera.get("label") or camera["name"])] = (
                 int(camera.get("height") or 480),
                 int(camera.get("width") or 640),
                 3,
@@ -3168,6 +3180,7 @@ class ControlLoop:
                     task=loaded.task,
                     state_keys=list(JOINT_ORDER),
                     overrides=self.rollout_extra,
+                    camera_names=self._rollout_camera_names(),
                 )
                 if config.type == "rtc":
                     engine = RemoteRTCInferenceEngine(
@@ -3186,7 +3199,7 @@ class ControlLoop:
                     self._inference_worker = PolicyWorker(
                         engine,
                         _POLICY_INFER_LOCK,
-                        preview=lambda _joints: [],
+                        preview=engine.leftover_poses,
                         timeline=self._rollout_timeline,
                         step_s=self._prediction_step_s(),
                         kind="cloud-sync",

@@ -63,13 +63,30 @@ def test_rollout_rejects_missing_stale_and_unsynchronized_frames(monkeypatch: py
     for camera in (first, second):
         camera._bgr = np.full((2, 2, 3), [1, 2, 3], dtype=np.uint8)
         camera.frame_received_at = 9.9
-    assert hub.rollout_rgb_map(max_age_s=1, max_skew_s=0.25)["front"][0, 0].tolist() == [3, 2, 1]
+    assert hub.rollout_rgb_map(max_age_s=1, max_skew_s=0.25)["cam 0"][0, 0].tolist() == [3, 2, 1]
     first.frame_received_at = 9.5
     with pytest.raises(RuntimeError, match="time skew"):
         hub.rollout_rgb_map(max_age_s=1, max_skew_s=0.25)
     first.frame_received_at = 8.0
     with pytest.raises(RuntimeError, match="stale"):
         hub.rollout_rgb_map(max_age_s=1, max_skew_s=0.25)
+
+
+def test_rollout_keys_frames_by_label_then_name() -> None:
+    """Policy image keys are the operator's labels, not opaque device indices."""
+    hub = CameraHub(CamerasConfig(probe=False))
+    labelled = DeviceCamera(0, width=2, height=2, jpeg_quality=80, port=5000)
+    labelled.enabled, labelled.feed_robot = True, True
+    labelled.label = "front"
+    unlabelled = DeviceCamera(1, width=2, height=2, jpeg_quality=80, port=5001)
+    unlabelled.enabled, unlabelled.feed_robot = True, True
+    hub.streams = {"0": labelled, "1": unlabelled}
+    for camera in (labelled, unlabelled):
+        camera._bgr = np.zeros((2, 2, 3), dtype=np.uint8)
+        camera.frame_received_at = time.perf_counter()
+    # A labelled camera is keyed by label; a blank label falls back to the device name.
+    unlabelled.label = ""
+    assert set(hub.rollout_rgb_map(max_age_s=5, max_skew_s=5)) == {"front", "1"}
 
 
 def test_extract_jpeg_frames_handles_multipart_noise() -> None:

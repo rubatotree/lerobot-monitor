@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import base64
+import json
+import logging
 import math
 import threading
 import time
 import traceback
 import uuid
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -18,6 +21,8 @@ import httpx
 
 from .cloud_manager.manager import CloudManager
 from .policy import ActionChunk, LoadedPolicy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -63,25 +68,79 @@ def parse_cloud_uri(value: str) -> CloudTarget | None:
     return CloudTarget(host_id, deployment_id, gpu_uuid)
 
 
-def _encode_images(observation: Mapping[str, Any]) -> dict[str, str]:
+class CloudRequestError(RuntimeError):
+    """A cloud API call failed; carries the upstream status when one exists."""
+
+    def __init__(self, message: str, status: int = 502) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _image_shape(value: Any) -> str:
+    """Describe a camera value without importing numpy at module scope."""
+
+    if value is None:
+        return "no frame"
+    shape = getattr(value, "shape", None)
+    return f"shape {tuple(shape)}" if shape is not None else f"type {type(value).__name__}"
+
+
+def _is_camera_frame(value: Any) -> bool:
+    """A camera frame is a 3-channel image array; scalars and states are not."""
+    shape = getattr(value, "shape", None)
+    return shape is not None and len(shape) == 3 and shape[2] == 3
+
+
+def _encode_images(observation: Mapping[str, Any], *, camera_names: Sequence[str] = ()) -> dict[str, str]:
+    """Encode camera frames as PNG.
+
+    Only 3-channel image arrays are encoded; scalar observations (joints, state)
+    are skipped silently, as they always were. A name listed in ``camera_names``
+    that yields no usable frame is an error naming that camera, instead of a
+    silently imageless request the cloud rejects as "missing required images".
+    """
     import cv2
     import numpy as np
 
+    required = {str(name) for name in camera_names}
     images: dict[str, str] = {}
     for key, value in observation.items():
+        name = str(key)
+        if name.startswith(("_", "observation.")):
+            continue
         array = np.asarray(value)
         if array.ndim != 3 or array.shape[2] != 3:
+            if name in required:
+                raise CloudRequestError(
+                    f"camera {name!r} has no usable RGB frame ({_image_shape(value)}); "
+                    "check that it is enabled and receives frames"
+                )
             continue
         # CameraHub exposes RGB. OpenCV writes BGR input into a standards-compliant PNG.
         ok, encoded = cv2.imencode(".png", np.ascontiguousarray(array[:, :, ::-1]))
         if not ok:
-            raise RuntimeError(f"could not encode camera {key}")
-        images[str(key)] = base64.b64encode(encoded.tobytes()).decode("ascii")
+            raise CloudRequestError(f"could not encode camera {name}")
+        images[name] = base64.b64encode(encoded.tobytes()).decode("ascii")
+    if required:
+        missing = [name for name in required if name not in images]
+        if missing:
+            raise CloudRequestError(
+                f"no usable frame for policy camera(s): {sorted(missing)}; "
+                "check that each camera is enabled and receives frames"
+            )
     return images
 
 
-class CloudRequestError(RuntimeError):
-    pass
+class _CloudStage:
+    """A completed inference phase, mirroring the native profiler's stage shape."""
+
+    __slots__ = ("name", "start", "end", "gpu_ms")
+
+    def __init__(self, name: str, start: float, end: float, gpu_ms: float | None = None) -> None:
+        self.name = name
+        self.start = start
+        self.end = end
+        self.gpu_ms = gpu_ms
 
 
 class RemoteSession:
@@ -93,12 +152,18 @@ class RemoteSession:
         task: str,
         state_keys: list[str],
         overrides: Mapping[str, str],
+        camera_names: Sequence[str] = (),
     ) -> None:
         self.owner = owner
         self.target = target
         self.mode = mode
         self.task = task
         self.overrides = dict(overrides)
+        self.camera_names = [str(name) for name in camera_names]
+        # Cloud inference is one synchronous round trip, so its phases are reported
+        # as stages the same way the local profiler reports them. Set by the caller
+        # (the rollout worker) to the currently charted chunk.
+        self.stages: list[_CloudStage] = []
         result = owner.request(
             target.host_id,
             "POST",
@@ -155,6 +220,10 @@ class RemoteSession:
             raise CloudRequestError("remote inference session is closed")
         if self._heartbeat_error is not None:
             raise CloudRequestError(f"remote inference heartbeat failed: {self._heartbeat_error}")
+        stages: list[_CloudStage] = []
+        self.stages = stages
+
+        started = time.perf_counter()
         state = {
             str(key): float(value)
             for key, value in observation.items()
@@ -162,11 +231,16 @@ class RemoteSession:
         }
         with self._epoch_lock:
             epoch = self.epoch
+        # Encoding PNG payloads is local work; it must not be mistaken for network time.
+        encoded_at = time.perf_counter()
+        images = _encode_images(observation, camera_names=self.camera_names)
+        encoded_end = time.perf_counter()
+        stages.append(_CloudStage("cloud_encode", encoded_at, encoded_end))
         payload: dict[str, Any] = {
             "epoch": epoch,
             "request_id": uuid.uuid4().hex,
             "state": state,
-            "images": _encode_images(observation),
+            "images": images,
             "task": self.task,
             "chunk_size": int(chunk_size),
             "inference_delay": max(0, int(inference_delay)),
@@ -174,13 +248,34 @@ class RemoteSession:
         if prefix_raw is not None and prefix_absolute is not None:
             payload["prefix_raw"] = prefix_raw
             payload["prefix_absolute"] = prefix_absolute
-        return self.owner.request(
+        sent_at = time.perf_counter()
+        result = self.owner.request(
             self.target.host_id,
             "POST",
             f"/api/v1/sessions/{self.session_id}/infer",
             json=payload,
             timeout=180,
         )
+        received_at = time.perf_counter()
+        # The worker reports its own GPU compute window, so the remainder of the
+        # round trip is transfer plus server-side queueing.
+        compute_s = float(result.get("compute_seconds") or 0.0)
+        compute_s = compute_s if math.isfinite(compute_s) and compute_s > 0.0 else 0.0
+        round_trip = received_at - sent_at
+        compute_s = min(compute_s, round_trip)
+        transfer = max(0.0, round_trip - compute_s)
+        # Split the non-compute time across the request and response legs; the exact
+        # boundary is invisible from here, so attribute it by payload proportion.
+        request_bytes = len(json.dumps(payload))
+        response_bytes = len(json.dumps(result))
+        total_bytes = max(1, request_bytes + response_bytes)
+        upload = transfer * (request_bytes / total_bytes)
+        stages.append(_CloudStage("cloud_upload", sent_at, sent_at + upload))
+        stages.append(
+            _CloudStage("cloud_compute", sent_at + upload, sent_at + upload + compute_s, compute_s * 1000.0)
+        )
+        stages.append(_CloudStage("cloud_download", sent_at + upload + compute_s, received_at))
+        return result
 
     def reset(self) -> None:
         with self._reset_lock:
@@ -227,6 +322,25 @@ class MonitorCloudClient:
         self._lock = threading.RLock()
         self._deployments: dict[tuple[str, str], dict[str, Any]] = {}
         self._active_sessions: dict[tuple[str, str], int] = {}
+        self._gpu_by_deployment: dict[tuple[str, str], str] = {}
+        self._loading_since: dict[tuple[str, str], float] = {}
+        self._refreshing: set[str] = set()
+        self._refreshed_at: dict[str, float] = {}
+        self._local_changes: dict[str, int] = {}
+
+    def _remembered_gpu(self, target: CloudTarget) -> str:
+        """Reuse the GPU this deployment was last loaded on, if we know it."""
+        with self._lock:
+            remembered = self._gpu_by_deployment.get((target.host_id, target.deployment_id), "")
+            if remembered:
+                return remembered
+            row = self._deployments.get((target.host_id, target.deployment_id)) or {}
+        return str(row.get("gpu_uuid") or "")
+
+    def _remember_gpu(self, target: CloudTarget, gpu_uuid: str) -> None:
+        if gpu_uuid:
+            with self._lock:
+                self._gpu_by_deployment[(target.host_id, target.deployment_id)] = gpu_uuid
 
     def hosts(self) -> list[dict[str, Any]]:
         return self.manager.hosts()
@@ -247,6 +361,7 @@ class MonitorCloudClient:
         path: str,
         *,
         json: dict[str, Any] | None = None,
+        params: Mapping[str, str] | None = None,
         timeout: float = 30,
     ) -> Any:
         self.connect_endpoint(host_id)
@@ -257,6 +372,7 @@ class MonitorCloudClient:
                 url + path,
                 headers={"Authorization": f"Bearer {token}"},
                 json=json,
+                params=params,
                 timeout=timeout,
                 trust_env=False,
             )
@@ -267,7 +383,10 @@ class MonitorCloudClient:
                 detail = response.json().get("detail")
             except ValueError:
                 detail = None
-            raise CloudRequestError(str(detail or f"cloud returned HTTP {response.status_code}"))
+            raise CloudRequestError(
+                str(detail or f"cloud returned HTTP {response.status_code}"),
+                response.status_code,
+            )
         return response.json()
 
     def connect_endpoint(self, host_id: str) -> None:
@@ -316,6 +435,38 @@ class MonitorCloudClient:
             else:
                 self._active_sessions.pop(key, None)
 
+    def _refresh_host_async(self, host_id: str, *, interval: float) -> None:
+        """Keep cached deployment states current without blocking a status push.
+
+        Loads finish on the cloud host, so the cache written at submit time goes
+        stale. Only connected hosts are polled: a status push must never open an
+        SSH tunnel.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if host_id in self._refreshing or now - self._refreshed_at.get(host_id, -interval) < interval:
+                return
+            self._refreshing.add(host_id)
+            self._refreshed_at[host_id] = now
+            generation = self._local_changes.get(host_id, 0)
+
+        def refresh() -> None:
+            try:
+                self.manager.endpoint(host_id)
+                rows = self.request(host_id, "GET", "/api/v1/deployments", timeout=5)
+                with self._lock:
+                    if self._local_changes.get(host_id, 0) != generation:
+                        return  # a load was submitted while this answer was in flight
+                    for row in rows:
+                        self._deployments[(host_id, str(row.get("id")))] = dict(row)
+            except Exception:  # noqa: BLE001 - a disconnected host keeps its last known state
+                pass
+            finally:
+                with self._lock:
+                    self._refreshing.discard(host_id)
+
+        threading.Thread(target=refresh, name=f"cloud-refresh-{host_id}", daemon=True).start()
+
     def residency(self, uri: str) -> dict[str, Any]:
         target = parse_cloud_uri(uri)
         if target is None:
@@ -324,20 +475,53 @@ class MonitorCloudClient:
         with self._lock:
             row = dict(self._deployments.get(key) or {})
             active = self._active_sessions.get(key, 0)
-        loaded = row.get("status") == "loaded" and bool(row.get("gpu_uuid"))
-        state = "in_use" if active else "ready" if loaded else "unloaded"
+        status = row.get("status")
+        transitioning = status in {"loading", "unloading"}
+        self._refresh_host_async(target.host_id, interval=1.0 if transitioning else 3.0)
+        with self._lock:
+            if status == "loading":
+                started = self._loading_since.setdefault(key, time.monotonic())
+            else:
+                self._loading_since.pop(key, None)
+                started = None
+        loaded = status == "loaded" and bool(row.get("gpu_uuid"))
+        state = (
+            "in_use" if active and loaded
+            else "ready" if loaded
+            else "loading" if status == "loading"
+            else "unloading" if status == "unloading"
+            else "error" if status == "error" and row.get("error")
+            else "unloaded"
+        )
         instances = []
-        if loaded:
+        if loaded or state in {"loading", "unloading"}:
+            instance: dict[str, Any] = {
+                "id": f"cloud:{target.host_id}:{target.deployment_id}",
+                "device": str(row.get("gpu_uuid")),
+                "state": state,
+                "gpu_bytes": 0,
+                "can_unload": loaded and not active,
+                "can_release": active > 0,
+                "can_cancel_load": False,
+                "overrides": {},
+                "remote": True,
+            }
+            if started is not None:
+                instance["elapsed_ms"] = (time.monotonic() - started) * 1000.0
+            instances.append(instance)
+        elif state == "error":
             instances.append(
                 {
                     "id": f"cloud:{target.host_id}:{target.deployment_id}",
-                    "device": str(row.get("gpu_uuid")),
-                    "state": state,
+                    "device": "cloud",
+                    "state": "error",
+                    "error": str(row.get("error")),
                     "gpu_bytes": 0,
-                    "can_unload": not active,
-                    "can_release": active > 0,
+                    "can_unload": False,
+                    "can_release": False,
                     "can_cancel_load": False,
                     "overrides": {},
+                    "remote": True,
                 }
             )
         return {
@@ -350,23 +534,31 @@ class MonitorCloudClient:
             "source_paths": [uri],
         }
 
-    def ensure_loaded(
+    def submit_load(
         self,
         target: CloudTarget,
         *,
         gpu_uuid: str | None = None,
-        timeout: float = 900,
     ) -> dict[str, Any]:
+        """Request a deployment load and return immediately with its job id.
+
+        Callers that must wait for usable weights use :meth:`ensure_loaded`; the
+        API uses this so a slow load never holds an HTTP request open.
+        """
         row = self.deployment(target)
         if row.get("status") == "loaded":
             if gpu_uuid and row.get("gpu_uuid") != gpu_uuid:
                 raise CloudRequestError("cloud deployment is loaded on a different GPU")
-            return row
+            self._remember_gpu(target, str(row.get("gpu_uuid") or gpu_uuid or ""))
+            return {"status": "loaded", "deployment": row}
         if row.get("status") not in {"ready", "error"}:
             raise CloudRequestError(f"cloud deployment is not ready ({row.get('status')})")
-        selected_gpu = str(gpu_uuid or "").strip()
+        selected_gpu = str(gpu_uuid or "").strip() or self._remembered_gpu(target)
         if not selected_gpu:
-            raise CloudRequestError("choose a cloud GPU before loading this model")
+            raise CloudRequestError(
+                "this cloud model is not loaded; load it from the Library and select a GPU first"
+            )
+        self._remember_gpu(target, selected_gpu)
         job = self.request(
             target.host_id,
             "POST",
@@ -374,7 +566,17 @@ class MonitorCloudClient:
             json={"gpu_uuid": selected_gpu, "device": "cuda"},
             timeout=30,
         )
-        job_id = str(job["job_id"])
+        # Show the load immediately; the background refresh reports completion.
+        key = (target.host_id, target.deployment_id)
+        with self._lock:
+            self._deployments[key] = {**row, "status": "loading", "gpu_uuid": selected_gpu, "error": None}
+            self._loading_since[key] = time.monotonic()
+            self._refreshed_at.pop(target.host_id, None)
+            self._local_changes[target.host_id] = self._local_changes.get(target.host_id, 0) + 1
+        return {"status": "loading", "job_id": str(job["job_id"]), "gpu_uuid": selected_gpu}
+
+    def wait_for_load(self, target: CloudTarget, job_id: str, *, timeout: float = 900) -> dict[str, Any]:
+        """Poll a previously submitted load job until it succeeds or fails."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             jobs = self.request(target.host_id, "GET", "/api/v1/jobs", timeout=30)
@@ -385,6 +587,19 @@ class MonitorCloudClient:
                 raise CloudRequestError(str(current.get("error") or "cloud model load failed"))
             time.sleep(0.25)
         raise CloudRequestError("cloud model load timed out")
+
+    def ensure_loaded(
+        self,
+        target: CloudTarget,
+        *,
+        gpu_uuid: str | None = None,
+        timeout: float = 900,
+    ) -> dict[str, Any]:
+        """Block until the deployment is loaded; used by rollout and debug paths."""
+        submitted = self.submit_load(target, gpu_uuid=gpu_uuid)
+        if submitted["status"] == "loaded":
+            return submitted["deployment"]
+        return self.wait_for_load(target, submitted["job_id"], timeout=timeout)
 
     def unload(self, target: CloudTarget, *, timeout: float = 180) -> None:
         row = self.deployment(target)
@@ -419,6 +634,7 @@ class MonitorCloudClient:
         task: str,
         state_keys: list[str],
         overrides: Mapping[str, str],
+        camera_names: Sequence[str] = (),
     ) -> RemoteSession:
         row = self.ensure_loaded(target)
         runtime_target = CloudTarget(
@@ -440,7 +656,7 @@ class MonitorCloudClient:
             for key, value in overrides.items()
             if key in allowed_policy or (mode == "rtc_chunk" and str(key).startswith("inference.rtc."))
         }
-        return RemoteSession(self, runtime_target, mode, task, state_keys, safe_overrides)
+        return RemoteSession(self, runtime_target, mode, task, state_keys, safe_overrides, camera_names)
 
     def load_policy(
         self,
@@ -486,6 +702,7 @@ class MonitorCloudClient:
             task=task,
             state_keys=state_keys,
             overrides=extra,
+            camera_names=sorted(str(name) for name in images_rgb),
         )
         wait_ms = (time.perf_counter() - started) * 1000
         try:
@@ -532,7 +749,16 @@ class RemoteSyncInferenceEngine:
         self.failure_traceback: str | None = None
         self.dispatched_chunk_id: int | None = None
         self.dispatched_action_index: int | None = None
+        # Mirrors the native profiler's observer contract so the rollout worker can
+        # record cloud transfer and compute phases on the same chart.
+        self.stage_observer: Any | None = None
         self._sequence = 0
+        # Actions the cloud policy still queues after the last request; the chart
+        # draws them as the dashed prediction a local sync rollout shows.
+        self._queued: list[dict[str, float]] = []
+
+    def leftover_poses(self, fallback: Mapping[str, float]) -> list[dict[str, float]]:
+        return [{**fallback, **pose} for pose in self._queued]
 
     def start(self) -> None:
         pass
@@ -549,11 +775,26 @@ class RemoteSyncInferenceEngine:
     def notify_observation(self, observation: dict[str, Any]) -> None:
         pass
 
+    def _publish_stages(self) -> None:
+        observer = self.stage_observer
+        if observer is None:
+            return
+        for stage in self.session.stages:
+            try:
+                observer(stage)
+            except Exception:  # noqa: BLE001 - telemetry must not affect control
+                logger.debug("cloud stage observer failed", exc_info=True)
+
     def get_action(self, observation: dict[str, Any] | None) -> dict[str, float] | None:
         if observation is None:
             return None
-        result = self.session.infer(observation, chunk_size=1)
+        try:
+            result = self.session.infer(observation, chunk_size=1)
+        finally:
+            self._publish_stages()
         poses = _poses(result, {})
+        # Older cloud services do not report the queue; the preview is then empty.
+        self._queued = _poses({**result, "actions": result.get("queued_actions") or []}, {})
         self._sequence += 1
         self.dispatched_chunk_id = self._sequence
         self.dispatched_action_index = 0
@@ -637,6 +878,9 @@ class RemoteRTCInferenceEngine:
     def get_processed_left_over(self) -> list[dict[str, float]]:
         with self._lock:
             return [dict(item[1]) for item in self._queue]
+
+    def leftover_poses(self, fallback: Mapping[str, float]) -> list[dict[str, float]]:
+        return [{**fallback, **pose} for pose in self.get_processed_left_over()]
 
     def _run(self) -> None:
         try:

@@ -176,6 +176,19 @@ class PolicyWorker:
                             if self.timeline
                             else None
                         )
+                    # A cloud engine reports transfer/compute phases instead of a GPU
+                    # profiler; attribute them to the chunk this request produced.
+                    stage_observer = getattr(self.engine, "stage_observer", None)
+                    if stage_observer is not None:
+                        self.engine.stage_observer = (
+                            (
+                                lambda stage: self.timeline.note_stage(
+                                    token, stage
+                                )
+                            )
+                            if self.timeline
+                            else None
+                        )
                     if self.prepare is not None:
                         prepared = time.perf_counter()
                         observation = self.prepare(observation)

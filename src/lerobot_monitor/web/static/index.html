@@ -312,6 +312,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg>
           <span>Hardware</span>
         </button>
+        <button type="button" class="panel-tab" id="side-tab-cloud" data-tab="cloud" role="tab" aria-selected="false" aria-controls="cloud-panel" tabindex="-1" title="Cloud models">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4 4 0 0 1 0-8 5.5 5.5 0 0 1 10.6-1.4A3.7 3.7 0 0 1 18 18z"/><path d="M12 12v5"/><path d="m9.5 14.5 2.5-2.5 2.5 2.5"/></svg>
+          <span>Cloud</span>
+        </button>
       </nav>
       <div id="preset-toolbar" class="side-tools">
         <div class="preset-row">
@@ -598,6 +602,57 @@
         </div>
         </div>
       </section>
+
+      <section class="panel side-tab-panel" id="cloud-panel" data-panel="cloud" data-tab-panel="cloud" role="tabpanel" aria-labelledby="side-tab-cloud" hidden>
+        <div class="panel-body cloud-panel-body">
+          <div class="task-block">
+            <h3>Cloud server</h3>
+            <div class="cloud-host-row">
+              <select id="cloud-host-select" aria-label="Cloud server"></select>
+              <button type="button" id="cloud-host-add" class="ghost icon-btn" title="Add SSH server" aria-label="Add SSH server">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+              </button>
+              <button type="button" id="cloud-refresh" class="ghost icon-btn" title="Refresh cloud status" aria-label="Refresh cloud status">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+              </button>
+            </div>
+            <p id="cloud-notice" class="cloud-notice" role="status" aria-live="polite" hidden></p>
+            <div id="cloud-host-meta" class="cloud-host-meta"></div>
+            <div id="cloud-host-actions" class="cloud-host-actions"></div>
+          </div>
+          <div class="task-block" data-panel="cloud-gpu">
+            <button type="button" class="panel-toggle" aria-expanded="true" aria-label="Toggle GPU resources">
+              <h3>GPU resources <span id="cloud-gpu-summary" class="cloud-count mono"></span></h3>
+              <span class="chevron" aria-hidden="true">▾</span>
+            </button>
+            <div class="panel-body">
+              <div id="cloud-gpu-list" class="cloud-gpu-grid"></div>
+            </div>
+          </div>
+          <div class="task-block" data-panel="cloud-models">
+            <button type="button" class="panel-toggle" aria-expanded="true" aria-label="Toggle Cloud models">
+              <h3>Cloud models <span id="cloud-model-count" class="cloud-count"></span></h3>
+              <span class="chevron" aria-hidden="true">▾</span>
+            </button>
+            <div class="panel-body">
+              <div class="cloud-model-toolbar">
+                <button type="button" id="cloud-model-add" class="ghost">+ Add</button>
+              </div>
+              <p id="cloud-runtime-status" class="cloud-hint"></p>
+              <div id="cloud-model-list" class="cloud-model-list"></div>
+            </div>
+          </div>
+          <div class="task-block" data-panel="cloud-jobs">
+            <button type="button" class="panel-toggle" aria-expanded="true" aria-label="Toggle Recent jobs">
+              <h3>Recent jobs <span id="cloud-updated-at" class="cloud-count"></span></h3>
+              <span class="chevron" aria-hidden="true">▾</span>
+            </button>
+            <div class="panel-body">
+              <div id="cloud-job-list" class="cloud-job-list"></div>
+            </div>
+          </div>
+        </div>
+      </section>
       </div>
     </aside>
 
@@ -679,6 +734,17 @@
           </div>
         </div>
         <div class="panel-body">
+          <div id="load-progress" class="load-progress hidden" role="status" aria-live="polite">
+            <div class="load-progress-head">
+              <span class="load-progress-spinner" aria-hidden="true"></span>
+              <span id="load-progress-label">Loading model…</span>
+            </div>
+            <progress id="load-progress-bar" aria-label="Model loading progress"></progress>
+            <div class="load-progress-meta">
+              <span id="load-progress-phase"></span>
+              <span id="load-progress-elapsed"></span>
+            </div>
+          </div>
           <ol id="log"></ol>
           <ol id="sessions"></ol>
         </div>
@@ -767,9 +833,37 @@
     </div>
   </div>
 
+  <dialog id="cloud-dialog" class="cloud-dialog" aria-labelledby="cloud-dialog-title">
+    <form id="cloud-dialog-form">
+      <header class="cloud-dialog-head">
+        <h2 id="cloud-dialog-title">Cloud</h2>
+        <button type="button" id="cloud-dialog-close" class="ghost icon-btn" aria-label="Close dialog">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
+        </button>
+      </header>
+      <div id="cloud-dialog-body" class="cloud-dialog-body"></div>
+      <p id="cloud-dialog-error" class="cloud-dialog-error" role="alert" hidden></p>
+      <footer class="cloud-dialog-actions">
+        <button type="button" id="cloud-dialog-cancel" class="ghost">Cancel</button>
+        <button type="submit" id="cloud-dialog-submit">Confirm</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="cloud-log-dialog" class="cloud-dialog cloud-log-dialog" aria-labelledby="cloud-log-title">
+    <header class="cloud-dialog-head">
+      <h2 id="cloud-log-title">Logs</h2>
+      <button type="button" id="cloud-log-close" class="ghost icon-btn" aria-label="Close logs">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>
+      </button>
+    </header>
+    <pre id="cloud-log-content" tabindex="0"></pre>
+  </dialog>
+
   <script type="module" src="/lerobot/static/rollout-lanes.js?v=20260928-rollout-ribbons"></script>
   <script src="/lerobot/static/rollout-speed.js?v=20260928-execution-speed"></script>
   <script src="/lerobot/static/app.js?v=20260928-model-actions"></script>
+  <script type="module" src="/lerobot/static/cloud-panel.js?v=20260929-cloud-panel"></script>
   <script type="module" src="/lerobot/static/robot-preview.js?v=20260923-arm-preview-2"></script>
 </body>
 </html>

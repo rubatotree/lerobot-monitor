@@ -1,13 +1,21 @@
 # Cloud models: service and Monitor integration
 
-The cloud service can be operated from its standalone manager or registered in LeRobot Monitor as a normal model entry. Monitor keeps SSH credentials and service tokens in its backend, while Debug, synchronous Rollout and RTC Rollout use authenticated remote sessions.
+The cloud service is operated from the **Cloud** panel inside LeRobot Monitor, which hosts the
+former standalone manager. A model can also be registered in the normal model library and used
+from Debug, synchronous Rollout and RTC Rollout. Monitor keeps SSH credentials and service
+tokens in its backend; the browser never receives them.
 
 ## Entry points and state
 
-- `lerobot-cloud-manager`: loopback HTTP on 127.0.0.1:8095; independent local state in `~/.lerobot-cloud-manager`.
-- `lerobot-monitor-cloud`: loopback HTTP on 127.0.0.1:8091; authenticated management and inference endpoints.
+- **LeRobot Monitor** (`lerobot-monitor`, default `http://127.0.0.1:8090/lerobot/`): serves the
+  Cloud side tab and the `/api/cloud/*` management API. This is the primary entry point.
+- `lerobot-cloud-manager`: the legacy loopback-only manager on 127.0.0.1:8095, kept for
+  compatibility. It shares `~/.lerobot-cloud-manager` with Monitor, so hosts added in either
+  place appear in both.
+- `lerobot-monitor-cloud`: loopback HTTP on 127.0.0.1:8091; authenticated management and
+  inference endpoints on the remote server.
 - Default roots: `/data/zhuyutian/lerobot-monitor` on `8x4090-server`; `/data2/zhuyutian/lerobot-monitor` on `8A6000-server`.
-- Both apps serve `cloud/web/index.html` and `/static/*`. `GET /api/ui-config` returns `{mode: "manager" | "cloud"}`.
+- The legacy apps serve `cloud/web/index.html` and `/static/*`. `GET /api/ui-config` returns `{mode: "manager" | "cloud"}`.
 
 ## Cloud HTTP API
 
@@ -25,16 +33,30 @@ All `/api/v1/*` endpoints require `Authorization: Bearer <token>` (including hea
 
 Inference uses authenticated HTTP sessions owned by cloud workers. Monitor reaches those sessions through its backend SSH tunnel; the browser receives only model, deployment and GPU metadata.
 
-## Local manager HTTP API
+## Host management HTTP API
 
-- `GET /api/hosts`: array with id, alias, root, port, status, error (no tokens).
-- `POST /api/hosts`: `{alias, root, port?: 8091, python?: "python3.12", runtime_python?: string}`. Alias uses existing OpenSSH config; credentials are never accepted.
-- `POST /api/hosts/{id}/probe`, `/bootstrap`, `/connect`, `/disconnect`: action; bootstrap returns a local job immediately.
-- `GET /api/jobs`: local initialization/upload task array.
-- `/api/hosts/{id}/cloud/api/v1/{path}`: authenticated proxy for supported cloud endpoints; token injected only on backend.
-- `POST /api/hosts/{id}/upload`: `{path: string, name: string}`; local checkpoint directory packed with a file-size/SHA256 manifest, transferred to isolated remote staging, verified and then registered as a path deployment. Symlinks and special files rejected. Returns local job immediately.
+Monitor hosts the full manager surface under `/api/cloud/*`; the legacy standalone manager
+serves the same operations without the `/api/cloud` prefix. Both are backed by the same
+`CloudManager` and the same on-disk state.
 
-Mutating manager requests require loopback Host and same-origin Origin when present. SSH uses argument lists, batch mode, strict host-key checking, configured jumps, keepalives and bounded timeouts. Failed tunnels are cleaned before reconnect; manager shutdown stops its tunnels only.
+Monitor-hosted routes:
+
+- `GET /api/cloud/hosts`: array with id, alias, root, port, status, operation_status, error (no tokens).
+- `POST /api/cloud/hosts`: `{alias, root, port?: 8091, python?: "python3.12", runtime_python?: string}`. Alias uses existing OpenSSH config; credentials are never accepted.
+- `POST /api/cloud/hosts/{id}/probe|connect|disconnect`: action; probe reports the interpreter, uv, root and writability.
+- `POST /api/cloud/hosts/{id}/bootstrap` and `/upgrade`: return a local job immediately (202).
+- `POST /api/cloud/hosts/{id}/upload`: `{path, name}` for an existing absolute local checkpoint directory; it is packed with a file-size/SHA256 manifest, transferred to isolated remote staging, verified and then registered as a path deployment. Symlinks and special files are rejected.
+- `POST /api/cloud/hosts/{id}/runtime`: `{wheel_path, profile, huggingface_home?}`.
+- `GET /api/cloud/hosts/{id}/catalog`: connected host, GPUs and deployments.
+- `GET /api/cloud/jobs`: local initialization/upload/runtime task array.
+- `GET|POST|DELETE /api/cloud/hosts/{id}/cloud/api/v1/{path}`: backend proxy for the supported cloud endpoints (`health`, `gpus`, `deployments`, `jobs`, `sessions`, and the deployment `load`/`unload`/`logs` sub-paths). The bearer token is injected only on the backend; unsupported paths return 404 and request bodies are capped at 64 MiB.
+
+This installs Monitor as the management surface; the standalone manager remains for
+compatibility. Unlike the loopback-only standalone manager, Monitor does not enforce a loopback
+Host or same-origin check, because Monitor is designed to be reachable from other devices on a
+trusted network. Keep `/api/cloud/*` on that same trusted network. SSH still uses argument
+lists, batch mode, strict host-key checking, configured jumps, keepalives and bounded timeouts.
+Failed tunnels are cleaned before reconnect; shutdown stops owned tunnels only.
 
 ## Installation and operations
 
@@ -44,9 +66,11 @@ Bootstrap is version-aware and must not replace an active service with a differe
 
 No actual remote initialization is performed just by opening the manager. Hosts start disconnected. SSH aliases may be probed without bootstrapping. Remote files are staged under the dedicated service root, and removal is restricted to owned files.
 
-## Running the independent local manager
+## Running the independent local manager (optional)
 
-From this checkout, install `lerobot-monitor[cloud]` into its own environment, then run:
+The Cloud panel in Monitor supersedes this page; the standalone manager is kept only for
+compatibility with existing scripts. If you still need it, install `lerobot-monitor[cloud]` into
+its own environment, then run:
 
 ```powershell
 lerobot-cloud-manager --port 8095 --project C:\path\to\lerobot-monitor
@@ -91,14 +115,41 @@ The cloud catalog API is backend-only:
 
 GPU rows include the compute processes reported by `nvidia-smi`, their Linux users resolved through `/proc/<pid>/status`, executable names and per-process GPU memory. The Load dialog shows the leading owner/program and disables a busy GPU unless it already belongs to the loaded deployment. A single faulty GPU query does not hide healthy rows. Stored addresses from the earlier `?gpu=<uuid>` format remain readable and migrate automatically to the stable address when Monitor opens its model registry.
 
+### Manage hosts and deployments from the Cloud panel
+
+The **Cloud** side tab hosts the whole standalone manager workflow in the Monitor page:
+
+1. **Server**: pick an existing SSH alias, or **+** to register one (`alias`, absolute server
+   data directory, service port and Python command). **Probe** checks the interpreter, uv,
+   root and writability without touching the service.
+2. **Initialize** installs the current checkout as a versioned service on the server;
+   **Upgrade** stages a new build and switches to it. Both run as local jobs and show progress
+   under **Recent jobs**. **Runtime** installs a pinned LeRobot wheel as a model-dependency
+   profile (ACT / SmolVLA / pi). **Connect** opens the managed SSH tunnel; **Disconnect**
+   closes it while leaving remote jobs running.
+3. **GPU resources**: per-card memory, health and the leading compute owner/program; the
+   **Load** dialog only offers genuinely available cards.
+4. **Cloud models**: **+ Add** deploys from Hugging Face, an existing server path, or a local
+   directory upload. Each row exposes **Load** (choose a GPU), **Unload**, **Logs**,
+   **Use** (register in the normal model library for Rollout/Debug) and **Remove**.
+5. **Recent jobs** merges local initialization/upload/runtime jobs with the job list reported
+   by the remote service.
+
+Polling runs only while the panel is visible and the browser tab is active.
+
 ### Add and load from Monitor
 
-1. Open **Library → Models** and choose **Add model**.
-2. Set **Source** to **Cloud deployment**.
-3. Select `8x4090-server`, choose **Connect and refresh**, then select the deployment.
-4. Choose **Add cloud model**. No GPU is selected at this stage.
-5. On the new model card, choose **Load**, review current owners and memory, select an available GPU, and choose **Load on selected GPU**.
-6. Use the model from Debug or Rollout. Choose **Unload** when finished; the card stays in the library for the next load.
+The **Add model** dialog separates the two sources into tabs, so only the fields for the
+selected source are shown:
+
+1. Open **Library → Models**, choose **Add model**, and stay on the **Local** tab for a Hugging
+   Face repo or a local path.
+2. For a remote deployment switch to the **Cloud** tab. The address/revision fields disappear;
+   select `8x4090-server`, choose **Connect and refresh**, then select the deployment.
+3. Optionally set **Name** on either tab, then choose **Add model** (Local) or **Add cloud model**
+   (Cloud). No GPU is selected at this stage.
+4. On the new model card, choose **Load**, review current owners and memory, select an available GPU, and choose **Load on selected GPU**.
+5. Use the model from Debug or Rollout. Choose **Unload** when finished; the card stays in the library for the next load.
 
 ## Validation evidence
 

@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .cameras import RemoteMjpegCamera, supported_resolutions
+from .cloud_api import add_cloud_routes
 from .config import MonitorConfig
 from .dataset_hub import (
     DatasetHubError,
@@ -1625,24 +1626,6 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
     async def model_load_diagnostics() -> dict[str, Any]:
         return await asyncio.to_thread(hub.policy_residency.load_diagnostics)
 
-    @router.get("/api/cloud/hosts")
-    async def cloud_hosts() -> list[dict[str, Any]]:
-        return await asyncio.to_thread(hub.cloud.hosts)
-
-    @router.post("/api/cloud/hosts/{host_id}/connect")
-    async def connect_cloud_host(host_id: str) -> dict[str, Any]:
-        try:
-            return await asyncio.to_thread(hub.cloud.connect, host_id)
-        except (CloudRequestError, KeyError, ValueError, RuntimeError) as exc:
-            raise HTTPException(502, str(exc)) from exc
-
-    @router.get("/api/cloud/hosts/{host_id}/catalog")
-    async def cloud_catalog(host_id: str) -> dict[str, Any]:
-        try:
-            return await asyncio.to_thread(hub.cloud.catalog, host_id)
-        except (CloudRequestError, KeyError, ValueError, RuntimeError) as exc:
-            raise HTTPException(502, str(exc)) from exc
-
     @router.post("/api/models/cloud")
     async def register_cloud_model(body: CloudModelRegisterBody) -> dict[str, Any]:
         try:
@@ -1678,11 +1661,17 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 gpu_uuid = str(body.device or "").strip()
                 if not gpu_uuid:
                     raise HTTPException(400, "choose a cloud GPU before loading this model")
-                await asyncio.to_thread(hub.cloud.ensure_loaded, target, gpu_uuid=gpu_uuid)
+                # Submit only: a cold load can take minutes and must not hold this
+                # request open. The UI tracks progress from the cloud job list.
+                submitted = await asyncio.to_thread(
+                    hub.cloud.submit_load, target, gpu_uuid=gpu_uuid
+                )
                 return {
                     "ok": True,
                     "accepted": True,
                     "instance_id": f"cloud:{target.host_id}:{target.deployment_id}",
+                    "job_id": submitted.get("job_id"),
+                    "loading": submitted.get("status") == "loading",
                     "residency": hub.cloud.residency(path),
                 }
             entry = await asyncio.to_thread(
@@ -2313,6 +2302,8 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 await asyncio.sleep(0.1)
         except WebSocketDisconnect:
             return
+
+    add_cloud_routes(router, hub)
 
     app.include_router(router, prefix=prefix)
     if STATIC_DIR.is_dir():

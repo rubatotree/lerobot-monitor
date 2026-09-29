@@ -187,6 +187,23 @@ def test_guard_and_persistence(tmp_path: Path) -> None:
     restored.close()
 
 
+def test_manager_degrades_on_unreadable_or_corrupt_state(tmp_path: Path) -> None:
+    (tmp_path / "hosts.json").write_text("{ not json", encoding="utf-8")
+    (tmp_path / "credentials.json").write_text("[1, 2]", encoding="utf-8")
+    manager = CloudManager(tmp_path)
+    assert manager.hosts() == []
+    assert manager._tokens == {}
+    manager.close()
+
+    (tmp_path / "hosts.json").write_text(json.dumps([
+        {"id": "ok", "alias": "ok", "root": "/data/me/cloud"},
+        {"id": "broken", "alias": "bad alias!", "root": "/data/me/cloud"},
+    ]), encoding="utf-8")
+    manager = CloudManager(tmp_path)
+    assert [row["alias"] for row in manager.hosts()] == ["ok"]
+    manager.close()
+
+
 def test_checkpoint_archive_manifest_and_symlink_boundary(tmp_path: Path) -> None:
     source = tmp_path / "checkpoint"
     source.mkdir()

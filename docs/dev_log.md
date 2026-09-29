@@ -1,5 +1,14 @@
 # Dev log
 
+## 2026-09-29：Rollout 底部泳道斜带适配完整预测计划
+
+- 现象：SmolVLA rollout 时 command action 图底部的泳道只有蓝色推理斜带和约 2.7px 的绿色碎段，没有长斜线计划尾迹；ACT 正常。用真实检查点驱动引擎+PolicyWorker+时间线复现数据：`n_action_steps=1` 时每个 block 的 `steps=accepted_steps=1`（引擎只上报**入队执行**的步数），前端 `chunkSpans` 按 `steps × step_s` 只能画出 66ms 的段。
+- 修复：`_RolloutBlock` 新增 `predicted_steps`（完整预测 chunk 长度），由 `note_inference_end` / `note_chunk_accepted` 记录并随快照发布。本地 sync 由 PolicyWorker 的新回调在引擎 `ready` 事件时读取 `predicted_chunk_total`（chunk 捕获）；无原生事件的路径（云 sync 等）用 `1 + len(preview)` 推出同一值。`steps`/`accepted_steps`/`remaining_steps` 语义不变（执行事实）。
+- 前端：`buildRolloutLanes` 的斜带 action 段在 `predicted_steps` 更大时扩展到完整计划长度，活动中的 chunk 因此显示淡色 planned 尾迹，被替换的 chunk 显示 45° replaced 尾迹；底部 chunk 两行带与重叠计数保持执行步数不变。悬停提示在行尾追加 `predicted N`（仅当与执行步数不同）。无 `predicted_steps` 的旧快照渲染完全不变。
+- 通用性：任何 policy 只要 chunk 生成交付被捕获（现行全部 chunking policy 均如此），泳道即显示完整计划；与策略类型、n_action_steps 无关。
+- 验证：真实 SmolVLA 复现脚本（已删除）显示本地与云 sync 两条路径的 block 均获得 `predicted=50`；前端几何（Node 直跑 rollout-lanes.js）产出 inference/action/planned/replaced 全相位。新增回归：timeline 字段透传 2 项、worker 原生/手动路径 2 项、前端几何 1 项。Monitor venv 相关套件 175 passed / 1 skipped；torch 依赖套件在同级 venv 9 passed；Node `test-rollout-lanes.mjs` 13/13；ruff 改动文件 0 新增告警。
+- 边界：云 sync 的 `preview=engine.leftover_poses` 接线与 monitor_cloud 引擎侧改动属于既有未提交工作，未纳入本次提交；云 RTC 引擎仍无 chunk 生命周期事件（泳道缺失为已知空白）。未重启 Monitor 服务，未跑浏览器 smoke。
+
 ## 2026-09-29：Rollout 虚线预测适配队列耗尽型策略
 
 - 现象：SmolVLA rollout 的动作图始终没有虚线预测（本机与云端 sync 一致），ACT 正常。根因：两个 SmolVLA 检查点均为 `n_action_steps=1 / chunk_size=50`，`select_action` 入队 1 步随即弹出，预览读取时队列恒为空；既有预览链（RTC 队列 → ACT temporal ensembler → policy 队列）无法看到被丢弃的其余 49 步。

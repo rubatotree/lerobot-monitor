@@ -756,6 +756,21 @@ def install_predicted_chunk_capture(policy: Any) -> PredictedChunkCapture | None
         return None
 
 
+def predicted_chunk_total(policy: Any) -> int | None:
+    """Length in steps of the last chunk the policy generated, if captured.
+
+    Callers run right after a generation pass (inference thread), so no age guard
+    applies here; stale recordings are rejected by ``predicted_chunk_tail`` instead.
+    """
+    capture = getattr(policy, "_monitor_chunk_capture", None)
+    if not isinstance(capture, PredictedChunkCapture) or capture.chunk is None:
+        return None
+    try:
+        return int(capture.chunk.shape[1])
+    except Exception:  # noqa: BLE001 - telemetry must not affect control
+        return None
+
+
 def predicted_chunk_tail(
     policy: Any,
     *,

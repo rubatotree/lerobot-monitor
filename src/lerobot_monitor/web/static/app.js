@@ -916,7 +916,7 @@ function rolloutLaneTooltipModel(chart) {
     `Action elapsed ${duration(analysis.actionElapsed)} / plan ${duration(analysis.plan)}`,
     `Last send ${time(b.last_dispatched)} · end ${time(b.action_end)}`,
     `RTC steps: original ${n(b.original_steps ?? b.steps)} · trimmed ${n(b.prefix_trimmed)} (${b.prefix_trimmed != null ? duration(b.prefix_trimmed * (b.step_s || 0)) : "—"})`,
-    `Accepted ${n(b.accepted_steps ?? b.steps)} · taken ${n(b.consumed_steps)} · sent ${n(b.dispatched_steps)}`,
+    `Accepted ${n(b.accepted_steps ?? b.steps)} · taken ${n(b.consumed_steps)} · sent ${n(b.dispatched_steps)}${b.predicted_steps != null && b.predicted_steps !== (b.accepted_steps ?? b.steps) ? ` · predicted ${n(b.predicted_steps)}` : ""}`,
     `Remaining ${n(b.remaining_steps)} · replaced ${n(b.replaced_steps)}${b.replaced_by != null ? ` by #${b.replaced_by}` : ""}`,
     `Plan overlap: ${overlaps.length ? overlaps.map(o => `#${o.ids.filter(id => id !== b.id).join(", #")} (${duration(o.duration)})`).join("; ") : "none"}`,
   ];

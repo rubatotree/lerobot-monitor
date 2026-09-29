@@ -84,3 +84,23 @@ test('waiting counts advance, failed counts stop and accepted plans need no exec
   const failed=build([block(1,{status:'failed',failed:true,active:null})],103).ribbons[0];
   assert.deepEqual(ribbonAnalysis(failed,103),ribbonAnalysis(failed,108));
 });
+test('ribbon plan tail extends to predicted steps while chunk bands keep executed steps',()=>{
+  const b=block(1,{steps:1,accepted_steps:1,predicted_steps:50});
+  const lanes=build([b],102);
+  // Bottom chunk band and overlap accounting keep executed steps (0.1s span).
+  assert.ok(Math.abs((lanes.chunks[0].end-lanes.chunks[0].start)-0.1)<1e-9);
+  // The diagonal ribbon covers the full predicted plan (5s).
+  const ribbon=lanes.ribbons[0];
+  assert.ok(Math.abs((ribbon.action.end-ribbon.action.start)-5)<1e-9);
+  const segments=ribbonSegments(lanes,t=>(t-100)*100,0);
+  assert.ok(segments.some(s=>s.phase==='planned'),'live plan tail');
+  // A superseded chunk marks the dropped plan as the replaced tail.
+  const done=build([block(1,{steps:1,accepted_steps:1,predicted_steps:50,action_end:1.7,status:'completed'})],102,{lookaheadS:10});
+  const tail=ribbonSegments(done,t=>(t-100)*100,0).find(s=>s.phase==='replaced');
+  assert.ok(tail,'replaced plan tail');
+  // action starts at active=1.6, ends at 1.6+50*0.1; superseded at action_end=1.7.
+  assert.ok(Math.abs((tail.x2-tail.x1)-(5-(1.7-1.6))*100)<1e-6);
+  // Blocks without predicted steps render exactly as before.
+  const plain=build([block(2)],102);
+  assert.ok(Math.abs((plain.ribbons[0].action.end-plain.ribbons[0].action.start)-0.8)<1e-9);
+});

@@ -21,6 +21,7 @@ class _RolloutBlock:
     end: float | None = None
     active: float | None = None
     steps: int | None = None
+    predicted_steps: int | None = None
     step_s: float | None = None
     failed: bool = False
     accepted: bool = False
@@ -146,7 +147,13 @@ class RolloutTimeline:
             return None
 
     def note_inference_end(
-        self, token: int | None, *, ok: bool, steps: int | None, discarded: bool = False
+        self,
+        token: int | None,
+        *,
+        ok: bool,
+        steps: int | None,
+        discarded: bool = False,
+        predicted_steps: int | None = None,
     ) -> None:
         """Close a previously opened inference interval."""
         if token is None:
@@ -167,6 +174,9 @@ class RolloutTimeline:
                 normalized_steps = self._positive_int(steps)
                 if normalized_steps is not None:
                     block.steps = normalized_steps
+                normalized_predicted = self._positive_int(predicted_steps)
+                if normalized_predicted is not None:
+                    block.predicted_steps = normalized_predicted
         except Exception as exc:  # noqa: BLE001 - telemetry must not affect control
             logger.debug("could not end rollout inference timing: %s", exc)
 
@@ -235,6 +245,7 @@ class RolloutTimeline:
         prefix_trimmed: int = 0,
         replaced: tuple[tuple[int, int], ...] = (),
         timestamp: float | None = None,
+        predicted_steps: int | None = None,
     ) -> None:
         """Apply the actual queue merge receipt, without changing generated steps."""
         try:
@@ -248,6 +259,9 @@ class RolloutTimeline:
                 block.accepted = steps > 0
                 block.accepted_at = now
                 block.accepted_steps = max(0, steps)
+                normalized_predicted = self._positive_int(predicted_steps)
+                if normalized_predicted is not None:
+                    block.predicted_steps = normalized_predicted
                 block.prefix_trimmed = max(0, prefix_trimmed)
                 if block.pending_dispatches and steps > 0:
                     block.active = min(block.pending_dispatches.values())
@@ -425,6 +439,7 @@ class RolloutTimeline:
             "failed": bool(block.failed),
             "status": block.status,
             "original_steps": block.steps,
+            "predicted_steps": block.predicted_steps,
             "prefix_trimmed": block.prefix_trimmed,
             "accepted_steps": block.accepted_steps,
             "consumed_steps": block.consumed_steps,

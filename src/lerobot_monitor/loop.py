@@ -42,6 +42,7 @@ from .policy import (
     load_policy,
     pose_from_action_tensor,
     predict_action_chunk,
+    predicted_chunk_total,
 )
 from .policy_residency import PolicyLease, PolicyResidencyManager
 from .policy_worker import PolicyWorker
@@ -3239,6 +3240,9 @@ class ControlLoop:
                     hw_features, self._prepare_rollout_observation(obs), prefix="observation",
                 ),
                 convert=lambda action, joints: pose_from_action_tensor(loaded, action, joints),
+                # The engine reports only executed (queued) steps; the capture
+                # remembers the full prediction for the ribbon plan tail.
+                predicted_steps=lambda: predicted_chunk_total(loaded.policy),
             )
         self._rollout_hw_feature_spec = hw_features
         self._next_prediction_t = self.task_t0

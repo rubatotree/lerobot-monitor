@@ -26,6 +26,26 @@ def test_explicit_rtc_events_do_not_activate_unpublished_or_discarded_chunks() -
     assert timeline.snapshot()["blocks"][1]["active"] is None
 
 
+def test_predicted_steps_are_plumbed_into_the_snapshot() -> None:
+    timeline = RolloutTimeline()
+    timeline.set_enabled(True)
+    token = timeline.note_inference_start(kind="sync", step_s=1 / 15)
+    timeline.note_inference_end(token, ok=True, steps=1, predicted_steps=50)
+    timeline.note_chunk_accepted(token, steps=1, predicted_steps=50)
+    block = timeline.snapshot()["blocks"][0]
+    assert block["steps"] == 1
+    assert block["accepted_steps"] == 1
+    assert block["original_steps"] == 1
+    assert block["predicted_steps"] == 50
+
+    plain = timeline.note_inference_start(kind="sync", step_s=1 / 15)
+    timeline.note_inference_end(plain, ok=True, steps=3)
+    timeline.note_chunk_accepted(plain, steps=3)
+    block = timeline.snapshot()["blocks"][1]
+    assert block["steps"] == 3
+    assert block["predicted_steps"] is None
+
+
 def test_disabled_timeline_has_no_snapshot_and_clear_resets_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

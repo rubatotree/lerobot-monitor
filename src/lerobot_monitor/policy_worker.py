@@ -26,6 +26,7 @@ class PolicyWorker:
         kind: str = "sync",
         prepare: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         convert: Callable[[Any, dict[str, float]], dict[str, float]] | None = None,
+        predicted_steps: Callable[[], int | None] | None = None,
     ) -> None:
         self.engine = engine
         self.inference_lock = inference_lock
@@ -35,6 +36,10 @@ class PolicyWorker:
         self.kind = str(kind)
         self.prepare = prepare
         self.convert = convert
+        # Full length of the generated chunk, when the policy exposes it. Engines
+        # only report the steps kept for execution (n_action_steps), which hides
+        # the predicted plan for queue-draining policies such as n_action_steps=1.
+        self._predicted_steps = predicted_steps
         self._requests: queue.Queue[tuple[dict[str, Any], dict[str, float]]] = (
             queue.Queue(maxsize=1)
         )
@@ -77,6 +82,23 @@ class PolicyWorker:
             )
         except Exception:  # noqa: BLE001, S110 - telemetry must not affect control
             pass
+
+    def _plan_steps(self, executed_steps: int | None, preview: list[dict[str, float]] | None) -> int | None:
+        """Total predicted chunk length for the ribbon plan tail, when known."""
+        try:
+            predicted = (
+                self._predicted_steps() if self._predicted_steps is not None else None
+            )
+            if predicted is None and preview:
+                predicted = (executed_steps or 1) + len(preview)
+            if predicted is None:
+                return None
+            predicted = int(predicted)
+            if executed_steps is not None and predicted <= int(executed_steps):
+                return None
+            return predicted if predicted > 0 else None
+        except Exception:  # noqa: BLE001 - telemetry must not affect control
+            return None
 
     def submit(
         self, observation: dict[str, Any], fallback_joints: dict[str, float]
@@ -192,7 +214,11 @@ class PolicyWorker:
                 and not self._native_events
             ):
                 try:
-                    self.timeline.note_chunk_accepted(token, steps=1)
+                    # One action was dispatched per request; the preview holds the
+                    # rest of the prediction (server queue or captured chunk tail).
+                    self.timeline.note_chunk_accepted(
+                        token, steps=1, predicted_steps=self._plan_steps(1, preview)
+                    )
                 except Exception:
                     logger.debug("Could not record worker telemetry", exc_info=True)
             if self._stop.is_set():
@@ -247,9 +273,15 @@ class PolicyWorker:
                 self._prepared_at,
             )
         elif event.kind == "ready":
-            self.timeline.note_inference_end(event.chunk_id, ok=True, steps=event.steps)
+            # The callback reads the capture right after generation, so the plan
+            # tail reflects the full prediction even when the queue keeps one step.
+            plan = self._plan_steps(event.steps, None)
+            self.timeline.note_inference_end(
+                event.chunk_id, ok=True, steps=event.steps, predicted_steps=plan
+            )
             self.timeline.note_chunk_accepted(
-                event.chunk_id, steps=event.steps, replaced=event.replaced
+                event.chunk_id, steps=event.steps, replaced=event.replaced,
+                predicted_steps=plan,
             )
         elif event.kind == "consumed":
             self.timeline.note_consumed(event.chunk_id, index=event.action_index)

@@ -57,7 +57,13 @@ export function buildRolloutLanes({ timeline, chartNow, epoch = null, prediction
   const inferences = inferenceSpans(blocks, now).filter(visible);
   const ribbons = blocks.flatMap(block => {
     const inference = inferenceSpans([block], now)[0];
-    const action = chunkSpans([block], { prediction, stepS: timeline.step_s })[0] || null;
+    let action = chunkSpans([block], { prediction, stepS: timeline.step_s })[0] || null;
+    // The diagonal ribbon shows the model's full predicted plan; the bottom chunk
+    // bands and overlap hatching keep executed (accepted) steps only.
+    const planSteps = finite(block.predicted_steps);
+    if (action && planSteps != null && planSteps > action.steps) {
+      action = { ...action, steps: planSteps, end: action.start + planSteps * action.step_s };
+    }
     if (!inference) return [];
     const end = action?.end ?? block.action_end ?? inference.end;
     if (!visible({ start: inference.start, end })) return [];

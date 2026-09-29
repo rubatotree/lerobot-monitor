@@ -220,3 +220,93 @@ def test_policy_worker_records_failed_inference() -> None:
     assert result[2] == "RuntimeError: inference failed"
     assert timeline.ends == [(12, False, 1)]
     worker.stop_async().wait(2)
+
+def test_native_ready_event_records_predicted_plan_steps() -> None:
+    from types import SimpleNamespace
+
+    from lerobot_monitor.rollout_timeline import RolloutTimeline
+
+    class NativeEngine:
+        def __init__(self) -> None:
+            self.chunk_observer = None
+            self.dispatched_chunk_id = None
+            self.dispatched_action_index = None
+            self._sequence = 0
+
+        def get_action(self, _observation: dict) -> dict[str, float]:
+            self._sequence += 1
+            chunk_id = self._sequence
+            self.chunk_observer(SimpleNamespace(kind="started", chunk_id=chunk_id))
+            self.chunk_observer(
+                SimpleNamespace(kind="ready", chunk_id=chunk_id, steps=1, replaced=())
+            )
+            self.chunk_observer(
+                SimpleNamespace(kind="consumed", chunk_id=chunk_id, action_index=0)
+            )
+            self.dispatched_chunk_id = chunk_id
+            self.dispatched_action_index = 0
+            return {"gripper": float(chunk_id)}
+
+        def stop(self) -> None:
+            pass
+
+    timeline = RolloutTimeline()
+    timeline.set_enabled(True)
+    worker = PolicyWorker(
+        NativeEngine(),
+        threading.Lock(),
+        timeline=timeline,
+        step_s=1 / 15,
+        predicted_steps=lambda: 50,
+    )
+    try:
+        assert worker.submit({}, {"gripper": 0.0})
+        result = None
+        deadline = time.perf_counter() + 2
+        while result is None and time.perf_counter() < deadline:
+            result = worker.latest()
+            time.sleep(0.005)
+        assert result is not None and result[1] == {"gripper": 1.0}
+    finally:
+        assert worker.stop_async().wait(2)
+
+    blocks = timeline.snapshot()["blocks"]
+    assert len(blocks) == 1
+    assert blocks[0]["steps"] == 1
+    assert blocks[0]["accepted_steps"] == 1
+    assert blocks[0]["predicted_steps"] == 50
+
+
+def test_manual_accept_records_plan_steps_from_preview() -> None:
+    from lerobot_monitor.rollout_timeline import RolloutTimeline
+
+    class Engine:
+        def get_action(self, _observation: dict) -> dict[str, float]:
+            return {"gripper": 1.0}
+
+        def stop(self) -> None:
+            pass
+
+    timeline = RolloutTimeline()
+    timeline.set_enabled(True)
+    worker = PolicyWorker(
+        Engine(),
+        threading.Lock(),
+        timeline=timeline,
+        step_s=1 / 15,
+        preview=lambda _joints: [{"gripper": 2.0}, {"gripper": 3.0}],
+    )
+    try:
+        assert worker.submit({}, {"gripper": 0.0})
+        result = None
+        deadline = time.perf_counter() + 2
+        while result is None and time.perf_counter() < deadline:
+            result = worker.latest()
+            time.sleep(0.005)
+        assert result is not None
+    finally:
+        assert worker.stop_async().wait(2)
+
+    block = timeline.snapshot()["blocks"][0]
+    assert block["steps"] == 1
+    assert block["predicted_steps"] == 3

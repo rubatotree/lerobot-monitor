@@ -9020,7 +9020,7 @@ function modelResidencyActionButton(model, action, scope, instanceId = null) {
   button.addEventListener("click", event => {
     event.stopPropagation();
     if (action === "load" && model.source === "cloud") {
-      openCloudLoadModal(model);
+      startCloudLoad(model);
       return;
     }
     runModelResidencyAction(model, action, instanceId);
@@ -9473,6 +9473,60 @@ function modalField(labelText, input) {
   label.textContent = labelText;
   label.appendChild(input);
   return label;
+}
+
+async function startCloudLoad(model) {
+  // Load without the dialog whenever a free GPU exists: pick the lowest index.
+  const current = modelsCache.find(item => String(item.id) === String(model.id));
+  if (!current || !modelResidencyCanAct(current, "load", null)) return;
+  const key = modelResidencyKey(current);
+  if (modelResidencyRequests.has(key)) return;
+  const hostId = String(current.cloud_host_id || "");
+  const deploymentId = String(current.cloud_deployment_id || "");
+  const fail = (message) => {
+    modelResidencyMessages.set(key, { text: message, error: true });
+    toastError(new Error(message));
+    localLog(`Model load failed: ${libraryDisplayName("model", current)} — ${message}`);
+  };
+  if (!hostId || !deploymentId) {
+    fail("This cloud model is missing its host or deployment identity.");
+    return;
+  }
+  modelResidencyRequests.set(key, { action: "load", instanceId: null });
+  refreshModelResidencyCards(current);
+  try {
+    const catalog = await api(`/api/cloud/hosts/${encodeURIComponent(hostId)}/connect`, {});
+    const cards = (catalog.gpus || []).filter(row => row.healthy !== false && !row.error);
+    const free = cards
+      .filter(row => !row.busy)
+      .sort((a, b) => Number(a.index) - Number(b.index));
+    if (free.length) {
+      const pick = free[0];
+      const index = Number(pick.index);
+      // Hand the in-flight guard to the action; it re-arms synchronously on entry.
+      modelResidencyRequests.delete(key);
+      refreshModelResidencyCards(current);
+      const result = await runModelResidencyAction(current, "load", null, { device: pick.uuid });
+      if (result) {
+        watchCloudLoad({
+          model: current, jobId: result.job_id, gpuUuid: pick.uuid,
+          gpuIndex: Number.isFinite(index) ? index : null,
+        });
+      }
+      return;
+    }
+    if (!cards.length) {
+      fail("No healthy cloud GPU detected; check the server or try again later.");
+      return;
+    }
+    // Every detected GPU is busy: the dialog is the only place to share one.
+    openCloudLoadModal(current);
+  } catch (error) {
+    fail(error.message || String(error));
+  } finally {
+    modelResidencyRequests.delete(key);
+    refreshModelResidencyCards(current);
+  }
 }
 
 function openCloudLoadModal(model) {

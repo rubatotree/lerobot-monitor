@@ -1,5 +1,11 @@
 # Dev log
 
+## 2026-09-30：云模型 Load 自动选择空闲 GPU
+
+- 左侧模型库对云模型点 Load 不再先弹 GPU 选择窗：自动拉取主机目录，把负载提交到编号最小的空闲（健康且非 busy）GPU，并直接进入侧边进度跟踪（"Loading … on GPU N"）。弹窗仅保留给"所有 GPU 都被占用、需要选择共享哪张卡"的场景；主机无健康 GPU 时不弹窗，直接在卡片与日志报错。点击期间沿用请求守卫（按钮显示 Requesting…），提交前同步移交守卫给加载动作，双击不会产生两次加载。
+- 验证：新增 `scripts/verify-cloud-load-autopick.cjs`（真实 Monitor 服务 + Playwright 路由桩 + 合成 WebSocket）8/8 通过——有空闲卡时不弹窗且请求体 `device` 指向最低编号空闲卡、全忙时弹窗且所有选项禁用/零提交、无健康卡时报错且不弹窗不提交、无浏览器异常；截图确认卡片红字错误与 "Loading Cloud SmolVLA on GPU 1" 进度条。`node --check` 通过。
+- 边界：云面板（cloud-panel.js）自带的 Load 对话框是另一条路径，未改动；本机模型 Load 本就不弹窗。
+
 ## 2026-09-30：云端构建版本漂移可见化
 
 - 现象：云端 4090 的 `classify-blocks-2-1-smolvla` rollout 仍无虚线与泳道。排查确认本机包哈希 `cf9db7c8…`（含两轮修复）与服务器 `daemon.json` 记录的运行构建 `79de4867…` 不一致——服务器从未升级，旧 worker 不回传 `queued_actions`，云端预览与 `predicted_steps` 数据链全部断在源头。ACT 本机运行不受影响。

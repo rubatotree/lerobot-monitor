@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import subprocess
@@ -15,17 +14,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from . import code_hash
 from .runtime import read_token
-
-
-def code_hash() -> str:
-    digest = hashlib.sha256()
-    package = Path(__file__).parent.parent
-    paths = set(package.rglob("*.py")) | {path for path in (package / "cloud" / "web").rglob("*") if path.is_file()}
-    for path in sorted(paths):
-        digest.update(str(path.relative_to(package)).replace("\\", "/").encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
 
 
 def request_service(root: Path, port: int, path: str, *, method: str = "GET") -> dict[str, Any]:

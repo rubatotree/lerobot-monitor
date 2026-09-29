@@ -1,5 +1,12 @@
 # Dev log
 
+## 2026-09-30：云端构建版本漂移可见化
+
+- 现象：云端 4090 的 `classify-blocks-2-1-smolvla` rollout 仍无虚线与泳道。排查确认本机包哈希 `cf9db7c8…`（含两轮修复）与服务器 `daemon.json` 记录的运行构建 `79de4867…` 不一致——服务器从未升级，旧 worker 不回传 `queued_actions`，云端预览与 `predicted_steps` 数据链全部断在源头。ACT 本机运行不受影响。
+- 修复：`code_hash` 从 `cloud/__main__.py` 上移到 `cloud/__init__.py`（包根与相对路径口径不变，跨机器可比）；manager 在 connect 时记录服务器健康报告的 `code_hash`，`hosts()` 新增 `build_outdated`（仅已连接且两端哈希都已知且不同为真）；云面板主机行显示 "outdated build" 徽标与升级提示（cloud-panel.js 属未提交工作，改动随其保留在工作区）。
+- 运维路径：云面板点 Upgrade 部署当前构建 → 重新加载模型（worker 按加载启动）→ rollout。有活动会话时服务器拒绝升级，需先停止。
+- 验证：`test_cloud_manager + test_cloud_api + test_cloud` 73 passed；新增漂移用例覆盖一致/失配/断开三态；`node --check` 通过；ruff 0 新增（`__main__` 的 I001 与测试桩 PYI 均为既有）。
+
 ## 2026-09-29：Rollout 底部泳道斜带适配完整预测计划
 
 - 现象：SmolVLA rollout 时 command action 图底部的泳道只有蓝色推理斜带和约 2.7px 的绿色碎段，没有长斜线计划尾迹；ACT 正常。用真实检查点驱动引擎+PolicyWorker+时间线复现数据：`n_action_steps=1` 时每个 block 的 `steps=accepted_steps=1`（引擎只上报**入队执行**的步数），前端 `chunkSpans` 按 `steps × step_s` 只能画出 66ms 的段。

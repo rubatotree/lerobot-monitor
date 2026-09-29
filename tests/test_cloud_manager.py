@@ -118,6 +118,41 @@ def test_reconnect_and_shutdown_clean_owned_tunnels(tmp_path: Path, monkeypatch:
     assert all(call[0] == "8x4090-server" for call in ssh.calls)
 
 
+def test_hosts_flag_outdated_server_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class BuildClient:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> BuildClient:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                200, json={"status": "ok", "code_hash": "server-build"},
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(httpx, "Client", BuildClient)
+    local = {"hash": "server-build"}
+    monkeypatch.setattr(
+        "lerobot_monitor.cloud_manager.manager.code_hash", lambda: local["hash"]
+    )
+    manager = CloudManager(tmp_path, transport=FakeSSH())
+    manager.connect("8x4090-server")
+    assert manager.hosts()[0]["build_outdated"] is False
+
+    local["hash"] = "newer-build"
+    manager._local_build = None  # recompute on the next connect
+    manager.connect("8x4090-server")
+    assert manager.hosts()[0]["build_outdated"] is True
+
+    manager.disconnect("8x4090-server")
+    assert manager.hosts()[0]["build_outdated"] is False
+
+
 def test_failed_health_check_does_not_leave_tunnel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class BrokenClient(HealthyClient):
         def get(self, url: str, **kwargs: Any) -> httpx.Response:

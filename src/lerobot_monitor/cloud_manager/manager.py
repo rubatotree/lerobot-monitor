@@ -19,8 +19,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 import httpx
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from ..cloud import code_hash
 from .artifacts import BOOTSTRAP, CLEANUP_UPLOAD, EXTRACT_UPLOAD, PREPARE_RUNTIME, STORE_WHEEL, VERIFY_UPLOAD, build_wheel, checkpoint_archive
 from .transport import SSHTransport, TransportError
 
@@ -86,18 +87,36 @@ class CloudManager:
         self._closed = False
         self._hosts: dict[str, dict[str, Any]] = {}
         self._tokens: dict[str, str] = {}
+        self._builds: dict[str, str | None] = {}
+        self._local_build: str | None = None
         hosts_path = state_dir / "hosts.json"
-        if hosts_path.exists():
-            for row in json.loads(hosts_path.read_text(encoding="utf-8")):
+        rows = self._read_state(hosts_path, list)
+        for row in rows:
+            try:
                 validated = HostInput.model_validate(row)
-                self._hosts[row["id"]] = {"id": row["id"], **validated.model_dump()}
-        else:
+            except (ValidationError, TypeError):
+                continue  # Skip a corrupt row instead of failing every host.
+            self._hosts[row["id"]] = {"id": row["id"], **validated.model_dump()}
+        if not rows and not hosts_path.exists():
             for alias, root in (("8x4090-server", "/data/zhuyutian/lerobot-monitor"),
                                 ("8A6000-server", "/data2/zhuyutian/lerobot-monitor")):
                 self._hosts[alias] = {"id": alias, **HostInput(alias=alias, root=root).model_dump()}
-        tokens_path = state_dir / "credentials.json"
-        if tokens_path.exists():
-            self._tokens = json.loads(tokens_path.read_text(encoding="utf-8"))
+        self._tokens = self._read_state(state_dir / "credentials.json", dict)
+
+    @staticmethod
+    def _read_state(path: Path, kind: type) -> Any:
+        """Read a JSON state file, never letting a bad one stop the application.
+
+        When Monitor hosts this manager, an unreadable or corrupt credentials
+        file must degrade to "no hosts / no tokens" rather than crash startup.
+        """
+        try:
+            if not path.exists():
+                return kind()
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return kind()
+        return value if isinstance(value, kind) else kind()
 
     def _host_lock(self, identifier: str) -> threading.RLock:
         with self._lock:
@@ -115,8 +134,13 @@ class CloudManager:
             for identifier, row in self._hosts.items():
                 tunnel = self._tunnels.get(identifier)
                 connected = tunnel is not None and tunnel[0].poll() is None
+                server_build = self._builds.get(identifier)
                 result.append({**row, "status": "connected" if connected else "disconnected",
                                "operation_status": "busy" if identifier in self._busy else "idle",
+                               "build_outdated": bool(
+                                   connected and server_build and self._local_build
+                                   and server_build != self._local_build
+                               ),
                                "error": self._errors.get(identifier)})
             return result
 
@@ -178,6 +202,9 @@ class CloudManager:
                 if self._closed:
                     self.transport.stop(process)
                     raise RuntimeError("Manager is shutting down")
+                if self._local_build is None:
+                    self._local_build = code_hash()
+                self._builds[identifier] = health.get("code_hash")
                 self._tunnels[identifier] = (process, port)
                 self._tokens[identifier] = token
                 atomic_json(self.state_dir / "credentials.json", self._tokens)

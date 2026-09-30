@@ -1,5 +1,12 @@
 # Dev log
 
+## 2026-09-30：Record 顶栏改为占位网格行，并随 record 模式退出
+
+- 现象一：Stop 退出 record 后顶栏仍在。根因：后端 `_stop_record` 结束后 `mode` 立即回到 idle，但 `_record_snapshot` 仍带着最后的 session（finalizing/completed/error）上报，而前端只在 `phase === "preparing"` 时清理 `liveRecord`，于是「可见」一直成立。修复：`renderRecordTransport` 以 `last.mode === "record"` 或 `task.pending === "record_start"` 为唯一判据，离开 record 模式即清空 `liveRecord` 并隐藏顶栏，重进 record 模式自动恢复。
+- 现象二：顶栏绝对定位覆盖摄像头窗口。修复：`.record-transport` 取消 `position: absolute` / `z-index` / `top/left/right`，改为 `#cameras` 网格第 1 行——`#cameras.record-open` 时 `grid-template-rows: auto repeat(var(--cr, 1), minmax(0, 1fr))` 且顶栏 `grid-column: 1 / -1; grid-row: 1`，摄像头窗口在剩余等分行里收缩（`object-fit: contain` 自适应）；`.camera-empty` 在 record-open 时改为 `grid-row: 2 / -1` 避免与顶栏同格；700px media query 里的 top/left/right 一并删除。
+- 验证：新增 `scripts/verify-record-transport.cjs` 12/12（合成状态流 + 路由 PNG：idle 顶栏隐藏且 `position: static`；record 帧顶栏可见、卡片 `top ≥ 顶栏 bottom`、顶栏不越出 `#cameras`、卡片高度较 idle 缩小 >20px；Stop 后仍上报 completed payload 时顶栏隐藏、`record-open` 移除、卡片高度恢复；重进 record 顶栏回来且仍不重叠）。回归：`verify-camera-rotation.cjs` 20/20、`verify-ui-fixes.cjs` 15/15、`tests/test_app.py -k "index_page or record"` 2 passed（唯一失败仍是 venv 缺 `huggingface_hub` 的环境用例）。截图 `.agent-progress/record-transport-shots/`。
+- 边界：未在真机录制流程验证（合成状态流模拟真值）；数据集 finalize/save 期间顶栏现在会随 Stop 立即消失，保存结果仍记录在 Log / Sessions。
+
 ## 2026-09-30：Main view 摄像头窗口旋转（0/90/180/270）
 
 - 主视图 `#cameras` 每张 `.cam-card` 头部新增旋转控件（`⟳ 0°` 循环 0→90→180→270，`aria-pressed` 标记是否旋转）；媒体区包进 `.cam-stage`，只旋转窗口显示。

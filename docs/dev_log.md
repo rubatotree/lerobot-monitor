@@ -1,5 +1,13 @@
 # Dev log
 
+## 2026-09-30：Debug 时间条下方的可折叠 profile 明细
+
+- 诉求：时间条下方显示详细 profile 信息；范围与形态定为「时序分段 + 云端网络分段 + 逐关节误差」，且可折叠、默认收起。
+- 后端：`ActionChunk` 追加 `stage_ms`——云调试把 `RemoteSession.stages` 的 `cloud_encode/upload/compute/download` 折算成毫秒，本地路径没有分段 profiler 恒为 `None`；`/api/debug/infer` 新增 `stage_ms`（无分段时 `{}`）。逐关节误差其实早已在响应里（`evaluation.joints` 的 `mae/rmse/nrmse/scale`），此前只是没有渲染。
+- 前端：`debug-timing.js` 的 `buildDebugTiming` 追加 `detailRows`（wait/load/compute/other + inference 合计 + chunk/幽灵行，占比统一以整段墙钟为分母，与条形一致）、`stageRows`（云端往返内部占比）、`jointRows`（按 nrmse 由差到好排序）与 `evaluationSummary`；`app.js` 用原生 `<details>` 渲染 Timing / Cloud legs / Reference 三个分区，行内以 `--pct` 半透明底纹表达占比，折叠状态记在 `debugProfileOpen` 中、跨重渲染保留但初始均收起；`styles.css` 新增 `.debug-profile*`（分区标题 + 箭头 + 右侧汇总值，行内 10px 等宽数字，沿用 `.debug-eval`/`.task-info summary` 的语言）；`app.js`/`styles.css`/`debug-timing.js` 资源版本升到 `20260930-debug-profile`。
+- 测试：`scripts/test-debug-timing.mjs` 新增 4 项（明细行分母与顺序、缺 fps 时 chunk 行为 `—` 且无幽灵、云端占比和为 100、逐关节排序与空数据降级）共 11/11；`scripts/verify-debug-timing.cjs` 追加 10 项检查（默认收起、展开后三张表的行序/数值/label、云端占比、逐关节首行、折叠状态跨重渲染保留、窄面板不溢出），两视口合计 32/32 通过并输出展开态截图。pytest 补 `stage_ms` 断言（本地 `None`、云端 250 ms、路由透出）；既有 `test_static_rate_panel_contract` 里「全文不得出现 `details.open`」的近似断言放宽为只在 rate 面板函数体内断言同一意图（新面板合法使用 `<details>`）；同级 venv 全套 556 passed / 1 skipped（2 项 HF 缓存扫描失败为本机环境既有）；改动 Python 文件 ruff 0 新增。
+- 边界：`Cloud legs` 占比以四段之和为分母，与上一行 `compute` 的墙钟值存在毫秒级差异（stage 时间戳不含 `session.infer` 内部少量组装开销），不要对齐两者；`Reference` 分区只在请求带 reference（打开了 episode/snapshot）时出现；`Cloud legs` 需服务器为本构建，旧构建该分区不出现。
+
 ## 2026-09-30：Debug 面板推理用时条（含未截取长度）
 
 - 诉求：Debug 页签的推理阶段要有一条条形用时统计，横跨「发起推理 → 动作块结束」，并标出动作块未被 `chunk_size` 截取时本应有的长度。

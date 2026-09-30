@@ -6897,6 +6897,52 @@ function clearChunkTiming() {
   host.replaceChildren();
 }
 
+// Expanded/collapsed profile sections survive re-renders: both defaults are collapsed.
+const debugProfileOpen = { timing: false, cloud: false, reference: false };
+
+function debugProfileSection(section, title, meta, body) {
+  const details = document.createElement("details");
+  details.className = "debug-profile-section";
+  details.dataset.section = section;
+  details.open = debugProfileOpen[section] === true;
+  details.addEventListener("toggle", () => { debugProfileOpen[section] = details.open; });
+  const head = document.createElement("summary");
+  head.className = "debug-profile-head";
+  const name = document.createElement("span");
+  name.className = "debug-profile-title";
+  name.textContent = title;
+  const value = document.createElement("span");
+  value.className = "debug-profile-meta";
+  value.textContent = meta;
+  head.append(name, value);
+  const pane = document.createElement("div");
+  pane.className = "debug-profile-body";
+  pane.append(...body);
+  details.append(head, pane);
+  return details;
+}
+
+function debugProfileRow({ key, label, text, detail, pct, color }) {
+  const row = document.createElement("div");
+  row.className = "debug-profile-row";
+  row.dataset.kind = key;
+  row.style.setProperty("--pct", `${Math.max(0, Math.min(100, Number(pct) || 0)).toFixed(2)}%`);
+  const dot = document.createElement("span");
+  dot.className = "debug-profile-dot";
+  if (color) dot.style.background = color;
+  const name = document.createElement("span");
+  name.className = "debug-profile-label";
+  name.textContent = label;
+  const note = document.createElement("span");
+  note.className = "debug-profile-detail";
+  note.textContent = detail || "";
+  const value = document.createElement("span");
+  value.className = "debug-profile-value";
+  value.textContent = text;
+  row.append(dot, name, note, value);
+  return row;
+}
+
 function renderChunkTiming(result) {
   const host = $("dbg-timing");
   if (!host) return;
@@ -6935,7 +6981,68 @@ function renderChunkTiming(result) {
   const note = document.createElement("p");
   note.className = "debug-timing-note";
   note.textContent = timing.caption;
-  host.replaceChildren(track, chips, note);
+  const profile = document.createElement("div");
+  profile.className = "debug-profile";
+  profile.append(debugProfileSection(
+    "timing",
+    "Timing",
+    api.formatTimingMs(timing.latencyMs),
+    timing.detailRows.map((row) => debugProfileRow({
+      key: row.key,
+      label: row.key,
+      text: row.text,
+      detail: row.detail,
+      pct: row.pct,
+      color: row.key === "chunk" || row.key === "ghost" ? "var(--ok)" : undefined,
+    })),
+  ));
+  if (timing.stageRows.length) {
+    profile.append(debugProfileSection(
+      "cloud",
+      "Cloud legs",
+      api.formatTimingMs(timing.stageTotalMs),
+      timing.stageRows.map((row) => debugProfileRow({
+        key: row.key,
+        label: stageLabel(row.key),
+        text: row.text,
+        detail: "",
+        pct: row.pct,
+        color: stageColor(row.key),
+      })),
+    ));
+  }
+  if (timing.jointRows.length) {
+    const head = debugProfileRow({ key: "head", label: "joint", text: "rmse", detail: "mae", pct: 0 });
+    head.classList.add("is-head");
+    const headNrmse = document.createElement("span");
+    headNrmse.className = "debug-profile-value is-nrmse";
+    headNrmse.textContent = "nrmse";
+    head.append(headNrmse);
+    profile.append(debugProfileSection(
+      "reference",
+      "Reference",
+      `score ${timing.evaluationSummary.score.toFixed(1)} / 100`,
+      [
+        head,
+        ...timing.jointRows.map((row) => {
+          const item = debugProfileRow({
+            key: row.key,
+            label: row.key,
+            text: Number(row.rmse).toFixed(4),
+            detail: Number(row.mae).toFixed(4),
+            pct: 0,
+          });
+          item.classList.add("is-joint");
+          const nrmse = document.createElement("span");
+          nrmse.className = "debug-profile-value is-nrmse";
+          nrmse.textContent = Number(row.nrmse).toFixed(4);
+          item.append(nrmse);
+          return item;
+        }),
+      ],
+    ));
+  }
+  host.replaceChildren(track, chips, note, profile);
   host.classList.remove("hidden");
 }
 

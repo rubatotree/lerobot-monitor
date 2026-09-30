@@ -84,3 +84,64 @@ test('durations format as ms under a second and seconds above', () => {
   assert.equal(formatTimingMs(Number.NaN), '—');
   assert.equal(formatTimingMs(-5), '—');
 });
+
+const rowKeys = (rows) => rows.map((row) => row.key);
+
+test('timing detail rows share the bar denominator', () => {
+  const timing = buildDebugTiming({
+    fps: 30, latency_ms: 1600, model_wait_ms: 1250, model_load_ms: 1250,
+    compute_ms: 300, actions: row(16), generated_steps: 50,
+  });
+  assert.deepEqual(rowKeys(timing.detailRows), ['load', 'compute', 'other', 'inference', 'chunk', 'ghost']);
+  const perRow = (key) => timing.detailRows.find((entry) => entry.key === key);
+  assert.ok(Math.abs(perRow('inference').pct - 48.98) < 0.01);
+  const legs = timing.detailRows.filter((entry) => ['wait', 'load', 'compute', 'other'].includes(entry.key));
+  assert.ok(Math.abs(legs.reduce((total, entry) => total + entry.pct, 0) - perRow('inference').pct) < 1e-6);
+  assert.equal(perRow('load').text, '1.25 s');
+  assert.equal(perRow('chunk').text, '533 ms');
+  assert.equal(perRow('chunk').detail, '16 / 50 steps · 30 fps');
+  assert.equal(perRow('ghost').detail, '34 more steps');
+});
+
+test('detail rows without fps keep the steps and drop the would-be tail', () => {
+  const timing = buildDebugTiming({ latency_ms: 100, compute_ms: 100, actions: row(3) });
+  assert.deepEqual(rowKeys(timing.detailRows), ['compute', 'inference', 'chunk']);
+  const chunk = timing.detailRows.find((entry) => entry.key === 'chunk');
+  assert.equal(chunk.text, '—');
+  assert.equal(chunk.pct, 0);
+  assert.equal(chunk.detail, '3 steps');
+});
+
+test('cloud legs report their own shares over the round trip', () => {
+  const timing = buildDebugTiming({
+    latency_ms: 10, compute_ms: 10, actions: row(2),
+    stage_ms: { cloud_encode: 10, cloud_upload: 250, cloud_compute: 250, cloud_download: 20 },
+  });
+  assert.equal(timing.stageTotalMs, 530);
+  assert.deepEqual(rowKeys(timing.stageRows), ['cloud_encode', 'cloud_upload', 'cloud_compute', 'cloud_download']);
+  assert.ok(Math.abs(timing.stageRows.reduce((total, entry) => total + entry.pct, 0) - 100) < 0.01);
+  assert.equal(timing.stageRows[1].text, '250 ms');
+  const empty = buildDebugTiming({ latency_ms: 10, compute_ms: 10, actions: row(2) });
+  assert.deepEqual(empty.stageRows, []);
+  assert.equal(empty.stageTotalMs, 0);
+});
+
+test('per-joint rows list the worst normalised error first', () => {
+  const timing = buildDebugTiming({
+    latency_ms: 10, compute_ms: 10, actions: row(4),
+    evaluation: {
+      score: 61.2, steps: 4, predicted_steps: 4, coverage: 1,
+      joints: {
+        gripper: { mae: 0.1, rmse: 0.2, nrmse: 0.02 },
+        shoulder_pan: { mae: 1, rmse: 2, nrmse: 0.2 },
+      },
+    },
+  });
+  assert.deepEqual(rowKeys(timing.jointRows), ['shoulder_pan', 'gripper']);
+  assert.deepEqual(timing.jointRows[0], { key: 'shoulder_pan', mae: 1, rmse: 2, nrmse: 0.2 });
+  assert.equal(timing.evaluationSummary.score, 61.2);
+  assert.equal(timing.evaluationSummary.predictedSteps, 4);
+  const none = buildDebugTiming({ latency_ms: 10, compute_ms: 10, actions: row(4) });
+  assert.deepEqual(none.jointRows, []);
+  assert.equal(none.evaluationSummary, null);
+});

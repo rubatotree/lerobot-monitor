@@ -2004,6 +2004,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             "model_load_ms": round(chunk.model_load_ms, 3),
             "compute_ms": round(chunk.compute_ms, 3),
             "generated_steps": chunk.generated_steps,
+            "stage_ms": chunk.stage_ms or {},
             "actions": actions,
             "evaluation": evaluation,
             "warnings": chunk.warnings,

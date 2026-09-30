@@ -1447,6 +1447,7 @@ def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatc
             model_load_ms=0.0,
             compute_ms=12.3,
             generated_steps=9,
+            stage_ms={"cloud_upload": 12.5},
         )
     )
 
@@ -1478,6 +1479,7 @@ def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatc
     assert body["model_load_ms"] == 0.0
     assert body["compute_ms"] == 12.3
     assert body["generated_steps"] == 9
+    assert body["stage_ms"] == {"cloud_upload": 12.5}
     assert [row["t_s"] for row in body["actions"]] == [0.1, 0.2]
     assert body["actions"][1]["joints"] == {"gripper": 2.0}
     assert body["source"]["id"] == "v1"
@@ -2012,12 +2014,15 @@ def test_static_rate_panel_contract(tmp_path: Path, monkeypatch) -> None:
         'window.addEventListener("resize"',
     ):
         assert symbol in script.text, symbol
-    # The panel is anchored by JS instead of scrolling the page to the header.
-    assert "details.open" not in script.text
+    # The rate panel is anchored by JS instead of falling back to a header
+    # disclosure or scrolling the page to the header. Scoped to the rate helpers:
+    # other panels legitimately own their own <details> elements.
+    for name in ("openRatePanel", "closeRatePanel", "positionRatePanel", "syncRatePanel", "submitRatePanel", "validateRatePanel"):
+        body = re.search(rf"function {name}\(.*?\n\}}", script.text, re.DOTALL)
+        assert body is not None, name
+        assert "details.open" not in body.group(0), name
+        assert "scrollIntoView" not in body.group(0), name
     assert 'id="rate-settings"' not in script.text
-    open_body = re.search(r"function openRatePanel\(.*?\n\}", script.text, re.DOTALL)
-    assert open_body is not None
-    assert "scrollIntoView" not in open_body.group(0)
 
 
 @pytest.mark.parametrize("during_compute", [False, True])

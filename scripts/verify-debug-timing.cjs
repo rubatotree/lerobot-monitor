@@ -99,6 +99,22 @@ const COLD = {
   compute_ms: 300,
   actions: Array.from({ length: 16 }, () => ({ gripper: 0 })),
   generated_steps: 50,
+  stage_ms: {
+    cloud_encode: 10,
+    cloud_upload: 250,
+    cloud_compute: 250,
+    cloud_download: 20,
+  },
+  evaluation: {
+    score: 61.2,
+    steps: 16,
+    predicted_steps: 16,
+    coverage: 1,
+    joints: {
+      gripper: { mae: 0.12, rmse: 0.2, nrmse: 0.02 },
+      shoulder_pan: { mae: 1.5, rmse: 2.4, nrmse: 0.24 },
+    },
+  },
 };
 const WARM = {
   fps: 30,
@@ -139,6 +155,36 @@ async function timingState(page) {
 async function renderTiming(page, payload) {
   await page.evaluate((value) => { window.renderChunkTiming(value); }, payload);
   await page.waitForTimeout(120);
+}
+
+async function profileState(page) {
+  return page.evaluate(() => {
+    const host = document.getElementById("dbg-timing");
+    const sections = [...(host ? host.querySelectorAll(".debug-profile-section") : [])].map((details) => ({
+      section: details.dataset.section,
+      open: details.open,
+      meta: details.querySelector(".debug-profile-meta")?.textContent || "",
+      rows: [...details.querySelectorAll(".debug-profile-row")].map((row) => ({
+        kind: row.dataset.kind,
+        label: row.querySelector(".debug-profile-label")?.textContent || "",
+        value: row.querySelector(".debug-profile-value")?.textContent || "",
+        detail: row.querySelector(".debug-profile-detail")?.textContent || "",
+        nrmse: row.querySelector(".is-nrmse")?.textContent || "",
+        pct: row.style.getPropertyValue("--pct"),
+      })),
+    }));
+    return {
+      sections,
+      scrollWidth: host?.scrollWidth || 0,
+      clientWidth: host?.clientWidth || 0,
+      pageOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+    };
+  });
+}
+
+async function toggleSection(page, section) {
+  await page.locator(`#dbg-timing details[data-section="${section}"] > summary`).click();
+  await page.waitForTimeout(80);
 }
 
 async function runViewport(browser, viewport) {
@@ -198,6 +244,54 @@ async function runViewport(browser, viewport) {
     JSON.stringify({ scrollWidth: cold.scrollWidth, clientWidth: cold.clientWidth, overflow: cold.pageOverflow }),
   );
 
+  const collapsed = await profileState(page);
+  check(
+    `${viewport.name} profile sections start collapsed`,
+    collapsed.sections.map((entry) => entry.section).join(",") === "timing,cloud,reference"
+      && collapsed.sections.every((entry) => !entry.open),
+    JSON.stringify(collapsed.sections.map((entry) => [entry.section, entry.open])),
+  );
+
+  await toggleSection(page, "timing");
+  const timingSection = (await profileState(page)).sections.find((entry) => entry.section === "timing");
+  check(
+    `${viewport.name} timing section lists bar-consistent rows`,
+    timingSection?.open === true
+      && timingSection.rows.map((row) => row.kind).join(",") === "load,compute,other,inference,chunk,ghost"
+      && timingSection.rows[3].value === "1.60 s"
+      && /16 \/ 50 steps/.test(timingSection.rows[4].detail)
+      && /34 more steps/.test(timingSection.rows[5].detail),
+    JSON.stringify(timingSection),
+  );
+
+  await toggleSection(page, "cloud");
+  const cloudSection = (await profileState(page)).sections.find((entry) => entry.section === "cloud");
+  const cloudShare = cloudSection
+    ? cloudSection.rows.reduce((total, row) => total + Number.parseFloat(row.pct) || 0, 0)
+    : 0;
+  check(
+    `${viewport.name} cloud legs keep enc/up/gpu/down apart`,
+    cloudSection?.open === true
+      && cloudSection.rows.map((row) => row.kind).join(",") === "cloud_encode,cloud_upload,cloud_compute,cloud_download"
+      && cloudSection.rows.map((row) => row.label).join(",") === "enc,up,gpu,down"
+      && cloudSection.rows[1].value === "250 ms"
+      && Math.abs(cloudShare - 100) < 1.5,
+    JSON.stringify({ rows: cloudSection?.rows.map((row) => [row.kind, row.label, row.value, row.pct]), share: cloudShare }),
+  );
+
+  await toggleSection(page, "reference");
+  const referenceSection = (await profileState(page)).sections.find((entry) => entry.section === "reference");
+  check(
+    `${viewport.name} reference section scores joints worst first`,
+    referenceSection?.open === true
+      && /score 61\.2 \/ 100/.test(referenceSection.meta)
+      && referenceSection.rows[0].kind === "head"
+      && referenceSection.rows.slice(1).map((row) => row.label).join(",") === "shoulder_pan,gripper"
+      && referenceSection.rows[1].nrmse === "0.2400"
+      && referenceSection.rows[1].detail === "1.5000",
+    JSON.stringify(referenceSection),
+  );
+
   await renderTiming(page, WARM);
   const warm = await timingState(page);
   const warmKinds = warm.segs.map((segment) => segment.kind).join(",");
@@ -205,6 +299,15 @@ async function runViewport(browser, viewport) {
     `${viewport.name} warm run drops load and hatched legs`,
     warmKinds === "wait,compute,other,chunk" && warm.chips.wait === "30 ms",
     `${warmKinds} | ${JSON.stringify(warm.chips)}`,
+  );
+  const warmProfile = await profileState(page);
+  check(
+    `${viewport.name} local run keeps only the timing section and its open state`,
+    warmProfile.sections.map((entry) => entry.section).join(",") === "timing"
+      && warmProfile.sections[0].open === true
+      && warmProfile.scrollWidth <= warmProfile.clientWidth + 1
+      && !warmProfile.pageOverflow,
+    JSON.stringify(warmProfile.sections.map((entry) => [entry.section, entry.open])),
   );
 
   await page.evaluate(() => window.clearChunkTiming());

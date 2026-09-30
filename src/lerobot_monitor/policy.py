@@ -243,6 +243,9 @@ class ActionChunk:
     # Steps the policy generated before a debug request truncated them; None when the
     # producing path cannot know (sequential fallback, or an older cloud worker).
     generated_steps: int | None = None
+    # Cloud debug runs report their transfer/compute legs (stage name -> ms); local
+    # runs have no staged profiler and leave it None.
+    stage_ms: dict[str, float] | None = None
 
 
 def resolve_cached_policy_path(path: str, revision: str = "") -> str | None:

@@ -60,6 +60,21 @@ export function buildDebugTiming(result = {}) {
     );
   }
   if (fps > 0) caption.push(`@ ${Math.round(fps)} fps`);
+  const stageMs = result.stage_ms && typeof result.stage_ms === "object" ? result.stage_ms : {};
+  const stageRows = Object.entries(stageMs)
+    .map(([key, value]) => ({ key, ms: num(value) }))
+    .filter((stage) => stage.ms > 0);
+  const stageTotalMs = stageRows.reduce((total, stage) => total + stage.ms, 0);
+  const jointSource = result.evaluation && result.evaluation.joints ? result.evaluation.joints : {};
+  const jointRows = Object.entries(jointSource)
+    .map(([key, value]) => ({
+      key,
+      mae: Number(value?.mae) || 0,
+      rmse: Number(value?.rmse) || 0,
+      nrmse: Number(value?.nrmse) || 0,
+    }))
+    .sort((left, right) => right.nrmse - left.nrmse);
+  const share = (value) => (totalMs > 0 ? (value / totalMs) * 100 : 0);
   return {
     hasTiming: latency > 0 && segments.length > 0,
     totalMs,
@@ -78,6 +93,50 @@ export function buildDebugTiming(result = {}) {
         .map((segment) => ({ key: segment.key, label: segment.label, text: formatTimingMs(segment.ms) })),
     ],
     caption: caption.join(" · "),
+    // Bar-consistent shares: every row is a fraction of the whole wall clock, so the
+    // row tint lines up with the bar above it.
+    detailRows: [
+      ...segments
+        .filter((segment) => segment.kind === "time")
+        .map((segment) => ({
+          key: segment.key, text: formatTimingMs(segment.ms), ms: segment.ms, detail: "", pct: share(segment.ms),
+        })),
+      { key: "inference", text: formatTimingMs(latency), ms: latency, detail: "", pct: share(latency) },
+      {
+        key: "chunk",
+        text: chunkMs > 0 ? formatTimingMs(chunkMs) : "—",
+        ms: chunkMs,
+        detail: `${steps}${generatedSteps != null ? ` / ${generatedSteps}` : ""} steps${fps > 0 ? ` · ${Math.round(fps)} fps` : ""}`,
+        pct: share(chunkMs),
+      },
+      ...(generatedSteps != null
+        ? [{
+            key: "ghost",
+            text: formatTimingMs(ghostMs),
+            ms: ghostMs,
+            detail: `${generatedSteps - steps} more steps`,
+            pct: share(ghostMs),
+          }]
+        : []),
+    ],
+    // Cloud legs keep their raw stage names; the renderer maps them to enc/up/gpu/down
+    // and paints the matching dot colour. Shares are over the round trip they partition.
+    stageRows: stageRows.map((stage) => ({
+      key: stage.key,
+      text: formatTimingMs(stage.ms),
+      ms: stage.ms,
+      pct: stageTotalMs > 0 ? (stage.ms / stageTotalMs) * 100 : 0,
+    })),
+    stageTotalMs,
+    jointRows,
+    evaluationSummary: result.evaluation
+      ? {
+          score: Number(result.evaluation.score) || 0,
+          steps: Number(result.evaluation.steps) || 0,
+          predictedSteps: Number(result.evaluation.predicted_steps) || steps,
+          coverage: Number(result.evaluation.coverage) || 0,
+        }
+      : null,
   };
 }
 

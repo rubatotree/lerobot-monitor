@@ -228,6 +228,7 @@ def test_native_chunk_is_truncated_to_chunk_size(fake_lerobot) -> None:
     assert len(result.actions) == 3
     assert result.actions[2]["shoulder_pan"] == pytest.approx(12.0)
     assert result.generated_steps == 9
+    assert result.stage_ms is None
 
 
 def test_temporal_ensemble_actions_are_projected_without_extra_inference(fake_lerobot) -> None:

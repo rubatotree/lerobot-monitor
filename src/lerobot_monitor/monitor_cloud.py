@@ -710,6 +710,10 @@ class MonitorCloudClient:
             result = session.infer({**joints, **images_rgb}, chunk_size=chunk_size)
             actions = _poses(result, joints)
             generated = result.get("generated_steps")
+            stages = {
+                stage.name: round((stage.end - stage.start) * 1000.0, 3)
+                for stage in session.stages
+            }
             return ActionChunk(
                 actions=actions,
                 strategy="cloud_policy_chunk",
@@ -722,6 +726,7 @@ class MonitorCloudClient:
                 generated_steps=(
                     int(generated) if isinstance(generated, int) and generated > 0 else None
                 ),
+                stage_ms=stages or None,
             )
         finally:
             session.close()

@@ -505,11 +505,12 @@ def test_cloud_inference_reports_transfer_and_compute_stages() -> None:
 
 
 def test_cloud_debug_infer_keeps_the_generated_horizon(tmp_path: Path) -> None:
-    """A debug chunk reports the steps the worker generated before ``chunk_size`` cut them."""
+    """A debug chunk reports the generated horizon and the cloud legs of its round trip."""
 
     class Session:
-        def __init__(self, payload: dict[str, Any]) -> None:
+        def __init__(self, payload: dict[str, Any], stages: list[Any] | None = None) -> None:
             self.payload = payload
+            self.stages = stages or []
             self.closed = False
 
         def infer(self, _observation: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -518,12 +519,25 @@ def test_cloud_debug_infer_keeps_the_generated_horizon(tmp_path: Path) -> None:
         def close(self) -> None:
             self.closed = True
 
+    stages = [
+        _LifecycleStage("cloud_encode", 0.00, 0.01),
+        _LifecycleStage("cloud_upload", 0.01, 0.26),
+        _LifecycleStage("cloud_compute", 0.26, 0.51),
+        _LifecycleStage("cloud_download", 0.51, 0.53),
+    ]
     rows = [[1.0, 2.0], [3.0, 4.0]]
     base = {"actions": rows, "raw_actions": rows, "action_keys": ["shoulder_pan.pos", "gripper.pos"]}
-    for index, (payload, expected) in enumerate(
-        (({**base, "generated_steps": 50}, 50), (base, None))
-    ):
-        session = Session(payload)
+    cases = (
+        ({**base, "generated_steps": 50}, stages, 50, {
+            "cloud_encode": 10.0,
+            "cloud_upload": 250.0,
+            "cloud_compute": 250.0,
+            "cloud_download": 20.0,
+        }),
+        (base, [], None, None),
+    )
+    for index, (payload, session_stages, expected, expected_stages) in enumerate(cases):
+        session = Session(payload, session_stages)
         client = MonitorCloudClient(tmp_path / f"case{index}", manager=FakeManager())  # type: ignore[arg-type]
         client.open_session = MagicMock(return_value=session)
         try:
@@ -539,6 +553,7 @@ def test_cloud_debug_infer_keeps_the_generated_horizon(tmp_path: Path) -> None:
         finally:
             client.close()
         assert chunk.generated_steps == expected
+        assert chunk.stage_ms == expected_stages
         assert len(chunk.actions) == len(rows)
         assert session.closed is True
 

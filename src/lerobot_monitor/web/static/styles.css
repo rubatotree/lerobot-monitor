@@ -2806,6 +2806,68 @@ select {
   font-size: 10px;
   font-family: "IBM Plex Mono", ui-monospace, monospace;
 }
+.debug-profile { margin-top: 8px; border-top: 1px solid var(--line); }
+.debug-profile-section { border-bottom: 1px solid var(--line); }
+.debug-profile-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.debug-profile-head:hover { color: var(--accent); }
+.debug-profile-head::-webkit-details-marker { display: none; }
+.debug-profile-title { flex: 1; }
+.debug-profile-title::before { content: "▸ "; color: var(--faint); }
+.debug-profile-section[open] .debug-profile-title::before { content: "▾ "; }
+.debug-profile-meta {
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+}
+.debug-profile-body { padding-bottom: 6px; }
+.debug-profile-row {
+  display: grid;
+  grid-template-columns: 6px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  font-size: 10px;
+  color: var(--muted);
+  background-image: linear-gradient(
+    90deg,
+    var(--row-tint, rgba(139, 124, 247, 0.16)) 0 var(--pct, 0%),
+    transparent var(--pct, 0%)
+  );
+}
+.debug-profile-row.is-head,
+.debug-profile-row.is-joint { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+.debug-profile-row.is-head .debug-profile-dot,
+.debug-profile-row.is-joint .debug-profile-dot { display: none; }
+.debug-profile-row.is-head { color: var(--faint); text-transform: uppercase; letter-spacing: 0.08em; }
+.debug-profile-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
+.debug-profile-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.debug-profile-detail { color: var(--faint); white-space: nowrap; }
+.debug-profile-value {
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.debug-profile-row[data-kind="wait"] { --row-tint: rgba(92, 82, 184, 0.22); }
+.debug-profile-row[data-kind="load"] { --row-tint: rgba(139, 124, 247, 0.22); }
+.debug-profile-row[data-kind="compute"] { --row-tint: rgba(110, 168, 255, 0.22); }
+.debug-profile-row[data-kind="other"] { --row-tint: rgba(133, 129, 156, 0.18); }
+.debug-profile-row[data-kind="inference"] { --row-tint: rgba(139, 124, 247, 0.10); }
+.debug-profile-row[data-kind="chunk"],
+.debug-profile-row[data-kind="ghost"] { --row-tint: rgba(93, 186, 154, 0.22); }
 
 .row-actions {
   display: flex;

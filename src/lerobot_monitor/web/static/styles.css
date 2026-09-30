@@ -2013,6 +2013,8 @@ main.episodes-closed {
 .cam-lbl {
   display: flex;
   justify-content: space-between;
+  align-items: center;
+  gap: 8px;
   padding: 4px 8px;
   font-size: 10px;
   letter-spacing: 0.08em;
@@ -2022,17 +2024,65 @@ main.episodes-closed {
   border-bottom: 1px solid var(--line);
   flex-shrink: 0;
 }
-.cam-card img {
-  flex: 1;
+.cam-lbl-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.cam-lbl-right [data-cam-meta] {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cam-rotate {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   min-height: 0;
+  padding: 1px 5px;
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: none;
+  color: var(--faint);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+.cam-rotate svg { width: 11px; height: 11px; }
+.cam-rotate:hover { color: var(--text); border-color: var(--accent-dim); }
+.cam-rotate[aria-pressed="true"] { color: var(--accent); border-color: var(--accent-dim); }
+.cam-stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  /* Container units let a 90°/270° image swap the box dimensions without JS. */
+  container-type: size;
+}
+.cam-stage img {
   width: 100%;
+  height: 100%;
   object-fit: contain;
   background: #000;
   display: none;
 }
-.cam-card img.live { display: block; }
+.cam-stage img.live { display: block; }
+.cam-card[data-rotation="90"] .cam-stage img,
+.cam-card[data-rotation="270"] .cam-stage img {
+  width: 100cqh;
+  height: 100cqw;
+}
+.cam-card[data-rotation="90"] .cam-stage img { transform: rotate(90deg); }
+.cam-card[data-rotation="180"] .cam-stage img { transform: rotate(180deg); }
+.cam-card[data-rotation="270"] .cam-stage img { transform: rotate(270deg); }
 .no-sig {
-  flex: 1;
+  position: absolute;
+  inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;

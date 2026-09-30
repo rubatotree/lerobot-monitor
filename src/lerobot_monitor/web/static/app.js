@@ -3035,21 +3035,62 @@ function setCamGrid(n) {
 
 const camCards = {};
 
-function addCamCard(id, label, src, metaText) {
+const CAM_ROTATION_KEY = "lerobot-monitor-camera-rotation";
+const CAM_ROTATION_STEPS = [0, 90, 180, 270];
+const CAM_ROTATE_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>';
+// Display-only rotation of the main-view window, keyed by camera identity so it
+// survives reloads; the stream, snapshots and robot input stay unrotated.
+const camRotations = loadJsonStorage(CAM_ROTATION_KEY);
+
+function normalizeCameraRotation(value) {
+  const angle = Number(value) || 0;
+  return CAM_ROTATION_STEPS.includes(angle) ? angle : 0;
+}
+
+function cameraRotationKey(cam) {
+  return String((cam && (cam.device_key || cam.name)) || "");
+}
+
+function syncCamCardRotation(card) {
+  if (!card) return;
+  const angle = normalizeCameraRotation(camRotations[card.dataset.rotationKey || ""]);
+  card.dataset.rotation = String(angle);
+  const value = card.querySelector("[data-cam-rotate-value]");
+  if (value) value.textContent = `${angle}°`;
+  const button = card.querySelector("[data-cam-rotate]");
+  if (!button) return;
+  const next = CAM_ROTATION_STEPS[(CAM_ROTATION_STEPS.indexOf(angle) + 1) % CAM_ROTATION_STEPS.length];
+  button.title = `Rotate main view — now ${angle}°, next ${next}°`;
+  button.setAttribute("aria-label", `Rotate main view (now ${angle}°)`);
+  button.setAttribute("aria-pressed", String(angle !== 0));
+}
+
+function addCamCard(id, label, src, metaText, rotationKey = "") {
   if (camCards[id]) {
     const el = camCards[id].querySelector("[data-cam-meta]");
     if (el && metaText) el.textContent = metaText;
     const title = camCards[id].querySelector("[data-cam-title]");
     if (title && label) title.textContent = label;
+    if (rotationKey) camCards[id].dataset.rotationKey = rotationKey;
+    syncCamCardRotation(camCards[id]);
     return camCards[id];
   }
   const host = $("cameras");
   const card = document.createElement("article");
   card.className = "cam-card";
+  card.dataset.rotationKey = rotationKey;
   card.innerHTML = `
-    <div class="cam-lbl"><span data-cam-title="${id}">${label}</span><span data-cam-meta="${id}">${metaText || "…"}</span></div>
-    <div class="no-sig">No signal</div>
-    <img alt="${label}"/>`;
+    <div class="cam-lbl">
+      <span data-cam-title="${id}">${label}</span>
+      <span class="cam-lbl-right">
+        <span data-cam-meta="${id}">${metaText || "…"}</span>
+        <button type="button" class="cam-rotate" data-cam-rotate="${id}">${CAM_ROTATE_ICON}<span data-cam-rotate-value="${id}">0°</span></button>
+      </span>
+    </div>
+    <div class="cam-stage">
+      <div class="no-sig">No signal</div>
+      <img alt="${label}"/>
+    </div>`;
   const img = card.querySelector("img");
   img.dataset.mjpegSrc = src;
   img.addEventListener("load", () => {
@@ -3058,8 +3099,18 @@ function addCamCard(id, label, src, metaText) {
     syncSnapshotButton();
     renderDebugPanel();
   });
+  card.querySelector("[data-cam-rotate]").addEventListener("click", () => {
+    const key = card.dataset.rotationKey || id;
+    const angle = normalizeCameraRotation(camRotations[key]);
+    const next = CAM_ROTATION_STEPS[(CAM_ROTATION_STEPS.indexOf(angle) + 1) % CAM_ROTATION_STEPS.length];
+    if (next === 0) delete camRotations[key];
+    else camRotations[key] = next;
+    saveJsonStorage(CAM_ROTATION_KEY, camRotations);
+    syncCamCardRotation(card);
+  });
   host.appendChild(card);
   camCards[id] = card;
+  syncCamCardRotation(card);
   observeMjpeg(img);
   setCamGrid(Object.keys(camCards).length || 1);
   return card;
@@ -3091,6 +3142,7 @@ function renderMainCameras(list) {
       cam.label || `cam ${cam.name}`,
       `${BASE}/camera/${encodeURIComponent(cam.name)}`,
       metaText,
+      cameraRotationKey(cam),
     );
   });
   syncCamCards(ids);

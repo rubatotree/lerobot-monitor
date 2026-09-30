@@ -7184,7 +7184,7 @@ function debugProfileRow({ key, kind, label, text, detail, pct, color, depth = 0
   row.dataset.kind = kind || key;
   row.style.setProperty("--pct", `${Math.max(0, Math.min(100, Number(pct) || 0)).toFixed(2)}%`);
   // Nested phase rows indent by parent depth; other sections pass no depth and stay flat.
-  row.style.setProperty("--indent", `${Math.max(0, Math.min(4, Number(depth) || 0)) * 8}px`);
+  row.style.setProperty("--indent", `${Math.max(0, Math.min(5, Number(depth) || 0)) * 8}px`);
   const dot = document.createElement("span");
   dot.className = "debug-profile-dot";
   if (color) dot.style.background = color;

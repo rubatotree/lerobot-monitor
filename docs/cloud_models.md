@@ -76,7 +76,7 @@ its own environment, then run:
 lerobot-cloud-manager --port 8095 --project C:\path\to\lerobot-monitor
 ```
 
-Open `http://127.0.0.1:8095`. Choose a server, inspect it, then initialize and connect. The manager does not contact either default host until an action is requested. This implementation round permits remote tests only on `8x4090-server`; `8A6000-server` remains configured but must not be connected, installed, started or tested.
+Open `http://127.0.0.1:8095`. Choose a server, inspect it, then initialize and connect. The manager does not contact either default host until an action is requested. Both configured hosts can be initialized, connected and tested; `8A6000-server` was initialized and connected on 2026-09-30 (see Validation evidence).
 
 The package must be built from a source checkout during initialization; `--project` disambiguates it when the manager itself was installed from a wheel. Package builds use a clean temporary copy and stable timestamps. They do not modify the source checkout or include local configuration, datasets or credentials.
 
@@ -173,7 +173,21 @@ selected source are shown:
 
 Evidence files in the isolated checkout are `.tmp_cloud_results/act.json` and `.tmp_cloud_results/smolvla.json`; both report `status: passed`. Existing ACT/SmolVLA external cache weights were retained. The earlier lightweight-environment test failures and missing `datasets` import were resolved by the complete dependency environment and runtime profile correction; they are not the final acceptance result.
 
-These inference tests used zero state and black PNG observations, with no robot attached. They validate the management and inference path, not task accuracy or physical robot performance. PI runtime support is implemented but no cached PI checkpoint was available for actual inference testing. A6000 was not contacted. Physical robot validation remains pending.
+These inference tests used zero state and black PNG observations, with no robot attached. They validate the management and inference path, not task accuracy or physical robot performance. PI runtime support is implemented but no cached PI checkpoint was available for actual inference testing. A6000 was not contacted in that round. Physical robot validation remains pending.
+
+### 8A6000-server initialization (2026-09-30)
+
+Bootstrap from the Monitor Cloud panel (`probe` → `bootstrap` job → `connect`) installed release
+`2b96ab478763fa20d31ad5e108d61173c6c9312600e87b3b1dd84a09899d9188` under
+`/data2/zhuyutian/lerobot-monitor` and started its owned daemon (`code_hash`
+`472ff1d3202d33029c22e77efc0dd2d6298af46e7ef1ea84e95edb4b398180ef`, `instance_id`
+`dd935ab9254b465c92f7f9d1a549f3f6`) listening on `127.0.0.1:8091`; the job ran about 20 seconds.
+Server-side checks: root mode `700`, `token` mode `600`, `installation.json` pointing at the
+release venv, one `LISTEN` socket on `127.0.0.1:8091`. Through Monitor's authenticated proxy the
+service reports `status: ok`, `api_version: 1`, no sessions and no loaded models, and returns eight
+`NVIDIA RTX A6000` rows (49140 MiB each) with GPUs 0-6 busy and GPU 7 idle. No deployments and no
+runtime profiles are installed yet, so model loading and inference on this host remain unverified.
+The 4090 host still reports `build_outdated`, because its service predates the current checkout.
 
 ### Profile selection and transport status
 

@@ -121,6 +121,12 @@ def test_deploy_load_session_reset_unload(client: TestClient, tmp_path: Path) ->
     result = client.post(f"/api/v1/sessions/{session_id}/infer", json=request)
     assert result.status_code == 200
     assert result.json()["actions"] == [[1, 2]]
+    timings = result.json()["timings"]
+    # The body upload, the request validation and the whole service call are measured
+    # separately; the fake worker reports no compute window of its own.
+    assert {"read", "parse", "service"} <= set(timings)
+    assert all(isinstance(value, float) and value >= 0 for value in timings.values())
+    assert timings["worker"] == 0.0
     assert client.post(f"/api/v1/sessions/{session_id}/infer", json=request).status_code == 409
     assert client.post(f"/api/v1/sessions/{session_id}/reset", json={"epoch": 0}).json() == {"epoch": 1}
     assert client.post(f"/api/v1/sessions/{session_id}/heartbeat", json={"epoch": 0}).status_code == 409

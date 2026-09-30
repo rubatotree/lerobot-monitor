@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
@@ -31,6 +32,9 @@ class ApiBoundary:
             return
         chunks: list[bytes] = []
         size = 0
+        # Time the body upload (this is where the client's transfer shows up on this
+        # side) and hand the completion instant to the route for its parse span.
+        read_started = time.perf_counter()
         while True:
             message = await receive()
             if message["type"] == "http.disconnect":
@@ -43,6 +47,10 @@ class ApiBoundary:
             chunks.append(chunk)
             if not message.get("more_body", False):
                 break
+        scope["lerobot_cloud_timing"] = {
+            "read": round((time.perf_counter() - read_started) * 1000.0, 3),
+            "body_done": time.perf_counter(),
+        }
         delivered = False
 
         async def replay() -> dict[str, Any]:
@@ -140,8 +148,26 @@ def create_app(root: str | Path = "~/.lerobot-monitor-cloud", *, runtime: CloudR
         return service.heartbeat(session_id, request.epoch)
 
     @api.post("/sessions/{session_id}/infer")
-    def infer(session_id: str, request: InferRequest) -> dict[str, Any]:
-        return service.infer(session_id, request)
+    def infer(session_id: str, request: InferRequest, http_request: Request) -> dict[str, Any]:
+        # The route sees the payload after FastAPI parsed it; ApiBoundary left the body
+        # upload span and its completion instant on the shared scope.
+        started = time.perf_counter()
+        stash = http_request.scope.get("lerobot_cloud_timing") or {}
+        result = service.infer(session_id, request)
+        timings: dict[str, float] = {"service": round((time.perf_counter() - started) * 1000.0, 3)}
+        if isinstance(stash.get("read"), (int, float)):
+            timings["read"] = round(float(stash["read"]), 3)
+        if isinstance(stash.get("body_done"), (int, float)):
+            timings["parse"] = round((started - float(stash["body_done"])) * 1000.0, 3)
+        worker = result.pop("timings", None)
+        if isinstance(worker, dict):
+            timings.update({
+                str(key): round(float(value), 3)
+                for key, value in worker.items()
+                if not isinstance(value, bool) and isinstance(value, (int, float))
+            })
+        timings["worker"] = round(float(result.get("compute_seconds") or 0.0) * 1000.0, 3)
+        return {**result, "timings": timings}
 
     @api.post("/sessions/{session_id}/reset")
     def reset(session_id: str, request: SessionEpoch) -> dict[str, Any]:

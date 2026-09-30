@@ -100,6 +100,7 @@ class SubprocessWorker:
         try:
             if not self.alive():
                 raise WorkerError("model worker is not running")
+            began = time.perf_counter()
             encoded = (json.dumps({"operation": operation, "payload": payload}, allow_nan=False) + "\n").encode()
             if len(encoded) > MAX_MESSAGE_BYTES:
                 raise ValueError("worker request exceeds message limit")
@@ -131,7 +132,13 @@ class SubprocessWorker:
             if response.get("protocol_version") != PROTOCOL_VERSION or response.get("worker_code_hash") != WORKER_CODE_HASH:
                 self.stop()
                 raise WorkerError("incompatible worker protocol/build; update the cloud runtime")
-            return response["result"]
+            result = response["result"]
+            if operation == "infer" and isinstance(result, dict):
+                # Serializing the payload, writing it through the pipe and reading the
+                # answer back: the parent's share of one worker round trip.
+                timings = result.setdefault("timings", {})
+                timings["ipc"] = round((time.perf_counter() - began) * 1000.0, 3)
+            return result
         finally:
             self._lock.release()
 
@@ -262,19 +269,25 @@ class NativePolicyBackend:
         import torch
         from lerobot.policies.utils import prepare_observation_for_inference
 
+        from lerobot_monitor.timing import Timing
+
         if self.session is None:
             raise ValueError("no active worker session")
+        timings = Timing()
         started = time.monotonic()
         state_keys = self.session["state_keys"]
         if set(payload["state"]) != set(state_keys):
             raise ValueError("state keys must exactly match session state_keys")
-        state = np.array([payload["state"][key] for key in state_keys], dtype=np.float32)
-        if not np.isfinite(state).all():
-            raise ValueError("state must remain finite in float32")
-        observation: dict[str, Any] = {"observation.state": state}
-        for name, value in decode_images(payload.get("images", {})).items():
-            key = name if name.startswith("observation.images.") else f"observation.images.{name}"
-            observation[key] = value
+        # Everything the request body costs on this side: state array plus base64/PNG
+        # decoding of each camera frame.
+        with timings.span("decode"):
+            state = np.array([payload["state"][key] for key in state_keys], dtype=np.float32)
+            if not np.isfinite(state).all():
+                raise ValueError("state must remain finite in float32")
+            observation: dict[str, Any] = {"observation.state": state}
+            for name, value in decode_images(payload.get("images", {})).items():
+                key = name if name.startswith("observation.images.") else f"observation.images.{name}"
+                observation[key] = value
         missing = set(self.metadata["image_keys"]) - observation.keys()
         if missing:
             raise ValueError(f"missing required images: {sorted(missing)}")
@@ -290,51 +303,55 @@ class NativePolicyBackend:
         with gradients, amp:
             if mode == "select_action" and task != self.session["task"]:
                 self.loaded.policy.drop_queued_actions()
-            prepared = prepare_observation_for_inference(observation, device, task, self.loaded.robot_type)
-            prepared = self.loaded.preprocessor(prepared)
-            if mode == "select_action":
-                # Native select_action retains temporal ensemble/history across requests.
-                raw = self.loaded.policy.select_action(prepared)
-                if raw.ndim != 2 or raw.shape[0] != 1:
-                    raise ValueError("selected action must have shape [1,A]")
-                original = raw.clone()
-                processed = self.loaded.postprocessor(raw)
-                raw = original.reshape(1, 1, -1)
-                processed = processed.reshape(1, 1, -1)
-                queued_actions = self._queued_actions(torch)
-            else:
-                kwargs: dict[str, Any] = {}
-                if mode == "rtc_chunk":
-                    prefix = self._rtc_prefix(payload, device)
-                    delay = payload["inference_delay"]
-                    rtc = self.loaded.policy.config.rtc_config
-                    if rtc.mode == "trained" and (delay > self.metadata["rtc_training_max_delay"]
-                            or delay > (len(payload.get("prefix_raw") or []))):
-                        raise ValueError("trained RTC inference_delay exceeds checkpoint or available prefix")
-                    kwargs = {"inference_delay": delay, "prev_chunk_left_over": prefix}
-                raw = self.loaded.policy.predict_action_chunk(prepared, **kwargs)
-                if isinstance(raw, dict):
-                    raw = raw["action"]
-                if raw.ndim != 3 or raw.shape[0] != 1:
-                    raise ValueError("policy chunk must have shape [1,T,A]")
-                if mode == "debug_chunk":
-                    generated_steps = int(raw.shape[1])
-                    raw = raw[:, :payload["chunk_size"], :]
-                original = raw.clone()
-                processed = self.loaded.postprocessor(raw)
-                raw = original
-            for tensor in (raw, processed):
-                if tensor.ndim != 3 or tensor.shape[0] != 1 or not 1 <= tensor.shape[1] <= 1024:
-                    raise ValueError("actions must have shape [1,T,A], 1 <= T <= 1024")
-                if tensor.shape[2] != self.metadata["action_dim"] or not torch.isfinite(tensor).all().item():
-                    raise ValueError("actions must be finite and match model action_dim")
-            if raw.shape != processed.shape:
-                raise ValueError("raw and processed action shapes differ")
-            raw_array = raw.squeeze(0).detach().to(device="cpu", dtype=torch.float32).tolist()
-            actions = processed.squeeze(0).detach().to(device="cpu", dtype=torch.float32).tolist()
+            with timings.span("prepare"):
+                prepared = prepare_observation_for_inference(observation, device, task, self.loaded.robot_type)
+                prepared = self.loaded.preprocessor(prepared)
+            with timings.span("policy"):
+                if mode == "select_action":
+                    # Native select_action retains temporal ensemble/history across requests.
+                    raw = self.loaded.policy.select_action(prepared)
+                    if raw.ndim != 2 or raw.shape[0] != 1:
+                        raise ValueError("selected action must have shape [1,A]")
+                    original = raw.clone()
+                    processed = self.loaded.postprocessor(raw)
+                    raw = original.reshape(1, 1, -1)
+                    processed = processed.reshape(1, 1, -1)
+                    queued_actions = self._queued_actions(torch)
+                else:
+                    kwargs: dict[str, Any] = {}
+                    if mode == "rtc_chunk":
+                        prefix = self._rtc_prefix(payload, device)
+                        delay = payload["inference_delay"]
+                        rtc = self.loaded.policy.config.rtc_config
+                        if rtc.mode == "trained" and (delay > self.metadata["rtc_training_max_delay"]
+                                or delay > (len(payload.get("prefix_raw") or []))):
+                            raise ValueError("trained RTC inference_delay exceeds checkpoint or available prefix")
+                        kwargs = {"inference_delay": delay, "prev_chunk_left_over": prefix}
+                    raw = self.loaded.policy.predict_action_chunk(prepared, **kwargs)
+                    if isinstance(raw, dict):
+                        raw = raw["action"]
+                    if raw.ndim != 3 or raw.shape[0] != 1:
+                        raise ValueError("policy chunk must have shape [1,T,A]")
+                    if mode == "debug_chunk":
+                        generated_steps = int(raw.shape[1])
+                        raw = raw[:, :payload["chunk_size"], :]
+                    original = raw.clone()
+                    processed = self.loaded.postprocessor(raw)
+                    raw = original
+            with timings.span("emit"):
+                for tensor in (raw, processed):
+                    if tensor.ndim != 3 or tensor.shape[0] != 1 or not 1 <= tensor.shape[1] <= 1024:
+                        raise ValueError("actions must have shape [1,T,A], 1 <= T <= 1024")
+                    if tensor.shape[2] != self.metadata["action_dim"] or not torch.isfinite(tensor).all().item():
+                        raise ValueError("actions must be finite and match model action_dim")
+                if raw.shape != processed.shape:
+                    raise ValueError("raw and processed action shapes differ")
+                raw_array = raw.squeeze(0).detach().to(device="cpu", dtype=torch.float32).tolist()
+                actions = processed.squeeze(0).detach().to(device="cpu", dtype=torch.float32).tolist()
             self.session["task"] = task
         result = {"raw_actions": raw_array, "actions": actions, "action_keys": self.metadata["action_keys"],
-                  "shape": [len(actions), self.metadata["action_dim"]], "compute_seconds": time.monotonic() - started}
+                  "shape": [len(actions), self.metadata["action_dim"]], "compute_seconds": time.monotonic() - started,
+                  "timings": timings.as_dict()}
         if mode == "select_action":
             result["queued_actions"] = queued_actions
         elif mode == "debug_chunk":

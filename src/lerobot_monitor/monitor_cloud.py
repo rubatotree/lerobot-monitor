@@ -21,6 +21,7 @@ import httpx
 
 from .cloud_manager.manager import CloudManager
 from .policy import ActionChunk, LoadedPolicy
+from .timing import Timing
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,24 @@ def _encode_images(observation: Mapping[str, Any], *, camera_names: Sequence[str
     return images
 
 
+def _json_body(payload: Any) -> bytes:
+    """httpx's own ``json=`` encoding, exposed so one payload is serialized once."""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _json_parse(raw: bytes) -> Any:
+    """Parse a raw response body; the request methods shadow the ``json`` module name."""
+    return json.loads(raw.decode("utf-8", errors="replace"))
+
+
+def _json_detail(raw: bytes) -> Any:
+    """``detail`` of an error body, or None when it is not JSON (mirrors httpx's parse)."""
+    try:
+        return _json_parse(raw).get("detail")
+    except ValueError:
+        return None
+
+
 class _CloudStage:
     """A completed inference phase, mirroring the native profiler's stage shape."""
 
@@ -215,6 +234,7 @@ class RemoteSession:
         prefix_raw: list[list[float]] | None = None,
         prefix_absolute: list[list[float]] | None = None,
         inference_delay: int = 0,
+        timing: Timing | None = None,
     ) -> dict[str, Any]:
         if self._closed.is_set():
             raise CloudRequestError("remote inference session is closed")
@@ -222,13 +242,15 @@ class RemoteSession:
             raise CloudRequestError(f"remote inference heartbeat failed: {self._heartbeat_error}")
         stages: list[_CloudStage] = []
         self.stages = stages
+        sizes: dict[str, int] = {}
+        book = timing if timing is not None else Timing()
 
-        started = time.perf_counter()
-        state = {
-            str(key): float(value)
-            for key, value in observation.items()
-            if not str(key).startswith("_") and not hasattr(value, "shape")
-        }
+        with book.span("client_build"):
+            state = {
+                str(key): float(value)
+                for key, value in observation.items()
+                if not str(key).startswith("_") and not hasattr(value, "shape")
+            }
         with self._epoch_lock:
             epoch = self.epoch
         # Encoding PNG payloads is local work; it must not be mistaken for network time.
@@ -236,18 +258,20 @@ class RemoteSession:
         images = _encode_images(observation, camera_names=self.camera_names)
         encoded_end = time.perf_counter()
         stages.append(_CloudStage("cloud_encode", encoded_at, encoded_end))
-        payload: dict[str, Any] = {
-            "epoch": epoch,
-            "request_id": uuid.uuid4().hex,
-            "state": state,
-            "images": images,
-            "task": self.task,
-            "chunk_size": int(chunk_size),
-            "inference_delay": max(0, int(inference_delay)),
-        }
-        if prefix_raw is not None and prefix_absolute is not None:
-            payload["prefix_raw"] = prefix_raw
-            payload["prefix_absolute"] = prefix_absolute
+        book.add("client_encode", encoded_end - encoded_at)
+        with book.span("client_build"):
+            payload: dict[str, Any] = {
+                "epoch": epoch,
+                "request_id": uuid.uuid4().hex,
+                "state": state,
+                "images": images,
+                "task": self.task,
+                "chunk_size": int(chunk_size),
+                "inference_delay": max(0, int(inference_delay)),
+            }
+            if prefix_raw is not None and prefix_absolute is not None:
+                payload["prefix_raw"] = prefix_raw
+                payload["prefix_absolute"] = prefix_absolute
         sent_at = time.perf_counter()
         result = self.owner.request(
             self.target.host_id,
@@ -255,8 +279,12 @@ class RemoteSession:
             f"/api/v1/sessions/{self.session_id}/infer",
             json=payload,
             timeout=180,
+            timings=book if timing is not None else None,
+            sizes=sizes if timing is not None else None,
         )
         received_at = time.perf_counter()
+        if timing is not None:
+            book.merge("server_", result.get("timings") if isinstance(result, dict) else None)
         # The worker reports its own GPU compute window, so the remainder of the
         # round trip is transfer plus server-side queueing.
         compute_s = float(result.get("compute_seconds") or 0.0)
@@ -266,8 +294,12 @@ class RemoteSession:
         transfer = max(0.0, round_trip - compute_s)
         # Split the non-compute time across the request and response legs; the exact
         # boundary is invisible from here, so attribute it by payload proportion.
-        request_bytes = len(json.dumps(payload))
-        response_bytes = len(json.dumps(result))
+        request_bytes = sizes.get("request")
+        response_bytes = sizes.get("response")
+        if request_bytes is None:
+            request_bytes = len(_json_body(payload))
+        if response_bytes is None:
+            response_bytes = len(_json_body(result))
         total_bytes = max(1, request_bytes + response_bytes)
         upload = transfer * (request_bytes / total_bytes)
         stages.append(_CloudStage("cloud_upload", sent_at, sent_at + upload))
@@ -291,20 +323,29 @@ class RemoteSession:
             with self._epoch_lock:
                 self.epoch = int(result["epoch"])
 
-    def close(self) -> None:
+    def close(self, timing: Timing | None = None) -> None:
         if self._closed.is_set():
             return
         self._closed.set()
         try:
-            self.owner.request(
-                self.target.host_id,
-                "DELETE",
-                f"/api/v1/sessions/{self.session_id}",
-                timeout=30,
-            )
+            started = time.perf_counter()
+            try:
+                self.owner.request(
+                    self.target.host_id,
+                    "DELETE",
+                    f"/api/v1/sessions/{self.session_id}",
+                    timeout=30,
+                )
+            finally:
+                if timing is not None:
+                    timing.add("client_close_http", time.perf_counter() - started)
         finally:
             if self._heartbeat is not threading.current_thread():
-                self._heartbeat.join(timeout=2)
+                if timing is not None:
+                    with timing.span("client_close_join"):
+                        self._heartbeat.join(timeout=2)
+                else:
+                    self._heartbeat.join(timeout=2)
             self.owner._session_closed(self.target)
 
 
@@ -363,9 +404,27 @@ class MonitorCloudClient:
         json: dict[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         timeout: float = 30,
+        timings: Timing | None = None,
+        sizes: dict[str, int] | None = None,
     ) -> Any:
         self.connect_endpoint(host_id)
         url, token = self.manager.endpoint(host_id)
+        if timings is None:
+            if sizes is not None:
+                raise ValueError("byte sizes require timings")
+            return self._plain_request(method, url, token, path, json, params, timeout)
+        return self._measured_request(method, url, token, path, json, params, timeout, timings, sizes)
+
+    def _plain_request(
+        self,
+        method: str,
+        url: str,
+        token: str,
+        path: str,
+        json: dict[str, Any] | None,
+        params: Mapping[str, str] | None,
+        timeout: float,
+    ) -> Any:
         try:
             response = httpx.request(
                 method,
@@ -388,6 +447,54 @@ class MonitorCloudClient:
                 response.status_code,
             )
         return response.json()
+
+    def _measured_request(
+        self,
+        method: str,
+        url: str,
+        token: str,
+        path: str,
+        json: dict[str, Any] | None,
+        params: Mapping[str, str] | None,
+        timeout: float,
+        timings: Timing,
+        sizes: dict[str, int] | None,
+    ) -> Any:
+        """Same semantics as ``_plain_request``, split into serialization, time to
+        first byte, body read and JSON parse so one inference can be attributed."""
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        body = b""
+        if json is not None:
+            with timings.span("client_serialize"):
+                # Exactly httpx's own json= encoding, so the wire bytes stay unchanged.
+                body = _json_body(json)
+        if sizes is not None:
+            sizes["request"] = len(body)
+        try:
+            # Building an httpx client is not free: it loads the CA bundle and builds an
+            # SSL context, which on Windows costs hundreds of milliseconds. Measure it
+            # instead of hiding it inside the round trip.
+            with timings.span("client_transport"):
+                client = httpx.Client(timeout=timeout, trust_env=False)
+            with client:
+                request = httpx.Request(method, url + path, headers=headers, content=body, params=params)
+                send_started = time.perf_counter()
+                response = client.send(request, stream=True)
+                timings.add("client_ttfb", time.perf_counter() - send_started)
+                raw = b""
+                with timings.span("client_read"):
+                    raw = response.read()
+                if sizes is not None:
+                    sizes["response"] = len(raw)
+                if not response.is_success:
+                    raise CloudRequestError(
+                        str(_json_detail(raw) or f"cloud returned HTTP {response.status_code}"),
+                        response.status_code,
+                    )
+                with timings.span("client_parse"):
+                    return _json_parse(raw)
+        except httpx.HTTPError as exc:
+            raise CloudRequestError(f"cloud request failed: {exc}") from exc
 
     def connect_endpoint(self, host_id: str) -> None:
         try:
@@ -695,41 +802,48 @@ class MonitorCloudClient:
         target = parse_cloud_uri(uri)
         if target is None:
             raise ValueError("not a cloud model address")
+        timing = Timing()
         started = time.perf_counter()
-        session = self.open_session(
-            target,
-            mode="debug_chunk",
-            task=task,
-            state_keys=state_keys,
-            overrides=extra,
-            camera_names=sorted(str(name) for name in images_rgb),
-        )
+        with timing.span("client_open"):
+            session = self.open_session(
+                target,
+                mode="debug_chunk",
+                task=task,
+                state_keys=state_keys,
+                overrides=extra,
+                camera_names=sorted(str(name) for name in images_rgb),
+            )
         wait_ms = (time.perf_counter() - started) * 1000
         try:
             compute_started = time.perf_counter()
-            result = session.infer({**joints, **images_rgb}, chunk_size=chunk_size)
-            actions = _poses(result, joints)
+            result = session.infer({**joints, **images_rgb}, chunk_size=chunk_size, timing=timing)
+            with timing.span("client_poses"):
+                actions = _poses(result, joints)
             generated = result.get("generated_steps")
             stages = {
                 stage.name: round((stage.end - stage.start) * 1000.0, 3)
                 for stage in session.stages
             }
-            return ActionChunk(
-                actions=actions,
-                strategy="cloud_policy_chunk",
-                degraded=False,
-                warnings=[],
-                cache_hit=True,
-                model_wait_ms=wait_ms,
-                model_load_ms=wait_ms,
-                compute_ms=(time.perf_counter() - compute_started) * 1000,
-                generated_steps=(
-                    int(generated) if isinstance(generated, int) and generated > 0 else None
-                ),
-                stage_ms=stages or None,
-            )
+            compute_ms = (time.perf_counter() - compute_started) * 1000
         finally:
-            session.close()
+            with timing.span("client_close"):
+                session.close(timing=timing)
+        # Close is measured after the chunk exists, so the phases are attached here.
+        return ActionChunk(
+            actions=actions,
+            strategy="cloud_policy_chunk",
+            degraded=False,
+            warnings=[],
+            cache_hit=True,
+            model_wait_ms=wait_ms,
+            model_load_ms=wait_ms,
+            compute_ms=compute_ms,
+            generated_steps=(
+                int(generated) if isinstance(generated, int) and generated > 0 else None
+            ),
+            stage_ms=stages or None,
+            timing_ms=timing.as_dict() or None,
+        )
 
     def close(self) -> None:
         self.manager.close()

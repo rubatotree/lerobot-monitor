@@ -172,6 +172,81 @@ test('per-joint rows list the worst normalised error first', () => {
   assert.equal(none.evaluationSummary, null);
 });
 
+test('measured phases walk the request and decompose the chores inside other', () => {
+  const timing = buildDebugTiming({
+    latency_ms: 3200, model_wait_ms: 900, model_load_ms: 900, compute_ms: 2500,
+    actions: row(16), generated_steps: 50,
+    stage_ms: { cloud_encode: 41, cloud_upload: 800, cloud_compute: 128, cloud_download: 24 },
+    timing_ms: {
+      client_open: 900, client_lease: 74, client_build: 4, client_encode: 41, client_serialize: 9,
+      client_transport: 430, client_ttfb: 912, client_read: 31, client_parse: 2, client_poses: 1,
+      client_close: 1226,
+      server_read: 700, server_parse: 18, server_service: 160, server_ipc: 30, server_worker: 128,
+      server_decode: 22, server_prepare: 18, server_policy: 80, server_emit: 4,
+    },
+  });
+  assert.equal(timing.phaseTotalMs, 3200);
+  // The tree is a wall-clock walk: session row, then the request and everything inside it.
+  assert.deepEqual(keys(timing.phaseRows), [
+    'session', 'inference', 'client_lease', 'client_build', 'client_encode', 'client_serialize',
+    'client_transport', 'client_ttfb', 'server_read', 'server_parse', 'server_service', 'server_ipc',
+    'server_worker', 'server_decode', 'server_prepare', 'server_policy', 'server_emit', 'client_read',
+    'client_parse', 'client_poses', 'client_close',
+  ]);
+  const depthOf = (key) => timing.phaseRows.find((entry) => entry.key === key).depth;
+  // Indent mirrors containment: service > worker ipc > policy worker > its own phases.
+  assert.deepEqual(
+    ['session', 'inference', 'client_lease', 'client_ttfb', 'server_service', 'server_worker', 'server_policy']
+      .map(depthOf),
+    [0, 0, 1, 1, 2, 4, 5],
+  );
+  // The bar's "other" is exactly the chores outside the request's stage legs.
+  const chores = ['client_lease', 'client_build', 'client_parse', 'client_poses', 'client_close'];
+  const choreMs = chores.reduce((total, key) => total + timing.phaseRows.find((entry) => entry.key === key).ms, 0);
+  assert.equal(choreMs, timing.otherMs);
+  assert.equal(timing.phaseRows.some((entry) => entry.key === 'other_unmeasured'), false);
+  // Shares use the inference (or the whole click for the session row) as denominator.
+  assert.ok(approx(timing.phaseRows[0].pct, (900 / 3200) * 100));
+  assert.ok(approx(timing.phaseRows[1].pct, 100));
+});
+
+test('a phase the client cannot see yet is reported as an unmeasured remainder', () => {
+  const timing = buildDebugTiming({
+    latency_ms: 1400, model_wait_ms: 0, model_load_ms: 0, compute_ms: 200,
+    actions: row(4),
+    stage_ms: { cloud_encode: 10, cloud_upload: 550, cloud_compute: 200, cloud_download: 20 },
+    timing_ms: { client_build: 2, client_parse: 1, client_close: 500 },
+  });
+  const others = ['client_build', 'client_parse', 'client_close'];
+  const measured = others.reduce((total, key) => total + timing.phaseRows.find((entry) => entry.key === key).ms, 0);
+  const unmeasured = timing.phaseRows.find((entry) => entry.key === 'other_unmeasured');
+  assert.equal(unmeasured.ms, timing.otherMs - measured);
+  assert.equal(unmeasured.depth, 1);
+  assert.equal(unmeasured.bucket, 'other');
+  // A remainder inside the noise floor is not worth a row.
+  const tight = buildDebugTiming({
+    latency_ms: 300, compute_ms: 100, actions: row(4),
+    stage_ms: { cloud_encode: 10, cloud_upload: 150, cloud_compute: 100, cloud_download: 10 },
+    timing_ms: { client_build: 30, client_poses: 0.2 },
+  });
+  assert.equal(tight.phaseRows.some((entry) => entry.key === 'other_unmeasured'), false);
+});
+
+test('a run without measured phases keeps its previous view', () => {
+  const timing = buildDebugTiming({
+    latency_ms: 2000, model_wait_ms: 800, model_load_ms: 800, compute_ms: 900, fps: 30,
+    actions: row(16), generated_steps: 50,
+    stage_ms: { cloud_encode: 10, cloud_upload: 250, cloud_compute: 300, cloud_download: 20 },
+  });
+  assert.deepEqual(timing.phaseRows, []);
+  assert.equal(timing.phaseTotalMs, 2000);
+  assert.deepEqual(barKeys(timing), ['encode', 'upload', 'compute', 'download', 'other', 'chunk', 'ghost']);
+  assert.deepEqual(keys(timing.detailRows), [
+    'load', 'inference', 'encode', 'upload', 'compute', 'download', 'other', 'chunk', 'ghost',
+  ]);
+  assert.deepEqual(keys(timing.stageRows), ['cloud_encode', 'cloud_upload', 'cloud_compute', 'cloud_download']);
+});
+
 test('durations format as ms under a second and seconds above', () => {
   assert.equal(formatTimingMs(320), '320 ms');
   assert.equal(formatTimingMs(1600.4), '1.60 s');

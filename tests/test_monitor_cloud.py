@@ -3,7 +3,7 @@ from __future__ import annotations
 import itertools
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from unittest.mock import MagicMock
 
 import httpx
@@ -237,6 +237,114 @@ class FakeManager:
 
     def close(self) -> None:
         pass
+
+
+def test_measured_request_records_phases_and_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One inference is attributed by measurement; the wire bytes stay httpx's own."""
+    import json as json_module
+
+    from lerobot_monitor.timing import Timing
+
+    seen: dict[str, Any] = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self) -> None:
+            self._body = json_module.dumps({"ok": True, "timings": {"read": 2.0}}).encode("utf-8")
+
+        @property
+        def is_success(self) -> bool:
+            return True
+
+        def read(self) -> bytes:
+            return self._body
+
+    class FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            seen["client_kwargs"] = kwargs
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_exc: object) -> bool:
+            return False
+
+        def send(self, request: httpx.Request, *, stream: bool = False) -> FakeResponse:
+            seen["request"] = request
+            seen["stream"] = stream
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    client = MonitorCloudClient(tmp_path, manager=FakeManager())  # type: ignore[arg-type]
+    payload = {"epoch": 0, "state": {"x": 1.0}, "blob": "y" * 4096}
+    timing, sizes = Timing(), {}
+    result = client.request(
+        "host", "POST", "/api/v1/sessions/s/infer", json=payload, timeout=30, timings=timing, sizes=sizes,
+    )
+
+    assert result == {"ok": True, "timings": {"read": 2.0}}
+    assert {"client_serialize", "client_ttfb", "client_read", "client_parse"} <= set(timing.as_dict())
+    assert seen["stream"] is True
+    request = seen["request"]
+    assert request.headers["content-type"] == "application/json"
+    assert json_module.loads(request.content) == payload
+    assert sizes["request"] == len(request.content)
+    assert sizes["response"] > 0
+    # The measured path must refuse a byte count it cannot fill in.
+    with pytest.raises(ValueError, match="require timings"):
+        client.request("host", "POST", "/api/v1/sessions/s/infer", json=payload, sizes={})
+
+
+def test_cloud_debug_infer_reports_measured_phases(tmp_path: Path) -> None:
+    """The debug chunk carries each measured phase, client and serving process alike."""
+    server = {
+        "read": 700.0, "parse": 18.0, "service": 160.0, "ipc": 30.0, "worker": 128.0,
+        "decode": 22.0, "prepare": 18.0, "policy": 80.0, "emit": 4.0,
+    }
+
+    class Owner:
+        def request(self, _host: str, method: str, path: str, **kwargs: Any) -> Any:
+            if method == "POST" and path.endswith("/sessions"):
+                return {"session_id": "s", "epoch": 0, "action_keys": ["a.pos"]}
+            if method == "POST" and path.endswith("/infer"):
+                timing = kwargs.get("timings")
+                sizes = kwargs.get("sizes")
+                if timing is not None:
+                    timing.add("client_serialize", 0.009)
+                    timing.add("client_ttfb", 0.912)
+                    timing.add("client_read", 0.031)
+                    timing.add("client_parse", 0.002)
+                if sizes is not None:
+                    sizes.update({"request": 2_600_000, "response": 12_000})
+                return {"actions": [[1.0]], "action_keys": ["a.pos"], "compute_seconds": 0.128, "timings": server}
+            if method == "DELETE":
+                return {}
+            return {}
+
+        def _session_opened(self, _target: Any) -> None:
+            pass
+
+        def _session_closed(self, _target: Any) -> None:
+            pass
+
+    client = MonitorCloudClient(tmp_path, manager=FakeManager())  # type: ignore[arg-type]
+    client.open_session = MagicMock(  # type: ignore[method-assign]
+        return_value=RemoteSession(Owner(), CloudTarget("h", "d"), "debug_chunk", "t", ["a"], {}),  # type: ignore[arg-type]
+    )
+    chunk = client.debug_infer(
+        "cloud://h/d", task="t", state_keys=["a"], extra={}, joints={"a": 0.0}, images_rgb={}, chunk_size=8,
+    )
+    timing = chunk.timing_ms or {}
+    assert {"client_open", "client_build", "client_encode", "client_serialize", "client_ttfb",
+            "client_read", "client_parse", "client_poses", "client_close"} <= set(timing)
+    assert {"server_read", "server_parse", "server_service", "server_ipc", "server_worker",
+            "server_decode", "server_prepare", "server_policy", "server_emit"} <= set(timing)
+    assert timing["server_read"] == 700.0
+    assert timing["server_service"] == 160.0
+    # The stage legs keep their own derivation (worker compute window inside the round
+    # trip), so the bar's numbers are unchanged by the new measurements.
+    assert set(chunk.stage_ms or {}) == {"cloud_encode", "cloud_upload", "cloud_compute", "cloud_download"}
 
 
 def test_cached_cloud_residency_tracks_active_sessions(tmp_path: Path) -> None:
@@ -521,7 +629,7 @@ def test_cloud_debug_infer_keeps_the_generated_horizon(tmp_path: Path) -> None:
         def infer(self, _observation: Any, **_kwargs: Any) -> dict[str, Any]:
             return self.payload
 
-        def close(self) -> None:
+        def close(self, **_kwargs: Any) -> None:
             self.closed = True
 
     stages = [

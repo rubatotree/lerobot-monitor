@@ -16,6 +16,59 @@ export const DEBUG_TIMING_SEGMENTS = [
   { key: "ghost", label: "would-be", kind: "ghost" },
 ];
 
+// Measured phases of one cloud debug inference, in wall-clock order. ``parent`` gives
+// the row its indent (the tree mirrors what contains what, not what the bar shows) and
+// ``bucket`` only colors the row with the bar segment it belongs to. Client phases are
+// measured by the Monitor, ``server_*`` ones by the serving process (and its worker
+// process) and arrive in the response, so an older cloud build simply omits them.
+export const DEBUG_PHASES = [
+  { key: "session", label: "session", parent: null, bucket: "load", detail: "load" },
+  { key: "inference", label: "inference", parent: null, bucket: "inference", detail: "request walk" },
+  { key: "client_lease", label: "lease", parent: "inference", bucket: "other", detail: "acquire + release" },
+  { key: "client_build", label: "build", parent: "inference", bucket: "other", detail: "state + payload" },
+  { key: "client_encode", label: "encode", parent: "inference", bucket: "encode", detail: "png" },
+  { key: "client_serialize", label: "serialize", parent: "inference", bucket: "other", detail: "json payload" },
+  { key: "client_transport", label: "client setup", parent: "inference", bucket: "upload", detail: "http client" },
+  { key: "client_ttfb", label: "tunnel", parent: "inference", bucket: "upload", detail: "request + headers" },
+  { key: "server_read", label: "server read", parent: "client_ttfb", bucket: "compute", detail: "body received" },
+  { key: "server_parse", label: "validate", parent: "client_ttfb", bucket: "compute", detail: "" },
+  { key: "server_service", label: "service", parent: "client_ttfb", bucket: "compute", detail: "" },
+  { key: "server_ipc", label: "worker ipc", parent: "server_service", bucket: "compute", detail: "json + pipe" },
+  { key: "server_worker", label: "policy worker", parent: "server_ipc", bucket: "compute", detail: "" },
+  { key: "server_decode", label: "decode", parent: "server_worker", bucket: "compute", detail: "state + png" },
+  { key: "server_prepare", label: "prepare", parent: "server_worker", bucket: "compute", detail: "" },
+  { key: "server_policy", label: "policy (gpu)", parent: "server_worker", bucket: "compute", detail: "" },
+  { key: "server_emit", label: "emit", parent: "server_worker", bucket: "compute", detail: "to cpu list" },
+  { key: "client_read", label: "read", parent: "inference", bucket: "download", detail: "reply body" },
+  { key: "client_parse", label: "parse", parent: "inference", bucket: "other", detail: "json reply" },
+  { key: "client_poses", label: "poses", parent: "inference", bucket: "other", detail: "" },
+  { key: "client_close", label: "close", parent: "inference", bucket: "other", detail: "DELETE + join" },
+  { key: "client_close_http", label: "session delete", parent: "client_close", bucket: "other", detail: "" },
+  { key: "client_close_join", label: "heartbeat join", parent: "client_close", bucket: "other", detail: "" },
+  { key: "other_unmeasured", label: "unmeasured", parent: "inference", bucket: "other", detail: "unmeasured tail" },
+];
+
+// Phases whose share is the whole click rather than the inference alone.
+const DEBUG_PHASE_ROOT_BUCKETS = new Set(["load"]);
+
+function phaseDepths() {
+  const byKey = new Map(DEBUG_PHASES.map((phase) => [phase.key, phase]));
+  const depths = new Map();
+  DEBUG_PHASES.forEach((phase) => {
+    let depth = 0;
+    let current = phase;
+    while (current && current.parent) {
+      depth += 1;
+      current = byKey.get(current.parent);
+    }
+    depths.set(phase.key, depth);
+  });
+  return depths;
+}
+
+const DEBUG_PHASE_DEPTHS = phaseDepths();
+const DEBUG_PHASE_UNMEASURED_FLOOR_MS = 0.5;
+
 export function formatTimingMs(value) {
   if (value == null || value === "") return "—";
   const ms = Number(value);
@@ -78,6 +131,53 @@ export function buildDebugTiming(result = {}) {
     .map(([key, value]) => ({ key, ms: num(value) }))
     .filter((row) => row.ms > 0);
   const stageTotalMs = stageRows.reduce((total, row) => total + row.ms, 0);
+  // Measured phases (cloud debug only): the request walk in wall-clock order, with the
+  // chores inside the bar's "other" segment listed one by one and any leftover named.
+  const timingMs = result.timing_ms && typeof result.timing_ms === "object" ? result.timing_ms : {};
+  const measured = Object.keys(timingMs).length > 0;
+  const phaseValue = (key) => {
+    if (key === "inference") return inference;
+    if (key === "session") return sessionMs;
+    return num(timingMs[key]);
+  };
+  const phaseMs = Object.fromEntries(DEBUG_PHASES.map((phase) => [phase.key, phaseValue(phase.key)]));
+  // "other" is the request minus the four stage legs, and the legs cover the whole
+  // round trip [sent_at, received_at] — serialization happens inside it, so only the
+  // phases outside that window belong to this reconciliation.
+  const otherPhases = ["client_lease", "client_build", "client_parse", "client_poses", "client_close"];
+  const choreMs = otherPhases.reduce((total, key) => total + phaseMs[key], 0);
+  const phaseRows = [];
+  if (measured) {
+    DEBUG_PHASES.forEach((phase) => {
+      if (phase.key === "other_unmeasured") return;
+      const ms = phaseMs[phase.key];
+      if (!(ms > 0)) return;
+      phaseRows.push({
+        key: phase.key,
+        label: phase.label,
+        detail: phase.detail,
+        bucket: phase.bucket,
+        depth: DEBUG_PHASE_DEPTHS.get(phase.key) || 0,
+        ms,
+        text: formatTimingMs(ms),
+        // Shares are over the request; the session row sits outside it and uses the clock.
+        pct: shareOf(DEBUG_PHASE_ROOT_BUCKETS.has(phase.bucket) ? latency : inference, ms),
+      });
+    });
+    const unmeasured = other - choreMs;
+    if (unmeasured > DEBUG_PHASE_UNMEASURED_FLOOR_MS) {
+      phaseRows.push({
+        key: "other_unmeasured",
+        label: "unmeasured",
+        detail: "outside measured phases",
+        bucket: "other",
+        depth: DEBUG_PHASE_DEPTHS.get("other_unmeasured") || 0,
+        ms: unmeasured,
+        text: formatTimingMs(unmeasured),
+        pct: shareOf(inference, unmeasured),
+      });
+    }
+  }
   const jointSource = result.evaluation && result.evaluation.joints ? result.evaluation.joints : {};
   const jointRows = Object.entries(jointSource)
     .map(([key, value]) => ({
@@ -159,6 +259,9 @@ export function buildDebugTiming(result = {}) {
       pct: stageTotalMs > 0 ? (row.ms / stageTotalMs) * 100 : 0,
     })),
     stageTotalMs,
+    // Section meta: the whole click (session + request), matching the first two rows.
+    phaseTotalMs: latency,
+    phaseRows,
     jointRows,
     evaluationSummary: result.evaluation
       ? {
@@ -172,5 +275,5 @@ export function buildDebugTiming(result = {}) {
 }
 
 if (typeof window !== "undefined") {
-  window.DebugTiming = { DEBUG_TIMING_SEGMENTS, buildDebugTiming, formatTimingMs };
+  window.DebugTiming = { DEBUG_TIMING_SEGMENTS, DEBUG_PHASES, buildDebugTiming, formatTimingMs };
 }

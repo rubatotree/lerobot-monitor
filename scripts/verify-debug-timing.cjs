@@ -124,6 +124,58 @@ const WARM = {
   compute_ms: 350,
   actions: Array.from({ length: 4 }, () => ({ gripper: 0 })),
 };
+// A cloud run from the measuring build: the stage legs stay what they always were, and
+// timing_ms adds the measured walk whose chores reconcile with the bar's "other".
+const PHASES = {
+  fps: 30,
+  latency_ms: 3200,
+  model_wait_ms: 900,
+  model_load_ms: 900,
+  compute_ms: 2500,
+  actions: Array.from({ length: 16 }, () => ({ gripper: 0 })),
+  generated_steps: 50,
+  stage_ms: {
+    cloud_encode: 41,
+    cloud_upload: 800,
+    cloud_compute: 128,
+    cloud_download: 24,
+  },
+  timing_ms: {
+    client_open: 900,
+    client_lease: 74,
+    client_build: 4,
+    client_encode: 41,
+    client_serialize: 9,
+    client_transport: 430,
+    client_ttfb: 912,
+    client_read: 31,
+    client_parse: 2,
+    client_poses: 1,
+    client_close: 1226,
+    client_close_http: 620,
+    client_close_join: 606,
+    server_read: 700,
+    server_parse: 18,
+    server_service: 160,
+    server_ipc: 30,
+    server_worker: 128,
+    server_decode: 22,
+    server_prepare: 18,
+    server_policy: 80,
+    server_emit: 4,
+  },
+};
+const PHASE_LABELS = [
+  "session", "inference", "lease", "build", "encode", "serialize", "client setup", "tunnel",
+  "server read", "validate", "service", "worker ipc", "policy worker", "decode", "prepare",
+  "policy (gpu)", "emit", "read", "parse", "poses", "close", "session delete", "heartbeat join",
+];
+
+function msOf(text) {
+  const value = Number.parseFloat(String(text));
+  if (!Number.isFinite(value)) return Number.NaN;
+  return String(text).includes("s") && !String(text).includes("ms") ? value * 1000 : value;
+}
 
 async function timingState(page) {
   return page.evaluate(() => {
@@ -171,6 +223,7 @@ async function profileState(page) {
         detail: row.querySelector(".debug-profile-detail")?.textContent || "",
         nrmse: row.querySelector(".is-nrmse")?.textContent || "",
         pct: row.style.getPropertyValue("--pct"),
+        indent: row.style.getPropertyValue("--indent"),
       })),
     }));
     return {
@@ -185,6 +238,25 @@ async function profileState(page) {
 async function toggleSection(page, section) {
   await page.locator(`#dbg-timing details[data-section="${section}"] > summary`).click();
   await page.waitForTimeout(80);
+}
+
+async function parkTimingCard(page) {
+  // Park the card's top 160 px into the scrollport: neither the sticky tab strip nor a
+  // short scrollport may hide the bar this shot is meant to prove.
+  await page.locator("#dbg-timing").evaluate((element) => {
+    const OFFSET = 160;
+    const box = element.getBoundingClientRect();
+    let scroller = element.parentElement;
+    while (scroller && scroller !== document.body && scroller.scrollHeight <= scroller.clientHeight + 1) {
+      scroller = scroller.parentElement;
+    }
+    if (scroller && scroller !== document.body) {
+      scroller.scrollTop += (box.top - scroller.getBoundingClientRect().top) - OFFSET;
+      return;
+    }
+    window.scrollBy(0, box.top - OFFSET);
+  });
+  await page.waitForTimeout(150);
 }
 
 async function runViewport(browser, viewport) {
@@ -311,6 +383,58 @@ async function runViewport(browser, viewport) {
     JSON.stringify(referenceSection),
   );
 
+  await renderTiming(page, PHASES);
+  const phasesCollapsed = await profileState(page);
+  check(
+    `${viewport.name} measured phases add a collapsed Phases section`,
+    phasesCollapsed.sections.map((entry) => entry.section).join(",") === "timing,cloud,phases"
+      && phasesCollapsed.sections.find((entry) => entry.section === "phases")?.open === false,
+    JSON.stringify(phasesCollapsed.sections.map((entry) => [entry.section, entry.open])),
+  );
+
+  await toggleSection(page, "phases");
+  const phasesState = await profileState(page);
+  const phasesSection = phasesState.sections.find((entry) => entry.section === "phases");
+  const phaseRows = phasesSection ? phasesSection.rows : [];
+  check(
+    `${viewport.name} phases walk the request inside the cloud round trip`,
+    phasesSection?.open === true
+      && phaseRows.map((row) => row.label).join(",") === PHASE_LABELS.join(",")
+      && phasesSection.meta === "3.20 s"
+      && phaseRows[0].indent === "0px"
+      && phaseRows[2].indent === "8px"
+      && phaseRows[10].indent === "16px"
+      && phaseRows[12].indent === "32px"
+      && phaseRows[15].indent === "40px"
+      && phaseRows[4].kind === "encode"
+      && phaseRows[6].kind === "upload"
+      && phaseRows[2].kind === "other"
+      && phaseRows[10].kind === "compute",
+    JSON.stringify(phaseRows.map((row) => [row.label, row.value, row.kind, row.indent])),
+  );
+  const timingRows = phasesState.sections.find((entry) => entry.section === "timing")?.rows || [];
+  const otherRow = timingRows.find((row) => row.kind === "other");
+  const choreLabels = ["lease", "build", "parse", "poses", "close"];
+  const choreMs = choreLabels.reduce(
+    (total, label) => total + msOf(phaseRows.find((row) => row.label === label)?.value),
+    0,
+  );
+  check(
+    `${viewport.name} chores inside other reconcile with the bar segment`,
+    phaseRows.every((row) => row.label !== "unmeasured")
+      && Math.abs(choreMs - msOf(otherRow?.value)) < 10
+      && phasesState.scrollWidth <= phasesState.clientWidth + 1
+      && !phasesState.pageOverflow,
+    `chores ${choreMs} vs other ${otherRow?.value} | ${JSON.stringify(phasesState.sections.find((entry) => entry.section === "phases")?.rows.map((row) => [row.label, row.value, row.pct]))}`,
+  );
+
+  fs.mkdirSync(SHOTS, { recursive: true });
+  // The tree is the point of this shot: bring the open Phases section next to the bar.
+  await page.locator('#dbg-timing details[data-section="phases"]').scrollIntoViewIfNeeded();
+  await page.evaluate(() => window.scrollBy(0, -320));
+  await page.waitForTimeout(150);
+  await page.screenshot({ path: path.join(SHOTS, `debug-timing-phases-${viewport.name}.png`) });
+
   await renderTiming(page, WARM);
   const warm = await timingState(page);
   const warmKinds = warm.segs.map((segment) => segment.kind).join(",");
@@ -341,22 +465,7 @@ async function runViewport(browser, viewport) {
 
   await renderTiming(page, COLD);
   fs.mkdirSync(SHOTS, { recursive: true });
-  // Park the card's top 160 px into the scrollport: neither the sticky tab strip nor a
-  // short scrollport may hide the bar this shot is meant to prove.
-  await page.locator("#dbg-timing").evaluate((element) => {
-    const OFFSET = 160;
-    const box = element.getBoundingClientRect();
-    let scroller = element.parentElement;
-    while (scroller && scroller !== document.body && scroller.scrollHeight <= scroller.clientHeight + 1) {
-      scroller = scroller.parentElement;
-    }
-    if (scroller && scroller !== document.body) {
-      scroller.scrollTop += (box.top - scroller.getBoundingClientRect().top) - OFFSET;
-      return;
-    }
-    window.scrollBy(0, box.top - OFFSET);
-  });
-  await page.waitForTimeout(150);
+  await parkTimingCard(page);
   await page.screenshot({ path: path.join(SHOTS, `debug-timing-${viewport.name}.png`) });
   check(`${viewport.name} no page errors`, errors.length === 0, errors.join(" | "));
   await context.close();

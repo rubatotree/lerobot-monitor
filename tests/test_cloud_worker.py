@@ -91,6 +91,18 @@ def test_select_preserves_history_drops_old_task_and_uses_amp(backend: NativePol
     assert backend.session["task"] == "new task"
 
 
+def test_infer_reports_measured_phases(backend: NativePolicyBackend) -> None:
+    """The serving process must say where its share of one round trip went."""
+    result = backend.infer(request())
+    timings = result["timings"]
+    assert set(timings) <= {"decode", "prepare", "policy", "emit"}
+    # A span is recorded only when it was actually measured, so the work doing real
+    # decoding and running the policy must be present.
+    assert {"decode", "policy"} <= set(timings)
+    assert all(isinstance(value, float) and value >= 0 for value in timings.values())
+    assert result["compute_seconds"] >= 0
+
+
 def test_select_reports_queued_actions_for_the_chart_preview(backend: NativePolicyBackend) -> None:
     from collections import deque
 

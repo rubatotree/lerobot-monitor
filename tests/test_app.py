@@ -1480,6 +1480,10 @@ def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatc
     assert body["compute_ms"] == 12.3
     assert body["generated_steps"] == 9
     assert body["stage_ms"] == {"cloud_upload": 12.5}
+    # A local (or older cloud) run reports no measured phases, so the panel keeps its
+    # previous view and no timing line reaches the UI log.
+    assert body["timing_ms"] == {}
+    assert not any("cloud infer timing" in str(entry.get("message", "")) for entry in hub.loop.logs)
     assert [row["t_s"] for row in body["actions"]] == [0.1, 0.2]
     assert body["actions"][1]["joints"] == {"gripper": 2.0}
     assert body["source"]["id"] == "v1"
@@ -1493,6 +1497,59 @@ def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatc
     assert sorted(kwargs["images_rgb"]) == ["front"]
     assert kwargs["images_rgb"]["front"].shape == (16, 24, 3)
     hub.loop.release_debug_lease.assert_called_once_with("lease-1")
+
+
+def test_debug_infer_reports_cloud_timing_and_logs_one_line(tmp_path: Path, monkeypatch) -> None:
+    """A cloud run's measured phases reach the panel and one line of the UI log."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    app = create_app(_debug_config(tmp_path))
+    hub = app.state.hub
+    hub.loop.acquire_debug_lease = MagicMock(return_value={"ok": True, "token": "lease-1"})
+    hub.loop.release_debug_lease = MagicMock(return_value={"ok": True, "released": True})
+    hub.loop.infer_action_chunk = MagicMock(
+        return_value=ActionChunk(
+            actions=[{"gripper": 1.0}],
+            strategy="cloud_policy_chunk",
+            degraded=False,
+            warnings=[],
+            cache_hit=True,
+            model_wait_ms=900.0,
+            model_load_ms=900.0,
+            compute_ms=2100.0,
+            stage_ms={"cloud_encode": 41.0, "cloud_upload": 800.0, "cloud_compute": 128.0, "cloud_download": 24.0},
+            timing_ms={
+                "client_open": 900.0, "client_build": 4.0, "client_encode": 41.0, "client_serialize": 9.0,
+                "client_ttfb": 912.0, "client_read": 31.0, "client_parse": 2.0, "client_poses": 1.0,
+                "client_close": 1226.0, "server_read": 700.0, "server_parse": 18.0, "server_service": 160.0,
+                "server_ipc": 30.0, "server_worker": 128.0, "server_policy": 80.0,
+            },
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/lerobot/api/debug/infer",
+            json={
+                "policy_path": "cloud://host/model",
+                "joints": {"gripper": 0.0},
+                "chunk_size": 1,
+                "fps": 10.0,
+                "cameras": [{"key": "front", "jpeg_base64": _jpeg_base64()}],
+                "camera_map": {"front": "observation.images.front"},
+            },
+        )
+
+    assert response.status_code == 200
+    timing = response.json()["timing_ms"]
+    assert timing["client_open"] == 900.0
+    assert timing["server_policy"] == 80.0
+    # The two control-loop round trips around the inference are the client's own cost.
+    assert timing["client_lease"] >= 0.0
+    lines = [str(entry.get("message", "")) for entry in hub.loop.logs if "cloud infer timing" in str(entry.get("message", ""))]
+    assert len(lines) == 1
+    assert "client_close=1226ms" in lines[0]
+    assert "server_read=700ms" in lines[0]
+    assert "client_lease=" in lines[0]
 
 
 def test_debug_infer_reports_busy_lease_as_conflict(tmp_path: Path, monkeypatch) -> None:

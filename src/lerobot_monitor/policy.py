@@ -246,6 +246,10 @@ class ActionChunk:
     # Cloud debug runs report their transfer/compute legs (stage name -> ms); local
     # runs have no staged profiler and leave it None.
     stage_ms: dict[str, float] | None = None
+    # Cloud debug runs also report the measured phases behind those legs, merged from
+    # the Monitor client and (when the cloud build supports it) the serving process;
+    # local runs and older cloud builds leave it None.
+    timing_ms: dict[str, float] | None = None
 
 
 def resolve_cached_policy_path(path: str, revision: str = "") -> str | None:

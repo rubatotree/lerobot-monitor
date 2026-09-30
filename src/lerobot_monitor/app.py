@@ -245,6 +245,43 @@ class SnapshotUpdateBody(BaseModel):
     joints: dict[str, float] | None = None
 
 
+# Wall-clock order of the measured cloud phases, so one log line reads as a timeline.
+_CLOUD_TIMING_LOG_ORDER = (
+    "client_lease",
+    "client_open",
+    "client_build",
+    "client_encode",
+    "client_serialize",
+    "client_transport",
+    "client_ttfb",
+    "server_read",
+    "server_parse",
+    "server_service",
+    "server_ipc",
+    "server_worker",
+    "server_decode",
+    "server_prepare",
+    "server_policy",
+    "server_emit",
+    "client_read",
+    "client_parse",
+    "client_poses",
+    "client_close",
+    "client_close_http",
+    "client_close_join",
+)
+
+
+def _cloud_timing_line(timing: dict[str, float]) -> str:
+    """One line naming every measured phase of a cloud inference, in wall-clock order."""
+    parts = [
+        f"{key}={timing[key]:.0f}ms"
+        for key in _CLOUD_TIMING_LOG_ORDER
+        if isinstance(timing.get(key), (int, float))
+    ]
+    return "cloud infer timing: " + " ".join(parts)
+
+
 class DebugInferBody(BaseModel):
     policy_path: str
     task: str = ""
@@ -1938,11 +1975,15 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
 
         started = time.perf_counter()
         cancelled = threading.Event()
+        lease_seconds = 0.0
 
         async def infer_and_release() -> Any:
+            nonlocal lease_seconds
             token = ""
             try:
+                lease_started = time.perf_counter()
                 lease = await asyncio.to_thread(hub.loop.acquire_debug_lease)
+                lease_seconds += time.perf_counter() - lease_started
                 if not lease.get("ok"):
                     raise HTTPException(409, str(lease.get("error") or "model debug is unavailable"))
                 token = str(lease.get("token") or "")
@@ -1962,7 +2003,9 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
                 )
             finally:
                 if token:
+                    release_started = time.perf_counter()
                     await asyncio.to_thread(hub.loop.release_debug_lease, token)
+                    lease_seconds += time.perf_counter() - release_started
 
         # An HTTP disconnect must not free the bus lease while native inference runs.
         inference = asyncio.create_task(infer_and_release())
@@ -1992,6 +2035,12 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             if body.reference
             else None
         )
+        # Measured phases of a cloud run (client + serving process); local runs and
+        # older cloud builds report nothing, so the panel keeps its previous view.
+        timing = dict(chunk.timing_ms or {})
+        if timing:
+            timing["client_lease"] = round(lease_seconds * 1000.0, 3)
+            hub.loop.log("info", _cloud_timing_line(timing))
         return {
             "ok": True,
             "source": body.source,
@@ -2005,6 +2054,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             "compute_ms": round(chunk.compute_ms, 3),
             "generated_steps": chunk.generated_steps,
             "stage_ms": chunk.stage_ms or {},
+            "timing_ms": timing,
             "actions": actions,
             "evaluation": evaluation,
             "warnings": chunk.warnings,

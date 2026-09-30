@@ -275,6 +275,79 @@ async function runViewport(browser, viewport, base, frames) {
   check(`${viewport.name} green lane pixels visible`, stats && stats.green > 20, JSON.stringify(stats));
   check(`${viewport.name} blue inference pixels visible`, stats && stats.blue > 10, JSON.stringify(stats));
 
+  // Dragging the now line trades visible past for visible future at a fixed span.
+  await page.locator("#chart-action").evaluate((element) => element.scrollIntoView({ block: "center" }));
+  await page.waitForTimeout(200);
+  const dragStart = await page.evaluate(() => {
+    const chart = window.Chart.getChart(document.getElementById("chart-action"));
+    const cursor = chart.$replayCursorElement;
+    const rect = cursor.getBoundingClientRect();
+    return {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      draggable: cursor.classList.contains("draggable"),
+      laneHeight: Number(chart.$laneHeight) || 0,
+      min: chart.scales.x.min,
+      max: chart.scales.x.max,
+      now: chart.$nowTime,
+    };
+  });
+  check(`${viewport.name} now line exposes a drag handle`, dragStart.draggable, JSON.stringify(dragStart));
+  await page.mouse.move(dragStart.x, dragStart.y);
+  await page.mouse.down();
+  await page.mouse.move(dragStart.x - 60, dragStart.y, { steps: 6 });
+  await page.mouse.up();
+  await page.waitForTimeout(250);
+  const dragged = await page.evaluate(() => {
+    const chart = window.Chart.getChart(document.getElementById("chart-action"));
+    return {
+      min: chart.scales.x.min,
+      max: chart.scales.x.max,
+      now: chart.$nowTime,
+      laneHeight: Number(chart.$laneHeight) || 0,
+      stored: localStorage.getItem("lerobot-monitor-rollout-now-fraction"),
+    };
+  });
+  const spanStart = dragStart.max - dragStart.min;
+  const spanDragged = dragged.max - dragged.min;
+  const fractionStart = (dragStart.now - dragStart.min) / spanStart;
+  const fractionDragged = (dragged.now - dragged.min) / spanDragged;
+  check(`${viewport.name} dragging the now line shifts the window`, fractionDragged < fractionStart - 0.02,
+    `${fractionStart.toFixed(3)} -> ${fractionDragged.toFixed(3)}`);
+  check(`${viewport.name} drag keeps the window span`, Math.abs(spanDragged - spanStart) < 0.25,
+    `${spanStart.toFixed(3)} -> ${spanDragged.toFixed(3)}`);
+  check(`${viewport.name} drag keeps the lane band`, dragged.laneHeight === 64, JSON.stringify(dragged));
+  check(`${viewport.name} drag stores the fraction`,
+    Number(dragged.stored) > 0 && Number(dragged.stored) < 1, String(dragged.stored));
+  const resetProbe = await page.evaluate(() => {
+    const chart = window.Chart.getChart(document.getElementById("chart-action"));
+    const cursor = chart.$replayCursorElement;
+    const rect = cursor.getBoundingClientRect();
+    const scaleSelect = document.getElementById("chart-scale");
+    const scaleSeconds = Number(scaleSelect && scaleSelect.value) || 10;
+    const future = Math.min(8, Math.max(1, scaleSeconds * 0.25));
+    return {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      expected: scaleSeconds / (scaleSeconds + future),
+    };
+  });
+  await page.mouse.dblclick(resetProbe.x, resetProbe.y);
+  await page.waitForTimeout(250);
+  const reset = await page.evaluate(() => {
+    const chart = window.Chart.getChart(document.getElementById("chart-action"));
+    return {
+      min: chart.scales.x.min,
+      max: chart.scales.x.max,
+      now: chart.$nowTime,
+      stored: localStorage.getItem("lerobot-monitor-rollout-now-fraction"),
+    };
+  });
+  const fractionReset = (reset.now - reset.min) / (reset.max - reset.min);
+  check(`${viewport.name} double-click restores the default split`,
+    Math.abs(fractionReset - resetProbe.expected) < 0.04 && reset.stored === null,
+    `${fractionReset.toFixed(3)} vs ${resetProbe.expected.toFixed(3)} stored=${reset.stored}`);
+
   await page.locator("#chart-action").evaluate((element) => element.scrollIntoView({ block: "center" }));
   await page.waitForTimeout(120);
   const tooltipState = await page.evaluate(() => {
@@ -531,6 +604,20 @@ async function runViewport(browser, viewport, base, frames) {
   await page.evaluate(frame=>window.__rolloutEmit({...frame,mode:"idle",display_mode:"idle",rollout_timeline:null}),frames[frames.length-1]);
   await page.waitForTimeout(100);
   check(`${viewport.name} stopped rollout retains frozen ribbon and legend`,await page.evaluate(()=>window.Chart.getChart(document.getElementById("chart-action")).$rolloutLanes.ribbons[0].id===501&&document.querySelector('#action-legend').textContent.includes('Inference stages')));
+  await page.locator("#chart-freeze").click();
+  await page.waitForTimeout(150);
+  const idleBand = await page.evaluate(() => {
+    const chart = window.Chart.getChart(document.getElementById("chart-action"));
+    return {
+      laneHeight: Number(chart.$laneHeight) || 0,
+      paddingBottom: chart.options.layout.padding.bottom,
+      lanes: chart.$rolloutLanes ? 1 : 0,
+      storedFraction: localStorage.getItem("lerobot-monitor-rollout-now-fraction"),
+    };
+  });
+  check(`${viewport.name} idle chart reclaims the lane band`,
+    idleBand.laneHeight === 0 && idleBand.paddingBottom === 18 && idleBand.lanes === 0,
+    JSON.stringify(idleBand));
   await page.evaluate(()=>window.enterReplay());
   check(`${viewport.name} replay clears freeze`,await page.locator("#chart-freeze").getAttribute("aria-pressed")==="false");
   await page.evaluate(()=>window.leaveReplay());

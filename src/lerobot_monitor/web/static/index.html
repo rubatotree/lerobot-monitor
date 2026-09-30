@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
-  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260930-debug-timeline"/>
+  <link rel="stylesheet" href="/lerobot/static/styles.css?v=20260930-ui-fixes"/>
   <script src="/lerobot/static/vendor/chart/chart.umd.min.js"></script>
   <script type="importmap">
     {
@@ -308,13 +308,13 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6M10 3v5l-5 9a2 2 0 0 0 1.8 3h10.4A2 2 0 0 0 19 17l-5-9V3"/><path d="M8 14h8"/></svg>
           <span>Debug</span>
         </button>
-        <button type="button" class="panel-tab" id="side-tab-hardware" data-tab="hardware" role="tab" aria-selected="false" aria-controls="hw-panel" tabindex="-1" title="Hardware">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg>
-          <span>Hardware</span>
-        </button>
         <button type="button" class="panel-tab" id="side-tab-cloud" data-tab="cloud" role="tab" aria-selected="false" aria-controls="cloud-panel" tabindex="-1" title="Cloud models">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4 4 0 0 1 0-8 5.5 5.5 0 0 1 10.6-1.4A3.7 3.7 0 0 1 18 18z"/><path d="M12 12v5"/><path d="m9.5 14.5 2.5-2.5 2.5 2.5"/></svg>
           <span>Cloud</span>
+        </button>
+        <button type="button" class="panel-tab" id="side-tab-hardware" data-tab="hardware" role="tab" aria-selected="false" aria-controls="hw-panel" tabindex="-1" title="Hardware">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg>
+          <span>Hardware</span>
         </button>
       </nav>
       <div id="preset-toolbar" class="side-tools">
@@ -862,10 +862,10 @@
   </dialog>
 
   <script type="module" src="/lerobot/static/rollout-lanes.js?v=20260928-rollout-ribbons"></script>
-  <script type="module" src="/lerobot/static/debug-timing.js?v=20260930-debug-timeline"></script>
+  <script type="module" src="/lerobot/static/debug-timing.js?v=20260930-debug-phases"></script>
   <script src="/lerobot/static/rollout-speed.js?v=20260928-execution-speed"></script>
-  <script src="/lerobot/static/app.js?v=20260930-debug-timeline"></script>
-  <script type="module" src="/lerobot/static/cloud-panel.js?v=20260929-cloud-panel"></script>
-  <script type="module" src="/lerobot/static/robot-preview.js?v=20260923-arm-preview-2"></script>
+  <script src="/lerobot/static/app.js?v=20260930-ui-fixes"></script>
+  <script type="module" src="/lerobot/static/cloud-panel.js?v=20260930-ui-fixes"></script>
+  <script type="module" src="/lerobot/static/robot-preview.js?v=20260930-ui-fixes"></script>
 </body>
 </html>

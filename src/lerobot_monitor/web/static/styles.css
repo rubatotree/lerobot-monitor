@@ -895,6 +895,23 @@ main.episodes-closed {
   padding: 3px 6px;
   font-size: 10px;
 }
+.copy-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  min-height: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: none;
+  color: var(--faint);
+  cursor: pointer;
+}
+.copy-chip svg { width: 11px; height: 11px; }
+.copy-chip:hover { color: var(--text); border-color: var(--line); background: var(--surface-2); }
+.copy-chip.copied { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
 .lib-meta {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -903,9 +920,14 @@ main.episodes-closed {
   padding: 8px 10px 9px;
   border-top: 1px dashed var(--line);
 }
+.lib-meta-head {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+}
 .lib-meta-row {
   display: grid;
-  grid-template-columns: minmax(64px, 0.32fr) minmax(0, 1fr);
+  grid-template-columns: minmax(64px, 0.32fr) minmax(0, 1fr) 18px;
   gap: 6px;
   min-width: 0;
   color: var(--faint);
@@ -922,8 +944,9 @@ main.episodes-closed {
   white-space: nowrap;
 }
 .lib-description {
+  position: relative;
   margin-top: 4px;
-  padding: 8px 10px;
+  padding: 8px 26px 8px 10px;
   border-top: 1px dashed var(--line);
   color: var(--muted);
   font-size: 10px;
@@ -932,6 +955,11 @@ main.episodes-closed {
   overflow-wrap: anywhere;
 }
 .lib-description.empty { color: var(--faint); font-style: italic; }
+.lib-description .copy-chip {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+}
 .model-residency {
   padding: 7px 10px 9px;
   border-top: 1px dashed var(--line);
@@ -1445,9 +1473,13 @@ main.episodes-closed {
   border: 1px solid var(--line);
   background: var(--bg-2);
 }
+.ep-meta-head {
+  display: flex;
+  justify-content: flex-end;
+}
 .ep-meta-row {
   display: grid;
-  grid-template-columns: 54px minmax(0, 1fr);
+  grid-template-columns: 54px minmax(0, 1fr) 18px;
   gap: 6px;
   font-size: 10px;
 }
@@ -2811,6 +2843,13 @@ select {
   font-size: 10px;
   font-family: "IBM Plex Mono", ui-monospace, monospace;
 }
+.debug-timing-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.debug-timing-foot .debug-timing-note { min-width: 0; overflow-wrap: anywhere; }
 .debug-profile { margin-top: 8px; border-top: 1px solid var(--line); }
 .debug-profile-section { border-bottom: 1px solid var(--line); }
 .debug-profile-head {
@@ -2839,11 +2878,12 @@ select {
 }
 .debug-profile-body { padding-bottom: 6px; }
 .debug-profile-row {
+  position: relative;
   display: grid;
   grid-template-columns: 6px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 6px;
-  padding: 2px 4px;
+  padding: 2px 22px 2px 4px;
   font-size: 10px;
   color: var(--muted);
   background-image: linear-gradient(
@@ -2851,6 +2891,12 @@ select {
     var(--row-tint, rgba(139, 124, 247, 0.16)) 0 var(--pct, 0%),
     transparent var(--pct, 0%)
   );
+}
+.debug-profile-row .copy-chip {
+  position: absolute;
+  top: 50%;
+  right: 2px;
+  transform: translateY(-50%);
 }
 .debug-profile-row.is-head,
 .debug-profile-row.is-joint { grid-template-columns: minmax(0, 1fr) auto auto auto; }
@@ -2867,6 +2913,8 @@ select {
   white-space: nowrap;
 }
 .debug-profile-row.is-child .debug-profile-label { padding-left: 8px; }
+.debug-profile-row .debug-profile-label { padding-left: var(--indent, 0px); }
+.debug-profile-row.is-phase .debug-profile-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .debug-profile-row[data-kind="inference"] { --row-tint: rgba(139, 124, 247, 0.12); }
 .debug-profile-row[data-kind="compute"] { --row-tint: rgba(110, 168, 255, 0.24); }
 .debug-profile-row[data-kind="encode"] { --row-tint: rgba(145, 201, 232, 0.20); }
@@ -3493,6 +3541,9 @@ body.dragging-row { cursor: row-resize; user-select: none; }
   transform: translateX(-0.5px);
 }
 .chart-replay-cursor[hidden] { display: none; }
+.chart-replay-cursor.draggable { pointer-events: auto; cursor: ew-resize; }
+.chart-replay-cursor.draggable::before { content: ""; position: absolute; inset: 0 -5px; }
+.chart-replay-cursor.dragging { background: var(--accent); }
 .chart-unavailable canvas { display: none; }
 .chart-fallback { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 80px; padding: 12px; color: var(--muted); text-align: center; }
 .log-wrap .panel-body {
@@ -4054,7 +4105,7 @@ body.dragging-row { cursor: row-resize; user-select: none; }
 .cloud-job-list { display: flex; flex-direction: column; }
 .cloud-job {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto 18px;
   gap: 8px;
   align-items: center;
   padding: 6px 0;

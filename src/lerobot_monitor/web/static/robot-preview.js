@@ -759,7 +759,9 @@ export const RobotPreview = {
     await refreshModels();
     state.status = await api("/api/status", undefined, "GET").catch(() => state.status);
     await alignToConnectedRobot().catch(() => {});
-    const startPowered = readStorage(POWER_KEY, "1") !== "0";
+    // The virtual follower claims the arm role, so it only connects after an
+    // explicit power-on; the stored choice still wins on later loads.
+    const startPowered = readStorage(POWER_KEY, "0") === "1";
     state.powered = false;
     setPowerButton();
     if (startPowered) await setPower(true, false);

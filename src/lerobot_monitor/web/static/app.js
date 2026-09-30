@@ -325,6 +325,64 @@ function toastError(err) {
   localLog(err.message || err, "error");
 }
 
+// Clipboard is unavailable on plain-HTTP origins, so every copy falls back to
+// a hidden textarea. Feedback is local to the button so no toast surface is needed.
+async function copyTextToClipboard(text) {
+  const value = String(text ?? "");
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    ta.remove();
+    return ok;
+  }
+}
+
+const COPY_CHIP_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="1.5"/><path d="M6 15H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v1"/></svg>';
+const COPY_CHIP_OK_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>';
+
+function markCopyChip(button) {
+  if (!button) return;
+  clearTimeout(button._copyTimer);
+  button.innerHTML = COPY_CHIP_OK_ICON;
+  button.classList.add("copied");
+  button._copyTimer = setTimeout(() => {
+    button.innerHTML = COPY_CHIP_ICON;
+    button.classList.remove("copied");
+  }, 1200);
+}
+
+function copyLines(lines) {
+  return (lines || []).map((line) => String(line ?? "")).filter((line) => line !== "").join("\n");
+}
+
+function makeCopyChip(getText, label = "Copy") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "copy-chip";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.innerHTML = COPY_CHIP_ICON;
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const text = typeof getText === "function" ? getText() : getText;
+    copyTextToClipboard(text).then((ok) => { if (ok) markCopyChip(button); });
+  });
+  return button;
+}
+
+// cloud-panel.js is an ES module: publish the helpers explicitly.
+window.copyTextToClipboard = copyTextToClipboard;
+window.markCopyChip = markCopyChip;
+window.COPY_CHIP_ICON = COPY_CHIP_ICON;
+
 let actionBusy = false;
 let stopRequested = false;
 const disconnectPending = { arm: false, leader: false };
@@ -515,6 +573,49 @@ function positionReplayChartCursor(chart) {
   cursor.hidden = false;
 }
 
+// Dragging the now line trades visible past for visible future without changing
+// the window span; only the live rollout view exposes the handle.
+function bindNowCursorDrag(chart) {
+  const cursor = chart && chart.$replayCursorElement;
+  if (!cursor) return;
+  let pointerId = null;
+  const liveDraggable = () => !replayActive && !chartFreeze
+    && currentControlMode() === "rollout" && !!chart.$showNowLine;
+  cursor.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || pointerId != null || !liveDraggable()) return;
+    event.preventDefault();
+    pointerId = event.pointerId;
+    cursor.classList.add("dragging");
+    try { cursor.setPointerCapture(event.pointerId); } catch { /* ignore */ }
+  });
+  cursor.addEventListener("pointermove", (event) => {
+    if (pointerId !== event.pointerId) return;
+    const area = chart.chartArea;
+    const rect = chart.canvas.getBoundingClientRect();
+    if (!area || !rect.width || !chart.width) return;
+    const pixel = (event.clientX - rect.left) / (rect.width / chart.width);
+    rolloutNowFraction = clampRolloutNowFraction(
+      (pixel - area.left) / Math.max(1, area.right - area.left),
+    );
+    renderLiveFrame();
+  });
+  const finish = (event) => {
+    if (pointerId !== event.pointerId) return;
+    pointerId = null;
+    cursor.classList.remove("dragging");
+    try { cursor.releasePointerCapture(event.pointerId); } catch { /* ignore */ }
+    try { localStorage.setItem(ROLLOUT_NOW_FRACTION_KEY, String(rolloutNowFraction)); } catch { /* ignore */ }
+  };
+  cursor.addEventListener("pointerup", finish);
+  cursor.addEventListener("pointercancel", finish);
+  cursor.addEventListener("dblclick", () => {
+    if (!liveDraggable()) return;
+    rolloutNowFraction = null;
+    try { localStorage.removeItem(ROLLOUT_NOW_FRACTION_KEY); } catch { /* ignore */ }
+    renderLiveFrame();
+  });
+}
+
 function positionLiveNowCursor(chart) {
   const cursor = chart && chart.$replayCursorElement;
   const x = chart && chart.scales && chart.scales.x;
@@ -532,13 +633,17 @@ function positionLiveNowCursor(chart) {
     || !chart.$showNowLine
     || !Number.isFinite(time)
   ) {
-    if (cursor) cursor.hidden = true;
+    if (cursor) {
+      cursor.hidden = true;
+      cursor.classList.remove("draggable");
+    }
     return;
   }
   const canvasRect = canvas.getBoundingClientRect();
   const hostRect = host.getBoundingClientRect();
   if (!canvasRect.width || !canvasRect.height || !chart.width || !chart.height) {
     cursor.hidden = true;
+    cursor.classList.remove("draggable");
     return;
   }
   const scaleX = canvasRect.width / chart.width;
@@ -546,6 +651,7 @@ function positionLiveNowCursor(chart) {
   let pixel = x.getPixelForValue(time);
   if (!Number.isFinite(pixel) || pixel < area.left) {
     cursor.hidden = true;
+    cursor.classList.remove("draggable");
     return;
   }
   pixel = Math.min(pixel, area.right);
@@ -553,6 +659,8 @@ function positionLiveNowCursor(chart) {
   cursor.style.top = `${canvasRect.top - hostRect.top + area.top * scaleY}px`;
   cursor.style.height = `${Math.max(0, (area.bottom - area.top) * scaleY)}px`;
   cursor.hidden = false;
+  cursor.classList.add("draggable");
+  cursor.title = "Drag to shift the window; double-click to reset";
 }
 
 function formatWallClockTime(seconds, milliseconds = false) {
@@ -826,9 +934,9 @@ function applyLeftBoundary(dataset, minTime, endIndex) {
 
 function refreshLiveChartSeries(chart, now) {
   if (!chart || chart.$timeAxis !== true) return;
-  const future = rolloutFutureWindowS(now);
-  const minTime = now - chartScaleSeconds;
-  const maxTime = now + future;
+  const timeWindow = liveTimeWindow(now);
+  const minTime = timeWindow.min;
+  const maxTime = timeWindow.max;
   (chart.$live || []).forEach((dataset) => {
     const raw = dataset.$raw || [];
     const visible = decimateVisibleSeries(raw, minTime, maxTime);
@@ -846,26 +954,37 @@ function liveWallClockNow() {
   return WALL_CLOCK_OFFSET_S + performance.now() / 1000;
 }
 
+function liveFrameNow() {
+  return Math.floor(liveWallClockNow() * LIVE_FRAME_RATE) / LIVE_FRAME_RATE;
+}
+
+function applyLiveChartWindow(now) {
+  [stateChart, actionChart].forEach((chart) => {
+    if (!chart || chart.$timeAxis !== true) return;
+    chart.$lastRenderedNow = now;
+    refreshLiveChartSeries(chart, now);
+    chart.$nowTime = now;
+    chart.$showNowLine = showLiveNowLine();
+    chart.options.scales.x = liveTimeAxis(now);
+    chart.update("none");
+    positionLiveNowCursor(chart);
+  });
+}
+
+function renderLiveFrame(now = liveFrameNow()) {
+  if (currentControlMode() === "rollout") {
+    updateRolloutLanes(liveRolloutTimeline, last?.prediction, now, now);
+    renderRolloutOverlays(now);
+  }
+  applyLiveChartWindow(now);
+}
+
 function animateLiveCharts(frameMs) {
   if (!document.hidden && !replayActive && !snapshotActive && !chartFreeze
       && frameMs - lastChartAnimationMs >= CHART_UPDATE_INTERVAL_MS) {
     lastChartAnimationMs = frameMs;
     // All geometry and elapsed counters use this exact frame, independent of WS cadence.
-    const renderNow = Math.floor(liveWallClockNow() * LIVE_FRAME_RATE) / LIVE_FRAME_RATE;
-    if (currentControlMode() === "rollout") {
-      updateRolloutLanes(liveRolloutTimeline, last?.prediction, renderNow, renderNow);
-      renderRolloutOverlays(renderNow);
-    }
-    [stateChart, actionChart].forEach((chart) => {
-      if (!chart || chart.$timeAxis !== true) return;
-      chart.$lastRenderedNow = renderNow;
-      refreshLiveChartSeries(chart, renderNow);
-      chart.$nowTime = renderNow;
-      chart.$showNowLine = showLiveNowLine();
-      chart.options.scales.x = liveTimeAxis(renderNow);
-      chart.update("none");
-      positionLiveNowCursor(chart);
-    });
+    renderLiveFrame(liveFrameNow());
   }
   chartAnimationFrame = requestAnimationFrame(animateLiveCharts);
 }
@@ -1672,7 +1791,9 @@ function mkChart(id) {
   };
   if (!canvas) return null;
   if (typeof window.Chart !== "function") return unavailable("Charts unavailable — live controls are still active.");
-  const laneHeight = id === "chart-action" ? ROLLOUT_LANE_BAND_PX : 0;
+  // The rollout lane band is reserved on demand (setRolloutLaneBand), so an idle
+  // Commanded-action chart fills the whole panel instead of leaving a blank band.
+  const laneHeight = 0;
   try {
     const chart = new window.Chart(canvas.getContext("2d"), {
     type: "line",
@@ -1725,6 +1846,7 @@ function mkChart(id) {
     cursor.hidden = true;
     canvas.parentElement.appendChild(cursor);
     chart.$replayCursorElement = cursor;
+    bindNowCursorDrag(chart);
     const tooltip = document.createElement("div");
     tooltip.className = "chart-hover-tooltip";
     tooltip.hidden = true;
@@ -1768,6 +1890,28 @@ const actionChart = mkChart("chart-action");
 const ROLLOUT_WINDOW_S = 20;
 const ROLLOUT_FUTURE_MAX_S = 8;
 const ROLLOUT_FUTURE_RATIO = 0.25;
+const ROLLOUT_NOW_FRACTION_KEY = "lerobot-monitor-rollout-now-fraction";
+const ROLLOUT_NOW_FRACTION_MIN = 0.05;
+const ROLLOUT_NOW_FRACTION_MAX = 0.95;
+
+function clampRolloutNowFraction(value) {
+  return Math.min(ROLLOUT_NOW_FRACTION_MAX, Math.max(ROLLOUT_NOW_FRACTION_MIN, Number(value)));
+}
+
+function loadRolloutNowFraction() {
+  try {
+    const raw = localStorage.getItem(ROLLOUT_NOW_FRACTION_KEY);
+    if (raw == null || raw === "") return null;
+    const value = Number(raw);
+    return Number.isFinite(value) ? clampRolloutNowFraction(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+// null keeps the historical split (past = chartScaleSeconds, future = lookahead);
+// dragging the now line stores the share of the window that lies in the past.
+let rolloutNowFraction = loadRolloutNowFraction();
 let actionLegendNames = [...JOINT_FALLBACK];
 let actionLegendSignature = "";
 
@@ -2045,11 +2189,20 @@ function rolloutFutureWindowS(now) {
   );
 }
 
-function liveTimeWindow(now) {
+// Window split around the now line. The total span never changes, so dragging
+// only trades visible past for visible future (and the lane window with it).
+function rolloutWindowSplit(now) {
   const future = rolloutFutureWindowS(now);
-  const padding = future > 0
-    ? future
-    : Math.min(LIVE_RIGHT_PADDING_S, Math.max(0.05, chartScaleSeconds * 0.02));
+  const total = chartScaleSeconds + future;
+  if (!(future > 0) || !(total > 0)) return null;
+  const fraction = clampRolloutNowFraction(rolloutNowFraction ?? chartScaleSeconds / total);
+  return { total, past: total * fraction, future: total * (1 - fraction) };
+}
+
+function liveTimeWindow(now) {
+  const split = rolloutWindowSplit(now);
+  if (split) return { min: now - split.past, max: now + split.future };
+  const padding = Math.min(LIVE_RIGHT_PADDING_S, Math.max(0.05, chartScaleSeconds * 0.02));
   return { min: now - chartScaleSeconds, max: now + padding };
 }
 
@@ -2344,16 +2497,28 @@ function renderRolloutOverlays(now) {
   applyRolloutOverlay(actionChart, now);
 }
 
+// Reserving the band is what keeps the lane geometry (64px of hard-coded
+// offsets) valid; outside a rollout the chart reclaims those pixels.
+function setRolloutLaneBand(chart, active) {
+  if (!chart) return;
+  const band = active ? ROLLOUT_LANE_BAND_PX : 0;
+  if (Number(chart.$laneHeight) === band) return;
+  chart.$laneHeight = band;
+  chart.options.layout.padding.bottom = CHART_TIME_AXIS_PADDING + band;
+  chart.update("none");
+}
+
 function updateRolloutLanes(timeline, prediction, chartNow, liveNow) {
   const build = window.RolloutLanes && window.RolloutLanes.buildRolloutLanes;
+  const timeWindow = liveTimeWindow(liveNow);
   const lanes = typeof build === "function" && timeline
     ? build({
       timeline,
       prediction,
       chartNow,
       epoch: chartFreeze ? chartFreeze.epoch : liveRolloutEpoch,
-      windowS: chartScaleSeconds,
-      lookaheadS: rolloutFutureWindowS(liveNow),
+      windowS: Math.max(0.5, liveNow - timeWindow.min),
+      lookaheadS: Math.max(0, timeWindow.max - liveNow),
       maxBlocks: ROLLOUT_LANE_MAX_BLOCKS,
       overlapMinS: ROLLOUT_OVERLAP_MIN_S,
       rows: ROLLOUT_LANE_ROWS,
@@ -2364,6 +2529,8 @@ function updateRolloutLanes(timeline, prediction, chartNow, liveNow) {
     actionChart.$rolloutLanes = lanes;
     actionChart.$displayTimeline = timeline;
     actionChart.$displayPrediction = prediction;
+    // Keep the band reserved for the whole run, even before the first block.
+    setRolloutLaneBand(actionChart, Boolean(timeline));
   }
   if (stateChart) stateChart.$rolloutLanes = null;
   return lanes;
@@ -2374,6 +2541,7 @@ function clearRolloutLanes() {
   vizState.rolloutLanes = null;
   if (actionChart) actionChart.$rolloutLanes = null;
   if (stateChart) stateChart.$rolloutLanes = null;
+  setRolloutLaneBand(actionChart, false);
 }
 
 function clearRolloutPredictions() {
@@ -3974,6 +4142,31 @@ function setSelectValue(select, value) {
   select.value = [...select.options].some((option) => option.value === wanted) ? wanted : "";
 }
 
+// Presets keep model paths / dataset ids that may no longer be listed in the
+// Library caches, so a loaded preset must be able to re-create its option.
+function ensureSelectOption(select, value, label = "") {
+  if (!select) return;
+  const wanted = String(value || "");
+  if (!wanted) return;
+  if ([...select.options].some((option) => option.value === wanted)) return;
+  const option = document.createElement("option");
+  option.value = wanted;
+  option.textContent = String(label || wanted);
+  select.appendChild(option);
+}
+
+function modelLabelForPath(path) {
+  const wanted = String(path || "");
+  const row = modelsCache.find((model) => String(model.path || "") === wanted);
+  return row ? libraryDisplayName("model", row) : wanted;
+}
+
+function datasetLabelForId(id) {
+  const wanted = String(id || "");
+  const row = datasetsCache.find((item) => String(item.id || "") === wanted);
+  return row ? libraryDisplayName("dataset", row) : wanted;
+}
+
 function modelOptionLabel(model) {
   return [libraryDisplayName("model", model), model.policy_type, model.source].filter(Boolean).join(" · ");
 }
@@ -4122,21 +4315,15 @@ function applyLibraryDrop(select, payload) {
   }
   if (expectedKind === "dataset") {
     const value = `dataset:${payload.id}`;
-    if (![...select.options].some((option) => option.value === value)) {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = payload.display_name || payload.id;
-      select.appendChild(option);
-    }
+    ensureSelectOption(select, value, payload.display_name || payload.id);
     select.value = value;
     syncRecordDatasetSelection();
   } else {
-    if (![...select.options].some((option) => option.value === payload.path)) {
-      const option = document.createElement("option");
-      option.value = payload.path;
-      option.textContent = payload.display_name || payload.id;
-      select.appendChild(option);
+    if (!payload.path) {
+      toastError(new Error("model has no path to select"));
+      return;
     }
+    ensureSelectOption(select, payload.path, payload.display_name || payload.id);
     select.value = payload.path;
     if (select.id === "dbg-policy" && $("dbg-path")) $("dbg-path").value = payload.path;
     persistUi();
@@ -4253,7 +4440,9 @@ function applyRecordFields(p) {
   if (p.deferred_encoding != null && $("chk-rec-deferred-enc")) $("chk-rec-deferred-enc").checked = !!p.deferred_encoding;
   if (p.encoder_threads != null && $("hw-enc-threads")) $("hw-enc-threads").value = p.encoder_threads;
   populateRecordDatasetSelect();
-  setSelectValue($("rec-dataset-select"), p.dataset_id ? `dataset:${p.dataset_id}` : recordDatasetValue());
+  const datasetSelection = p.dataset_id ? `dataset:${p.dataset_id}` : "";
+  ensureSelectOption($("rec-dataset-select"), datasetSelection, datasetLabelForId(p.dataset_id));
+  setSelectValue($("rec-dataset-select"), datasetSelection || recordDatasetValue());
   syncRecordDatasetSelection();
   updateResumeTargetUi();
 }
@@ -4331,6 +4520,7 @@ function applyRolloutFields(p) {
   if (p.interpolation != null && $("pol-interpolation")) $("pol-interpolation").checked = !!p.interpolation;
   if (p.extra != null) setKvPairs(p.extra);
   populateModelSelects();
+  ensureSelectOption($("pol-path"), p.policy_path, modelLabelForPath(p.policy_path));
   setSelectValue($("pol-path"), String(p.policy_path || ""));
 }
 
@@ -5084,16 +5274,7 @@ function captureFields() {
 }
 bind("btn-log-copy", async () => {
   const text = [...document.querySelectorAll("#log li")].map((li) => li.textContent).join("\n");
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
-    ta.remove();
-  }
+  await copyTextToClipboard(text);
 });
 bind("btn-log-clear", () => {
   clearedLogSequence = latestLogSequence;
@@ -5416,21 +5597,36 @@ function renderLibraryMetadata(li, kind, row) {
     ? Object.keys(metadata)
     : libraryMetaFields[`${kind}s`] || [];
   const visible = fields
-    .map((key) => [key, metadataText(key, metadata[key])])
-    .filter(([, value]) => value);
+    .map((key) => [key, metadata[key]])
+    .filter(([key, value]) => metadataText(key, value));
   if (!visible.length) return;
+  const entries = visible.map(([key, value]) => {
+    const label = LIBRARY_META_LABELS[key] || key;
+    return { key, label, value: metadataText(key, value) };
+  });
   const host = document.createElement("div");
   host.className = "lib-meta";
-  visible.forEach(([key, value]) => {
+  const head = document.createElement("div");
+  head.className = "lib-meta-head";
+  head.appendChild(makeCopyChip(
+    () => copyLines(entries.map((entry) => `${entry.label}: ${entry.value}`)),
+    "Copy all metadata",
+  ));
+  host.appendChild(head);
+  entries.forEach((entry) => {
     const line = document.createElement("div");
     line.className = "lib-meta-row";
-    line.dataset.key = key;
+    line.dataset.key = entry.key;
     const label = document.createElement("strong");
-    label.textContent = LIBRARY_META_LABELS[key] || key;
+    label.textContent = entry.label;
     const text = document.createElement("span");
-    text.textContent = value;
-    text.title = value;
-    line.append(label, text);
+    text.textContent = entry.value;
+    text.title = entry.value;
+    line.append(
+      label,
+      text,
+      makeCopyChip(() => `${entry.label}: ${entry.value}`, `Copy ${entry.label}`),
+    );
     host.appendChild(line);
   });
   li.appendChild(host);
@@ -5443,6 +5639,7 @@ function renderLibraryDescription(li, kind, sourceId, row) {
   host.className = `lib-description${description ? "" : " empty"}`;
   host.textContent = description || "No description";
   host.title = description || "No description";
+  host.appendChild(makeCopyChip(() => description || "No description", "Copy description"));
   li.appendChild(host);
 }
 
@@ -6668,6 +6865,7 @@ function applyDebugFields(preset) {
   const select = $("dbg-policy");
   if (select && preset.policy_path) select.value = preset.policy_path;
   populateModelSelects();
+  ensureSelectOption($("dbg-policy"), preset.policy_path, modelLabelForPath(preset.policy_path));
   setSelectValue($("dbg-policy"), String(preset.policy_path || ""));
   renderDebugPanel();
 }
@@ -6898,7 +7096,7 @@ function clearChunkTiming() {
 }
 
 // Expanded/collapsed profile sections survive re-renders: both defaults are collapsed.
-const debugProfileOpen = { timing: false, cloud: false, reference: false };
+const debugProfileOpen = { timing: false, cloud: false, phases: false, reference: false };
 
 function debugProfileSection(section, title, meta, body) {
   const details = document.createElement("details");
@@ -6922,11 +7120,13 @@ function debugProfileSection(section, title, meta, body) {
   return details;
 }
 
-function debugProfileRow({ key, label, text, detail, pct, color }) {
+function debugProfileRow({ key, kind, label, text, detail, pct, color, depth = 0 }) {
   const row = document.createElement("div");
   row.className = "debug-profile-row";
-  row.dataset.kind = key;
+  row.dataset.kind = kind || key;
   row.style.setProperty("--pct", `${Math.max(0, Math.min(100, Number(pct) || 0)).toFixed(2)}%`);
+  // Nested phase rows indent by parent depth; other sections pass no depth and stay flat.
+  row.style.setProperty("--indent", `${Math.max(0, Math.min(4, Number(depth) || 0)) * 8}px`);
   const dot = document.createElement("span");
   dot.className = "debug-profile-dot";
   if (color) dot.style.background = color;
@@ -6940,6 +7140,13 @@ function debugProfileRow({ key, label, text, detail, pct, color }) {
   value.className = "debug-profile-value";
   value.textContent = text;
   row.append(dot, name, note, value);
+  // Rows append extra value cells (nrmse), so the chip is positioned out of flow.
+  if (key !== "head") {
+    row.appendChild(makeCopyChip(
+      () => copyLines([`${label}: ${text}`, detail ? `detail: ${detail}` : ""]),
+      `Copy ${label}`,
+    ));
+  }
   return row;
 }
 
@@ -6981,6 +7188,15 @@ function renderChunkTiming(result) {
   const note = document.createElement("p");
   note.className = "debug-timing-note";
   note.textContent = timing.caption;
+  const foot = document.createElement("div");
+  foot.className = "debug-timing-foot";
+  foot.append(note, makeCopyChip(() => copyLines([
+    `inference ${api.formatTimingMs(timing.inferenceMs)} · ${timing.caption}`,
+    ...timing.chips.map((chip) => `${chip.label}: ${chip.text}`),
+    ...timing.detailRows.map((row) => `${row.key}: ${row.text}${row.detail ? ` (${row.detail})` : ""}`),
+    ...timing.stageRows.map((row) => `${stageLabel(row.key)}: ${row.text}`),
+    ...timing.phaseRows.map((row) => `${"  ".repeat(row.depth)}${row.label}: ${row.text}${row.detail ? ` (${row.detail})` : ""}`),
+  ]), "Copy inference timing"));
   const profile = document.createElement("div");
   profile.className = "debug-profile";
   profile.append(debugProfileSection(
@@ -7014,6 +7230,27 @@ function renderChunkTiming(result) {
       })),
     ));
   }
+  if (timing.phaseRows.length) {
+    // Measured walk of the request: the bar's "other" segment finally shows its parts.
+    profile.append(debugProfileSection(
+      "phases",
+      "Phases",
+      api.formatTimingMs(timing.phaseTotalMs),
+      timing.phaseRows.map((row) => {
+        const item = debugProfileRow({
+          key: row.key,
+          kind: row.bucket,
+          label: row.label,
+          text: row.text,
+          detail: row.detail,
+          pct: row.pct,
+          depth: row.depth,
+        });
+        item.classList.add("is-phase");
+        return item;
+      }),
+    ));
+  }
   if (timing.jointRows.length) {
     const head = debugProfileRow({ key: "head", label: "joint", text: "rmse", detail: "mae", pct: 0 });
     head.classList.add("is-head");
@@ -7045,7 +7282,7 @@ function renderChunkTiming(result) {
       ],
     ));
   }
-  host.replaceChildren(track, chips, note, profile);
+  host.replaceChildren(track, chips, foot, profile);
   host.classList.remove("hidden");
 }
 
@@ -7251,15 +7488,30 @@ function episodeSummaryValues(ep, draft = null) {
 function makeEpisodeSummary(values) {
   const summary = document.createElement("div");
   summary.className = "ep-meta-summary";
-  [["task", "Task"], ["name", "Name"], ["note", "Note"]].forEach(([key, label]) => {
+  const entries = [["task", "Task"], ["name", "Name"], ["note", "Note"]].map(([key, label]) => ({
+    label,
+    value: String(values[key] || "—"),
+  }));
+  const head = document.createElement("div");
+  head.className = "ep-meta-head";
+  head.appendChild(makeCopyChip(
+    () => copyLines(entries.map((entry) => `${entry.label}: ${entry.value}`)),
+    "Copy episode metadata",
+  ));
+  summary.appendChild(head);
+  entries.forEach((entry) => {
     const row = document.createElement("div");
     row.className = "ep-meta-row";
     const name = document.createElement("strong");
-    name.textContent = label;
+    name.textContent = entry.label;
     const value = document.createElement("span");
-    value.textContent = String(values[key] || "—");
-    value.title = value.textContent;
-    row.append(name, value);
+    value.textContent = entry.value;
+    value.title = entry.value;
+    row.append(
+      name,
+      value,
+      makeCopyChip(() => `${entry.label}: ${entry.value}`, `Copy ${entry.label}`),
+    );
     summary.appendChild(row);
   });
   return summary;
@@ -9164,6 +9416,15 @@ function renderLoadProgress() {
   }
 }
 
+// The progress card is static markup, so its copy chip is attached once.
+if ($("load-progress-meta") && !$("load-progress-meta").querySelector(".copy-chip")) {
+  $("load-progress-meta").appendChild(makeCopyChip(() => copyLines([
+    $("load-progress-label")?.textContent || "",
+    $("load-progress-phase")?.textContent || "",
+    $("load-progress-elapsed")?.textContent || "",
+  ]), "Copy load progress"));
+}
+
 async function pollCloudLoad(item) {
   const started = Date.now();
   let misses = 0;
@@ -9363,7 +9624,12 @@ function renderModelResidency(host, model, processGpu = []) {
     ? `${fmtBytes(status.gpu_bytes)} GPU tensors${devices ? ` · ${devices}` : ""}`
     : (cpuResident ? "CPU RAM resident" : (devices || ""));
   memory.title = "Persistent model tensor storage; excludes temporary inference memory and CUDA context.";
-  line.append(badge, memory, modelResidencyActionButton(model, "load", status));
+  line.append(badge, memory, makeCopyChip(() => copyLines([
+    `model: ${model.id}`,
+    `state: ${badge.textContent}`,
+    `memory: ${memory.textContent}`,
+    devices ? `devices: ${devices}` : "",
+  ]), "Copy model residency"), modelResidencyActionButton(model, "load", status));
   const instances = status.instances || [];
   const cancelling = status.state === "cancelling" || instances.some(item => item.state === "cancelling");
   const stopping = status.state === "stopping" || instances.some(item => item.state === "stopping");
@@ -10569,7 +10835,9 @@ async function refreshPorts() {
       "arm-port",
       lastPorts,
       robot.connected ? robot.port : "",
-      virtualPort,
+      // The virtual follower stays selectable but is never the default; the
+      // port comes back from the last pick or the applied hardware preset.
+      savedPortValue(uiHw, "arm_port", ""),
     );
     fillPortSelect(
       "leader-port",

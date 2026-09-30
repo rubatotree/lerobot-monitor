@@ -99,7 +99,7 @@ export function createCloudPanel(doc = document, options = {}) {
   const $ = (id) => doc.getElementById(id);
   const state = {
     base, hosts: [], hostId: "", health: null, gpus: [], models: [],
-    cloudJobs: [], localJobs: [], connected: false, busy: false, refreshing: false,
+    cloudJobs: [], localJobs: [], renderedJobs: [], connected: false, busy: false, refreshing: false,
     generation: 0, pendingRefresh: false, dialogHandler: null, timer: null, message: "", error: false,
   };
   const esc = escapeHTML;
@@ -109,6 +109,7 @@ export function createCloudPanel(doc = document, options = {}) {
     hostId ? `${base}/api/cloud/hosts/${encodeURIComponent(hostId)}/cloud/api/v1${suffix}` : null
   );
   const badge = (value) => `<span class="cloud-badge ${statusClass(value)}">${esc(statusText(value))}</span>`;
+  const copyChip = (kind, id, label) => `<button type="button" class="copy-chip" data-cloud-copy="${esc(kind)}" data-id="${esc(id)}" title="${esc(label)}" aria-label="${esc(label)}">${window.COPY_CHIP_ICON || ""}</button>`;
   const setHTML = (id, html) => { const node = $(id); if (node && node.innerHTML !== html) node.innerHTML = html; };
 
   function notice(message = "", error = false) {
@@ -150,7 +151,7 @@ export function createCloudPanel(doc = document, options = {}) {
     const connected = selected.status === "connected";
     const operationBusy = hostBusy(selected.id);
     const disabled = state.busy || operationBusy;
-    setHTML("cloud-host-meta", `<div class="cloud-host-line">${badge(selected.status || "disconnected")}${operationBusy ? ` ${badge("busy")}` : ""}${selected.build_outdated ? ` ${badge("outdated build")}` : ""}</div><p class="cloud-host-path mono">${esc(selected.root)} · ${esc(selected.port || 8091)}</p>${selected.build_outdated ? '<p class="cloud-hint">The server runs an older build than this Monitor. Click Upgrade, then reload the model.</p>' : ""}${selected.error ? `<p class="cloud-host-error">${esc(selected.error)}</p>` : ""}`);
+    setHTML("cloud-host-meta", `<div class="cloud-host-line">${badge(selected.status || "disconnected")}${operationBusy ? ` ${badge("busy")}` : ""}${selected.build_outdated ? ` ${badge("outdated build")}` : ""}${copyChip("host", "host", "Copy server info")}</div><p class="cloud-host-path mono">${esc(selected.root)} · ${esc(selected.port || 8091)}</p>${selected.build_outdated ? '<p class="cloud-hint">The server runs an older build than this Monitor. Click Upgrade, then reload the model.</p>' : ""}${selected.error ? `<p class="cloud-host-error">${esc(selected.error)}</p>` : ""}`);
     setHTML("cloud-host-actions", `<button type="button" data-cloud-host-action="probe" ${disabled ? "disabled" : ""}>Probe</button><button type="button" data-cloud-host-action="bootstrap" ${disabled ? "disabled" : ""}>Initialize</button>${connected ? `<button type="button" data-cloud-host-action="upgrade" ${disabled ? "disabled" : ""}>Upgrade</button>` : ""}<button type="button" data-cloud-host-action="runtime" ${disabled ? "disabled" : ""}>Runtime</button><button type="button" data-cloud-host-action="${connected ? "disconnect" : "connect"}" class="${connected ? "ghost" : ""}" ${disabled ? "disabled" : ""}>${connected ? "Disconnect" : "Connect"}</button>`);
   }
 
@@ -177,7 +178,7 @@ export function createCloudPanel(doc = document, options = {}) {
       const ownership = owners
         ? `<ul class="cloud-gpu-owners">${owners}</ul>${processes.length > 2 ? `<p class="cloud-hint">+${processes.length - 2} more process(es)</p>` : ""}`
         : (used > 512 ? '<p class="cloud-hint">Driver memory; no attributable compute process</p>' : "");
-      return `<article class="cloud-gpu ${healthy ? "" : "bad"}"><div class="cloud-gpu-top"><span class="cloud-gpu-index">GPU ${esc(gpu.index)}</span>${badge(!healthy ? "unavailable" : free ? "healthy" : "busy")}</div><p class="cloud-gpu-name" title="${esc(gpu.name)}">${esc(gpu.name || "unknown GPU")}</p><div class="cloud-gpu-mem"><span class="cloud-gpu-mem-used mono">${(used / 1024).toFixed(1)} / ${(total / 1024).toFixed(1)} GiB</span><span>used</span></div><div class="cloud-meter ${meterClass}" role="meter" aria-label="GPU ${esc(gpu.index)} memory used" aria-valuenow="${Math.round(percent)}" aria-valuemin="0" aria-valuemax="100"><span style="width:${percent}%"></span></div>${ownership}</article>`;
+      return `<article class="cloud-gpu ${healthy ? "" : "bad"}"><div class="cloud-gpu-top"><span class="cloud-gpu-index">GPU ${esc(gpu.index)}</span>${badge(!healthy ? "unavailable" : free ? "healthy" : "busy")}${copyChip("gpu", gpu.index, `Copy GPU ${gpu.index}`)}</div><p class="cloud-gpu-name" title="${esc(gpu.name)}">${esc(gpu.name || "unknown GPU")}</p><div class="cloud-gpu-mem"><span class="cloud-gpu-mem-used mono">${(used / 1024).toFixed(1)} / ${(total / 1024).toFixed(1)} GiB</span><span>used</span></div><div class="cloud-meter ${meterClass}" role="meter" aria-label="GPU ${esc(gpu.index)} memory used" aria-valuenow="${Math.round(percent)}" aria-valuemin="0" aria-valuemax="100"><span style="width:${percent}%"></span></div>${ownership}</article>`;
     }).join("") : '<div class="cloud-empty"><svg class="cloud-empty-icon" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h4M6 14h8"/></svg><strong>No GPU reported</strong>Check the server driver.</div>');
   }
 
@@ -203,7 +204,7 @@ export function createCloudPanel(doc = document, options = {}) {
       : state.models.length ? state.models.map((model) => {
         const actions = deploymentActions(model);
         const active = Number(model.active_sessions || 0) > 0;
-        return `<article class="cloud-model" data-status="${esc(model.status || "")}"><div class="cloud-model-main"><div class="cloud-model-title"><h4>${esc(model.name || model.id)}</h4>${badge(model.status)}</div><p class="cloud-model-source mono">${esc(model.source_kind === "huggingface" ? "HF" : "PATH")} · ${esc(model.source || model.path || "")}</p>${model.revision ? `<p class="cloud-model-note mono">revision · ${esc(model.revision)}</p>` : ""}${model.gpu_uuid ? `<p class="cloud-model-note mono">${esc(model.gpu_uuid)}${active ? " · in use" : ""}</p>` : ""}${model.error ? `<p class="cloud-model-error">${esc(model.error)}</p>` : ""}</div><div class="cloud-model-actions">${model.status === "loaded" ? `<button type="button" data-cloud-model-action="unload" data-id="${esc(model.id)}" ${active || state.busy ? "disabled" : ""}>Unload</button>` : `<button type="button" data-cloud-model-action="load" data-id="${esc(model.id)}" ${!actions.load || !available || state.busy ? "disabled" : ""}>Load</button>`}<button type="button" class="ghost" data-cloud-model-action="logs" data-id="${esc(model.id)}">Logs</button><button type="button" data-cloud-model-action="use" data-id="${esc(model.id)}" title="Register this deployment in the Model library so Rollout and Debug can select it">Add to library</button><button type="button" class="ghost" data-cloud-model-action="remove" data-id="${esc(model.id)}" ${!actions.remove || state.busy ? "disabled" : ""}>Remove</button></div></article>`;
+        return `<article class="cloud-model" data-status="${esc(model.status || "")}"><div class="cloud-model-main"><div class="cloud-model-title"><h4>${esc(model.name || model.id)}</h4>${badge(model.status)}${copyChip("model", model.id, "Copy cloud model")}</div><p class="cloud-model-source mono">${esc(model.source_kind === "huggingface" ? "HF" : "PATH")} · ${esc(model.source || model.path || "")}</p>${model.revision ? `<p class="cloud-model-note mono">revision · ${esc(model.revision)}</p>` : ""}${model.gpu_uuid ? `<p class="cloud-model-note mono">${esc(model.gpu_uuid)}${active ? " · in use" : ""}</p>` : ""}${model.error ? `<p class="cloud-model-error">${esc(model.error)}</p>` : ""}</div><div class="cloud-model-actions">${model.status === "loaded" ? `<button type="button" data-cloud-model-action="unload" data-id="${esc(model.id)}" ${active || state.busy ? "disabled" : ""}>Unload</button>` : `<button type="button" data-cloud-model-action="load" data-id="${esc(model.id)}" ${!actions.load || !available || state.busy ? "disabled" : ""}>Load</button>`}<button type="button" class="ghost" data-cloud-model-action="logs" data-id="${esc(model.id)}">Logs</button><button type="button" data-cloud-model-action="use" data-id="${esc(model.id)}" title="Register this deployment in the Model library so Rollout and Debug can select it">Add to library</button><button type="button" class="ghost" data-cloud-model-action="remove" data-id="${esc(model.id)}" ${!actions.remove || state.busy ? "disabled" : ""}>Remove</button></div></article>`;
       }).join("") : '<div class="cloud-empty"><svg class="cloud-empty-icon" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg><strong>No deployment yet</strong>Download weights from Hugging Face, register a server path, or upload a local checkpoint.</div>');
   }
 
@@ -211,13 +212,14 @@ export function createCloudPanel(doc = document, options = {}) {
     const jobs = [...state.localJobs.map((job) => ({ ...job, local: true })), ...state.cloudJobs]
       .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
       .slice(0, 12);
-    setHTML("cloud-job-list", jobs.length ? jobs.map((job) => {
+    state.renderedJobs = jobs;
+    setHTML("cloud-job-list", jobs.length ? jobs.map((job, index) => {
       const date = job.updated_at || job.created_at;
       const dt = date ? new Date(typeof date === "number" ? date * 1000 : date) : null;
       const label = dt && !Number.isNaN(dt.getTime())
         ? dt.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
         : "";
-      return `<article class="cloud-job">${badge(job.status)}<div class="cloud-job-info"><p class="cloud-job-name">${esc(KINDS[job.kind] || job.kind || "Job")}${job.local ? " · local" : ""}</p><p class="cloud-job-detail">${esc(job.error || job.message || job.id)}</p></div><time>${esc(label)}</time></article>`;
+      return `<article class="cloud-job">${badge(job.status)}<div class="cloud-job-info"><p class="cloud-job-name">${esc(KINDS[job.kind] || job.kind || "Job")}${job.local ? " · local" : ""}</p><p class="cloud-job-detail">${esc(job.error || job.message || job.id)}</p></div><time>${esc(label)}</time>${copyChip("job", index, "Copy job")}</article>`;
     }).join("") : '<div class="cloud-empty"><svg class="cloud-empty-icon" viewBox="0 0 24 24"><path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="10"/></svg><strong>No jobs yet</strong>Deploy, upload and load progress shows here.</div>');
   }
 
@@ -229,6 +231,73 @@ export function createCloudPanel(doc = document, options = {}) {
     renderJobs();
     const updated = $("cloud-updated-at");
     if (updated && state.connected) updated.textContent = `${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+  }
+
+  const copyLines = (lines) => (lines || []).filter((line) => line != null && line !== "").join("\n");
+
+  function hostCopyText(row) {
+    if (!row) return "";
+    return copyLines([
+      `Alias: ${row.alias || ""}`,
+      `ID: ${row.id || ""}`,
+      `Status: ${statusText(row.status || "disconnected")}`,
+      `Root: ${row.root || ""} · ${row.port || 8091}`,
+      row.build_outdated ? "Build: outdated (upgrade recommended)" : "",
+      row.error ? `Error: ${row.error}` : "",
+    ]);
+  }
+
+  function gpuCopyText(gpu) {
+    if (!gpu) return "";
+    const processes = Array.isArray(gpu.processes) ? gpu.processes : [];
+    const total = Number(gpu.memory_total_mb || 0);
+    const used = Number(gpu.memory_used_mb || 0);
+    const available = gpuAvailable(gpu, state.models);
+    return copyLines([
+      `GPU: ${gpu.index}`,
+      `Name: ${gpu.name || "unknown GPU"}`,
+      `Status: ${gpu.healthy === false || gpu.error ? "unavailable" : available ? "available" : "busy"}`,
+      `Memory: ${(used / 1024).toFixed(1)} / ${(total / 1024).toFixed(1)} GiB used`,
+      ...processes.map((process) => `Process: ${process.user || "unknown"} ${process.program || "unknown"} ${((Number(process.memory_used_mb || 0)) / 1024).toFixed(1)} GiB`),
+      gpu.error ? `Error: ${gpu.error}` : "",
+    ]);
+  }
+
+  function modelCopyText(model) {
+    if (!model) return "";
+    return copyLines([
+      `ID: ${model.id || ""}`,
+      `Name: ${model.name || model.id || ""}`,
+      `Status: ${statusText(model.status)}`,
+      `Source: ${model.source_kind === "huggingface" ? "HF" : "PATH"} ${model.source || model.path || ""}`,
+      model.revision ? `Revision: ${model.revision}` : "",
+      model.gpu_uuid ? `GPU: ${model.gpu_uuid}` : "",
+      Number(model.active_sessions || 0) > 0 ? `Active sessions: ${model.active_sessions}` : "",
+      model.error ? `Error: ${model.error}` : "",
+    ]);
+  }
+
+  function jobCopyText(job) {
+    if (!job) return "";
+    const date = job.updated_at || job.created_at;
+    const dt = date ? new Date(typeof date === "number" ? date * 1000 : date) : null;
+    const created = job.created_at ? new Date(typeof job.created_at === "number" ? job.created_at * 1000 : job.created_at) : null;
+    return copyLines([
+      `Kind: ${KINDS[job.kind] || job.kind || "Job"}${job.local ? " · local" : ""}`,
+      `Status: ${statusText(job.status)}`,
+      `ID: ${job.id || ""}`,
+      job.error ? `Error: ${job.error}` : (job.message ? `Message: ${job.message}` : ""),
+      created && !Number.isNaN(created.getTime()) ? `Created: ${created.toLocaleString()}` : "",
+      dt && !Number.isNaN(dt.getTime()) ? `Updated: ${dt.toLocaleString()}` : "",
+    ]);
+  }
+
+  function copyTarget(kind, id) {
+    if (kind === "host") return hostCopyText(host());
+    if (kind === "gpu") return gpuCopyText(state.gpus.find((row) => String(row.index) === String(id)));
+    if (kind === "model") return modelCopyText(state.models.find((row) => String(row.id) === String(id)));
+    if (kind === "job") return jobCopyText(state.renderedJobs[Number(id)]);
+    return "";
   }
 
   async function refresh({ manual = false } = {}) {
@@ -543,6 +612,13 @@ export function createCloudPanel(doc = document, options = {}) {
     $("cloud-model-list")?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-cloud-model-action]");
       if (button && !button.disabled) void modelAction(button.dataset.cloudModelAction, button.dataset.id);
+    });
+    $("cloud-panel")?.addEventListener("click", (event) => {
+      const chip = event.target.closest("[data-cloud-copy]");
+      if (!chip || !window.copyTextToClipboard) return;
+      const text = copyTarget(chip.dataset.cloudCopy, chip.dataset.id);
+      if (!text) return;
+      void window.copyTextToClipboard(text).then((ok) => { if (ok) window.markCopyChip(chip); });
     });
     $("cloud-dialog-close")?.addEventListener("click", closeDialog);
     $("cloud-dialog-cancel")?.addEventListener("click", closeDialog);

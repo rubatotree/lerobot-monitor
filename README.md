@@ -53,6 +53,7 @@ Windows 也可以运行 `.\run.ps1`。它优先读取本地 `config.yaml`，否�
 - 缓存迁移后可设置 `huggingface_home`；若校准文件仍在旧目录，分别设置 `robot.calibration_dir` 和 `leader.calibration_dir` 为包含 `<id>.json` 的目录。
 - `recording.root`、`library.*_roots`、`robot_models.root` 可改为你自己的目录。
 - 运行数据默认放在 `data/`，不会提交到 Git。Hugging Face 凭据请使用其标准本机认证方式，不要写入配置文件。
+- Hugging Face 连接也读标准环境变量：`HF_HOME` 优先于配置里的 `huggingface_home`；`HF_ENDPOINT` 用于下载与搜索（可以是 `https://hf-mirror.com` 这类镜像）；上传需要写权限，取 `HF_TOKEN`（优先）或 `huggingface-cli login` 保存的登录凭据。`HF_ENDPOINT` 指向只读镜像时，写入会自动改用 `https://huggingface.co`；自建 Hub 或其他可写 endpoint 用 `HF_UPLOAD_ENDPOINT` 显式指定。上传前会先用 `whoami` 校验凭据，被拒时立即报错并指出要改的变量，不会传到一半才失败。启动横幅会打印一行 `hf: cache=… endpoint=… upload=… token=…`，其中 token 只显示来源（`env HF_TOKEN`／`login store`／`missing`），不显示令牌本身。
 - `rollout.preload_dependencies` 默认开启：服务在摄像头和控制线程启动前导入策略共享依赖，避免首次 Load 在运行中的线程间竞争。此步骤不构建模型、不读取权重；阶段耗时写入启动日志与 `runtime.policy_dependencies`。仅使用监控功能时可设为 `false`，恢复按需导入。未安装 PyTorch/LeRobot 时跳过，其他依赖导入失败会记录错误并继续启动监控。
 
 ## 开发与验证

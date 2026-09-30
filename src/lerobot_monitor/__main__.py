@@ -36,7 +36,8 @@ def main() -> None:
     config = MonitorConfig.load(config_path if config_path.is_file() else None)
     if config.huggingface_home is not None:
         # Hugging Face reads HF_HOME when its modules are first imported.
-        os.environ["HF_HOME"] = str(config.huggingface_home.expanduser())
+        # The environment wins; the config file only supplies the default.
+        os.environ.setdefault("HF_HOME", str(config.huggingface_home.expanduser()))
     host = args.host or config.server.host
     port = args.port or config.server.port
 
@@ -46,7 +47,19 @@ def main() -> None:
     print(f"[lerobot-monitor] LAN:    http://{_local_ip()}:{port}{prefix}/")
 
     from .app import create_app
+    from .library import (
+        huggingface_endpoint,
+        huggingface_home,
+        huggingface_token_source,
+        huggingface_upload_endpoint,
+    )
     from .runtime import format_runtime, probe_runtime
+
+    print(
+        "[lerobot-monitor] hf:     "
+        f"cache={huggingface_home()} endpoint={huggingface_endpoint()} "
+        f"upload={huggingface_upload_endpoint()} token={huggingface_token_source()}"
+    )
 
     runtime = probe_runtime()
     print(f"[lerobot-monitor] python: {runtime['python']}")

@@ -16,7 +16,16 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from .library import dataset_entry, hub_cache_repo_dir, huggingface_hub_cache, lerobot_home, list_hf_datasets, slugify
+from .library import (
+    assert_huggingface_write_access,
+    dataset_entry,
+    hub_cache_repo_dir,
+    huggingface_hub_cache,
+    huggingface_write_api,
+    lerobot_home,
+    list_hf_datasets,
+    slugify,
+)
 from .store import JsonStore
 from .types import JOINT_ORDER
 
@@ -328,8 +337,11 @@ def upload_dataset_folder(
     done_bytes = 0
     done_files = 0
     try:
-        hub.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
-        remote_files = set(hub.list_repo_files(repo_id, repo_type="dataset", revision=revision or None))
+        # Writes never use the read endpoint: a download mirror cannot host them.
+        api = huggingface_write_api(hub)
+        assert_huggingface_write_access(api)
+        api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
+        remote_files = set(api.list_repo_files(repo_id, repo_type="dataset", revision=revision or None))
         local_files = {relative for relative, _size in files}
         # Hub creates this file for LFS routing. Keep it unless the local
         # dataset explicitly supplies its own copy.
@@ -340,7 +352,7 @@ def upload_dataset_folder(
                 operation_add(path_in_repo=relative, path_or_fileobj=str(root / relative))
                 for relative, _size in batch
             ]
-            hub.create_commit(
+            api.create_commit(
                 operations=operations,
                 commit_message=f"Upload {len(operations)} file(s) via lerobot-monitor",
                 **commit_kwargs,
@@ -351,7 +363,7 @@ def upload_dataset_folder(
                 on_progress(done_bytes, done_files)
         for start in range(0, len(obsolete), 50):
             batch = obsolete[start : start + 50]
-            hub.create_commit(
+            api.create_commit(
                 operations=[operation_delete(path_in_repo=relative) for relative in batch],
                 commit_message=f"Remove {len(batch)} obsolete dataset file(s) via lerobot-monitor",
                 **commit_kwargs,

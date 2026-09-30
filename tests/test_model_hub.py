@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from lerobot_monitor import model_hub
 from lerobot_monitor.model_hub import ModelRegistry, parse_remote, search_hf_models
 from lerobot_monitor.store import JsonStore
@@ -20,6 +22,69 @@ def test_parse_remote_accepts_repo_ids_urls_and_local_paths(tmp_path: Path) -> N
     parsed = parse_remote(str(local))
     assert parsed.source == "local"
     assert parsed.path == str(local)
+
+
+def test_upload_hf_model_uses_env_token_and_write_endpoint(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com")
+    monkeypatch.delenv("HF_UPLOAD_ENDPOINT", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "hf_env_token")
+    calls: list[tuple] = []
+
+    class FakeApi:
+        def __init__(self, endpoint=None, token=None):
+            self.endpoint = endpoint
+            self.token = token
+            calls.append(("api", endpoint, token))
+
+        @staticmethod
+        def whoami():
+            return {"name": "tester"}
+
+        @staticmethod
+        def create_repo(repo_id, *, repo_type, exist_ok):
+            calls.append(("create_repo", repo_id, repo_type, exist_ok))
+
+        @staticmethod
+        def upload_folder(*, repo_id, repo_type, folder_path, revision):
+            calls.append(("upload_folder", repo_id, repo_type, folder_path, revision))
+
+    monkeypatch.setattr(model_hub, "_hub_module", lambda: SimpleNamespace(HfApi=FakeApi))
+    model_hub.upload_hf_model("user/policy", str(tmp_path), "")
+
+    assert calls == [
+        ("api", "https://huggingface.co", "hf_env_token"),
+        ("create_repo", "user/policy", "model", True),
+        ("upload_folder", "user/policy", "model", str(tmp_path), None),
+    ]
+
+
+def test_upload_hf_model_reports_rejected_token_before_uploading(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HF_TOKEN", "hf_revoked")
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    monkeypatch.delenv("HF_UPLOAD_ENDPOINT", raising=False)
+    uploaded: list[str] = []
+
+    class FakeApi:
+        def __init__(self, endpoint=None, token=None):
+            self.endpoint = endpoint
+            self.token = token
+
+        @staticmethod
+        def whoami():
+            raise RuntimeError("401 Client Error. Invalid username or password.")
+
+        @staticmethod
+        def upload_folder(**kwargs):
+            uploaded.append("upload_folder")
+
+    monkeypatch.setattr(model_hub, "_hub_module", lambda: SimpleNamespace(HfApi=FakeApi))
+    with pytest.raises(model_hub.ModelHubError) as caught:
+        model_hub.upload_hf_model("user/policy", str(tmp_path), "")
+
+    message = str(caught.value)
+    assert "https://huggingface.co" in message
+    assert "HF_TOKEN" in message
+    assert uploaded == []
 
 
 def test_search_hf_models_prefers_lerobot_filter(monkeypatch) -> None:

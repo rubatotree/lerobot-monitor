@@ -1,8 +1,10 @@
 import json
 import os
 import shutil
+import sys
 import threading
 import time
+import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -22,6 +24,11 @@ from lerobot_monitor.dataset_hub import (
 from lerobot_monitor.library import (
     DatasetRecorder,
     VideoLibrary,
+    huggingface_endpoint,
+    huggingface_token,
+    huggingface_token_source,
+    huggingface_upload_endpoint,
+    huggingface_write_api,
     list_hf_datasets,
     list_local_models,
 )
@@ -517,6 +524,64 @@ def test_dataset_registry_edits_source_and_starts_upload(tmp_path: Path, monkeyp
         registry.start_upload("user/unknown")
 
 
+def test_huggingface_endpoints_split_reads_from_writes(monkeypatch) -> None:
+    monkeypatch.delenv("HF_UPLOAD_ENDPOINT", raising=False)
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    assert huggingface_endpoint() == "https://huggingface.co"
+    assert huggingface_upload_endpoint() == "https://huggingface.co"
+
+    monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com/")
+    assert huggingface_endpoint() == "https://hf-mirror.com"
+    assert huggingface_upload_endpoint() == "https://huggingface.co"
+
+    # Self-hosted endpoints keep serving both directions.
+    monkeypatch.setenv("HF_ENDPOINT", "https://hub.example.test")
+    assert huggingface_upload_endpoint() == "https://hub.example.test"
+
+    monkeypatch.setenv("HF_UPLOAD_ENDPOINT", "https://write.example.test/")
+    assert huggingface_upload_endpoint() == "https://write.example.test"
+    assert huggingface_endpoint() == "https://hub.example.test"
+
+
+def test_huggingface_token_prefers_the_environment(monkeypatch) -> None:
+    fake = types.ModuleType("huggingface_hub")
+    fake.get_token = lambda: "hf_stored"
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "hf_env_token")
+    assert huggingface_token() == "hf_env_token"
+    assert huggingface_token_source() == "env HF_TOKEN"
+
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "hf_legacy_token")
+    assert huggingface_token() == "hf_legacy_token"
+
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    assert huggingface_token() == "hf_stored"
+    assert huggingface_token_source() == "login store"
+
+    fake.get_token = lambda: (_ for _ in ()).throw(OSError("unreadable store"))
+    assert huggingface_token() is None
+    assert huggingface_token_source() == "missing"
+
+
+def test_huggingface_write_api_pins_endpoint_and_token(monkeypatch) -> None:
+    monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com")
+    monkeypatch.delenv("HF_UPLOAD_ENDPOINT", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "hf_env_token")
+    seen: dict = {}
+
+    class FakeHub:
+        @staticmethod
+        def HfApi(endpoint=None, token=None):
+            seen.update(endpoint=endpoint, token=token)
+            return types.SimpleNamespace(endpoint=endpoint, token=token)
+
+    api = huggingface_write_api(FakeHub)
+    assert (api.endpoint, api.token) == ("https://huggingface.co", "hf_env_token")
+    assert seen == {"endpoint": "https://huggingface.co", "token": "hf_env_token"}
+
+
 def test_upload_dataset_folder_reports_batched_progress(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "dataset"
     (root / "meta").mkdir(parents=True)
@@ -530,6 +595,9 @@ def test_upload_dataset_folder_reports_batched_progress(tmp_path: Path, monkeypa
 
     committed: list[list[str]] = []
     steps: list[tuple[int, int]] = []
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "hf_test_token")
 
     class Hub:
         class CommitOperationAdd:
@@ -541,19 +609,28 @@ def test_upload_dataset_folder_reports_batched_progress(tmp_path: Path, monkeypa
             def __init__(self, path_in_repo):
                 self.path_in_repo = path_in_repo
 
-        @staticmethod
-        def list_repo_files(repo_id, *, repo_type="dataset", revision=None):
-            assert (repo_id, repo_type, revision) == ("user/demo", "dataset", None)
-            return ["old.parquet", ".gitattributes"]
+        class HfApi:
+            def __init__(self, endpoint=None, token=None):
+                self.endpoint = endpoint
+                self.token = token
 
-        @staticmethod
-        def create_repo(repo_id, repo_type="dataset", private=False, exist_ok=True):
-            assert private is False
-            committed.append(["create_repo"])
+            @staticmethod
+            def whoami():
+                return {"name": "tester"}
 
-        @staticmethod
-        def create_commit(*, operations, commit_message, **kwargs):
-            committed.append([op.path_in_repo for op in operations])
+            @staticmethod
+            def list_repo_files(repo_id, *, repo_type="dataset", revision=None):
+                assert (repo_id, repo_type, revision) == ("user/demo", "dataset", None)
+                return ["old.parquet", ".gitattributes"]
+
+            @staticmethod
+            def create_repo(repo_id, repo_type="dataset", private=False, exist_ok=True):
+                assert (repo_id, repo_type, private, exist_ok) == ("user/demo", "dataset", False, True)
+                committed.append(["create_repo"])
+
+            @staticmethod
+            def create_commit(*, operations, commit_message, **kwargs):
+                committed.append([op.path_in_repo for op in operations])
 
     monkeypatch.setattr(dataset_hub, "_hub_module", lambda: Hub)
     dataset_hub.upload_dataset_folder(
@@ -581,6 +658,9 @@ def test_upload_dataset_folder_creates_private_repo(tmp_path: Path, monkeypatch)
     (root / "meta").mkdir(parents=True)
     (root / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
     created: list[dict] = []
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "hf_test_token")
 
     class Hub:
         class CommitOperationAdd:
@@ -591,23 +671,122 @@ def test_upload_dataset_folder_creates_private_repo(tmp_path: Path, monkeypatch)
             def __init__(self, path_in_repo):
                 self.path_in_repo = path_in_repo
 
-        @staticmethod
-        def create_repo(repo_id, *, repo_type, private, exist_ok):
-            created.append({"repo_id": repo_id, "repo_type": repo_type, "private": private, "exist_ok": exist_ok})
+        class HfApi:
+            def __init__(self, endpoint=None, token=None):
+                self.endpoint = endpoint
+                self.token = token
 
-        @staticmethod
-        def list_repo_files(repo_id, *, repo_type, revision=None):
-            return []
+            @staticmethod
+            def whoami():
+                return {"name": "tester"}
 
-        @staticmethod
-        def create_commit(**kwargs):
-            return None
+            @staticmethod
+            def create_repo(repo_id, *, repo_type, private, exist_ok):
+                created.append({"repo_id": repo_id, "repo_type": repo_type, "private": private, "exist_ok": exist_ok})
+
+            @staticmethod
+            def list_repo_files(repo_id, *, repo_type, revision=None):
+                return []
+
+            @staticmethod
+            def create_commit(**kwargs):
+                return None
 
     monkeypatch.setattr(dataset_hub, "_hub_module", lambda: Hub)
     dataset_hub.upload_dataset_folder("user/new-private", root, private=True)
     assert created == [{
         "repo_id": "user/new-private", "repo_type": "dataset", "private": True, "exist_ok": True,
     }]
+
+
+def test_upload_dataset_folder_skips_the_read_only_mirror(tmp_path: Path, monkeypatch) -> None:
+    """A mirror in HF_ENDPOINT redirects commits to the Hub and drops auth, so uploads must not use it."""
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_UPLOAD_ENDPOINT", raising=False)
+    monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com")
+    monkeypatch.setenv("HF_TOKEN", "hf_env_token")
+    clients: list[tuple] = []
+
+    class Hub:
+        class CommitOperationAdd:
+            def __init__(self, path_in_repo, path_or_fileobj):
+                self.path_in_repo = path_in_repo
+
+        class CommitOperationDelete:
+            def __init__(self, path_in_repo):
+                self.path_in_repo = path_in_repo
+
+        class HfApi:
+            def __init__(self, endpoint=None, token=None):
+                self.endpoint = endpoint
+                self.token = token
+                clients.append((endpoint, token))
+
+            @staticmethod
+            def whoami():
+                return {"name": "tester"}
+
+            @staticmethod
+            def list_repo_files(repo_id, *, repo_type, revision=None):
+                return []
+
+            @staticmethod
+            def create_repo(repo_id, *, repo_type, private, exist_ok):
+                return None
+
+            @staticmethod
+            def create_commit(**kwargs):
+                return None
+
+    monkeypatch.setattr(dataset_hub, "_hub_module", lambda: Hub)
+    dataset_hub.upload_dataset_folder("user/demo", root)
+    assert clients == [("https://huggingface.co", "hf_env_token")]
+
+
+def test_upload_dataset_folder_reports_rejected_token_before_committing(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text('{"fps": 15}\n', encoding="utf-8")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com")
+    monkeypatch.setenv("HF_TOKEN", "hf_revoked")
+    committed: list[str] = []
+
+    class Hub:
+        class CommitOperationAdd:
+            def __init__(self, path_in_repo, path_or_fileobj):
+                self.path_in_repo = path_in_repo
+
+        class CommitOperationDelete:
+            def __init__(self, path_in_repo):
+                self.path_in_repo = path_in_repo
+
+        class HfApi:
+            def __init__(self, endpoint=None, token=None):
+                self.endpoint = endpoint
+                self.token = token
+
+            @staticmethod
+            def whoami():
+                raise RuntimeError("401 Client Error. Invalid username or password.")
+
+            @staticmethod
+            def create_commit(**kwargs):
+                committed.append("commit")
+
+    monkeypatch.setattr(dataset_hub, "_hub_module", lambda: Hub)
+    with pytest.raises(dataset_hub.DatasetHubError) as caught:
+        dataset_hub.upload_dataset_folder("user/demo", root)
+
+    message = str(caught.value)
+    assert "https://huggingface.co" in message
+    assert "HF_TOKEN" in message and "HF_UPLOAD_ENDPOINT" in message
+    assert committed == []
 
 
 def test_upload_accepts_hub_blob_links_but_skips_external_links(tmp_path: Path, monkeypatch) -> None:

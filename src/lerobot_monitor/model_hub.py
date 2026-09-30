@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .library import is_policy_dir, list_local_models, policy_config
+from .library import (
+    assert_huggingface_write_access,
+    huggingface_write_api,
+    is_policy_dir,
+    list_local_models,
+    policy_config,
+)
 from .store import JsonStore
 
 HF_HOSTS = {"huggingface.co", "www.huggingface.co", "hf.co"}
@@ -140,8 +146,11 @@ def upload_hf_model(repo_id: str, path: str, revision: str = "") -> None:
     """Upload a local policy directory to its Hugging Face model repo."""
     hub = _hub_module()
     try:
-        hub.create_repo(repo_id, repo_type="model", exist_ok=True)
-        hub.upload_folder(
+        # Writes never use the read endpoint: a download mirror cannot host them.
+        api = huggingface_write_api(hub)
+        assert_huggingface_write_access(api)
+        api.create_repo(repo_id, repo_type="model", exist_ok=True)
+        api.upload_folder(
             repo_id=repo_id,
             repo_type="model",
             folder_path=path,

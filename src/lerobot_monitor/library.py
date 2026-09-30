@@ -14,6 +14,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import cv2
 
@@ -1001,6 +1002,100 @@ def huggingface_hub_cache() -> Path:
     if os.environ.get("HUGGINGFACE_HUB_CACHE"):
         return Path(os.environ["HUGGINGFACE_HUB_CACHE"])
     return huggingface_home() / "hub"
+
+
+HF_DEFAULT_ENDPOINT = "https://huggingface.co"
+
+# Mirrors that only serve downloads. They answer the write API with a redirect
+# to the canonical Hub, and httpx drops `Authorization` on a cross-origin
+# redirect, so every uploaded commit arrives anonymous and the Hub rejects it
+# with 401 "Invalid username or password".
+HF_READ_ONLY_MIRRORS = ("hf-mirror.com",)
+
+
+class HuggingFaceAuthError(RuntimeError):
+    """Raised when a Hub write has no usable credentials."""
+
+
+def _normalized_endpoint(value: str | None) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def huggingface_endpoint() -> str:
+    """Hub endpoint for reads: ``HF_ENDPOINT`` when set, canonical Hub otherwise."""
+    return _normalized_endpoint(os.environ.get("HF_ENDPOINT")) or HF_DEFAULT_ENDPOINT
+
+
+def huggingface_upload_endpoint() -> str:
+    """Endpoint that can accept Hub writes.
+
+    ``HF_ENDPOINT`` normally names the same Hub for reads and writes, so
+    self-hosted endpoints keep working. Read-only mirrors cannot create repos or
+    commits, so writes fall back to the canonical Hub unless ``HF_UPLOAD_ENDPOINT``
+    names a write-capable endpoint explicitly.
+    """
+    override = _normalized_endpoint(os.environ.get("HF_UPLOAD_ENDPOINT"))
+    if override:
+        return override
+    endpoint = huggingface_endpoint()
+    host = urlparse(endpoint).netloc.lower().split(":", 1)[0]
+    if any(host == mirror or host.endswith(f".{mirror}") for mirror in HF_READ_ONLY_MIRRORS):
+        return HF_DEFAULT_ENDPOINT
+    return endpoint
+
+
+def huggingface_token() -> str | None:
+    """Hub token for authenticated calls. ``HF_TOKEN`` wins over the login store."""
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        value = str(os.environ.get(name) or "").strip()
+        if value:
+            return value
+    try:
+        from huggingface_hub import get_token  # noqa: PLC0415 - optional, LeRobot brings it in
+    except ImportError:
+        return None
+    try:
+        token = str(get_token() or "").strip()
+    except Exception:  # noqa: BLE001 - an unreadable store must read as "not logged in"
+        return None
+    return token or None
+
+
+def huggingface_token_source() -> str:
+    """Where the write token comes from, for the startup banner. Never the value."""
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        if str(os.environ.get(name) or "").strip():
+            return f"env {name}"
+    return "login store" if huggingface_token() else "missing"
+
+
+def huggingface_write_api(hub_module: Any) -> Any:
+    """``HfApi`` pinned to the write endpoint and to the token used for uploads."""
+    return hub_module.HfApi(endpoint=huggingface_upload_endpoint(), token=huggingface_token())
+
+
+def assert_huggingface_write_access(api: Any) -> None:
+    """Confirm the write credentials before a transfer starts.
+
+    Raises [`HuggingFaceAuthError`] naming the endpoint and the environment
+    variables that change it, so a rejected or missing token is not reported as a
+    bare 401 from a background transfer.
+    """
+    endpoint = str(getattr(api, "endpoint", "") or huggingface_upload_endpoint())
+    if not getattr(api, "token", None):
+        raise HuggingFaceAuthError(
+            "no Hugging Face token is configured for uploads: set HF_TOKEN to a write token "
+            f"from https://huggingface.co/settings/tokens (upload endpoint {endpoint})"
+        )
+    try:
+        api.whoami()
+    except Exception as exc:  # noqa: BLE001 - every Hub failure here is user-facing
+        raise HuggingFaceAuthError(
+            f"Hugging Face rejected the upload token at {endpoint}: {exc}. "
+            "Set HF_TOKEN to a fresh write token and keep the endpoint write-capable: mirrors "
+            "such as hf-mirror.com only serve downloads, set HF_UPLOAD_ENDPOINT to override "
+            f"the write endpoint (currently {endpoint})"
+        ) from exc
 
 
 def hub_cache_repo_dir(path: str | Path | None, repo_id: str = "", *, kind: str = "dataset") -> Path | None:

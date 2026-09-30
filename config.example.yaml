@@ -2,6 +2,8 @@
 # Cameras are probed locally (DirectShow / V4L). Enable a network stream in
 # the Cameras panel; only those streams appear on the main grid.
 # Set this when the Hugging Face cache lives outside its default location.
+# HF_HOME in the environment wins over this value; uploads additionally read
+# HF_TOKEN, HF_ENDPOINT (downloads) and HF_UPLOAD_ENDPOINT (writes).
 # huggingface_home: D:/Cache/huggingface
 
 server:

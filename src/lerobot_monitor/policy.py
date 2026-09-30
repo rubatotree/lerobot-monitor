@@ -240,6 +240,9 @@ class ActionChunk:
     model_wait_ms: float = 0.0
     model_load_ms: float = 0.0
     compute_ms: float = 0.0
+    # Steps the policy generated before a debug request truncated them; None when the
+    # producing path cannot know (sequential fallback, or an older cloud worker).
+    generated_steps: int | None = None
 
 
 def resolve_cached_policy_path(path: str, revision: str = "") -> str | None:
@@ -1079,7 +1082,8 @@ def predict_action_chunk(
         if callable(chunk_method):
             try:
                 raw_chunk = chunk_method(prepared)
-                chunk = _as_action_chunk_tensor(raw_chunk)[:, :chunk_size, :]
+                full_chunk = _as_action_chunk_tensor(raw_chunk)
+                chunk = full_chunk[:, :chunk_size, :]
                 actions = [
                     _action_pose(loaded.postprocessor(chunk[:, index, :]), loaded, joints)
                     for index in range(chunk.shape[1])
@@ -1090,6 +1094,7 @@ def predict_action_chunk(
                         strategy="policy_chunk",
                         degraded=False,
                         warnings=warnings,
+                        generated_steps=int(full_chunk.shape[1]),
                     )
                 warnings.append("policy returned an empty action chunk")
             except Exception as exc:  # noqa: BLE001

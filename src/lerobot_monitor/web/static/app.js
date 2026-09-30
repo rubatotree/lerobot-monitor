@@ -6890,6 +6890,55 @@ function renderChunkEvaluation(evaluation) {
   host.classList.remove("hidden");
 }
 
+function clearChunkTiming() {
+  const host = $("dbg-timing");
+  if (!host) return;
+  host.classList.add("hidden");
+  host.replaceChildren();
+}
+
+function renderChunkTiming(result) {
+  const host = $("dbg-timing");
+  if (!host) return;
+  const api = window.DebugTiming;
+  const timing = api && typeof api.buildDebugTiming === "function" ? api.buildDebugTiming(result) : null;
+  if (!timing || !timing.hasTiming) {
+    clearChunkTiming();
+    return;
+  }
+  const track = document.createElement("div");
+  track.className = "debug-timing-track";
+  track.setAttribute("aria-label", `inference ${api.formatTimingMs(timing.latencyMs)} · ${timing.caption}`);
+  timing.segments.forEach((segment) => {
+    const bar = document.createElement("span");
+    bar.className = `debug-timing-seg is-${segment.key}`;
+    bar.dataset.kind = segment.key;
+    bar.style.width = `${segment.pct.toFixed(3)}%`;
+    bar.title = `${segment.label} ${api.formatTimingMs(segment.ms)}`;
+    track.appendChild(bar);
+  });
+  const chips = document.createElement("div");
+  chips.className = "debug-timing-chips";
+  timing.chips.forEach((chip) => {
+    const item = document.createElement("span");
+    item.className = `debug-timing-chip is-${chip.key}`;
+    const dot = document.createElement("span");
+    dot.className = "debug-timing-dot";
+    const name = document.createElement("span");
+    name.textContent = chip.label;
+    const value = document.createElement("span");
+    value.className = "debug-timing-value";
+    value.textContent = chip.text;
+    item.append(dot, name, value);
+    chips.appendChild(item);
+  });
+  const note = document.createElement("p");
+  note.className = "debug-timing-note";
+  note.textContent = timing.caption;
+  host.replaceChildren(track, chips, note);
+  host.classList.remove("hidden");
+}
+
 async function runDebugInference() {
   const source = debugSourceInfo();
   if (!source) throw new Error("open an episode or snapshot first");
@@ -6903,6 +6952,7 @@ async function runDebugInference() {
   const run = $("btn-dbg-run");
   if (run) run.disabled = true;
   clearChunkEvaluation();
+  clearChunkTiming();
   setDebugStatus("running inference…");
   try {
     const reference = buildDebugReference(source.overlayStart, fields.chunk_size, fields.fps);
@@ -6923,6 +6973,7 @@ async function runDebugInference() {
         ? " · no reference command in a snapshot"
         : " · no reference command for this window";
     renderChunkEvaluation(reference.length ? result.evaluation : null);
+    renderChunkTiming(result);
     const modelNote = result.cache_hit
       ? "resident model reused"
       : `model load ${(Number(result.model_load_ms || 0) / 1000).toFixed(1)} s`;
@@ -6932,6 +6983,7 @@ async function runDebugInference() {
     localLog(`debug inference: ${result.strategy} · ${modelNote} · ${result.actions.length} steps · ${Number(result.latency_ms).toFixed(0)} ms`);
   } catch (err) {
     clearChunkEvaluation();
+    clearChunkTiming();
     setDebugStatus(err.message || String(err), true);
     throw err;
   } finally {

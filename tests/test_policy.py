@@ -208,6 +208,7 @@ def test_native_chunk_path_maps_every_timestep(fake_lerobot) -> None:
     assert result.degraded is False
     assert result.warnings == []
     assert len(result.actions) == 4
+    assert result.generated_steps == 4
     assert sorted(result.actions[0]) == sorted(observation_joints())
     # Row 0 maps to the first six raw values in dataset-feature order.
     assert result.actions[0]["shoulder_pan"] == pytest.approx(0.0)
@@ -226,6 +227,7 @@ def test_native_chunk_is_truncated_to_chunk_size(fake_lerobot) -> None:
     assert result.strategy == "policy_chunk"
     assert len(result.actions) == 3
     assert result.actions[2]["shoulder_pan"] == pytest.approx(12.0)
+    assert result.generated_steps == 9
 
 
 def test_temporal_ensemble_actions_are_projected_without_extra_inference(fake_lerobot) -> None:

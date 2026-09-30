@@ -160,7 +160,18 @@ def test_debug_chunk_resets_and_returns_cpu_absolute_and_raw(backend: NativePoli
     result = backend.infer(request(chunk_size=1))
     assert result["raw_actions"] == [[1, 2]]
     assert result["actions"] == [[11, 12]]
+    assert result["generated_steps"] == 2
     assert backend.test_calls == ["reset", {}]
+
+
+def test_select_action_and_rtc_do_not_report_generated_steps(
+    backend: NativePolicyBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The rtc prefix helper imports the sibling lerobot package; the monitor venv lacks it.
+    monkeypatch.setattr(backend, "_rtc_prefix", lambda payload, device: None)
+    for mode in ("select_action", "rtc_chunk"):
+        backend.session["mode"] = mode
+        assert "generated_steps" not in backend.infer(request(chunk_size=1))
 
 
 def test_rtc_reanchors_against_cached_raw_state(backend: NativePolicyBackend, monkeypatch: pytest.MonkeyPatch) -> None:

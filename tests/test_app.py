@@ -1446,6 +1446,7 @@ def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatc
             model_wait_ms=0.8,
             model_load_ms=0.0,
             compute_ms=12.3,
+            generated_steps=9,
         )
     )
 
@@ -1476,6 +1477,7 @@ def test_debug_infer_returns_chunk_and_releases_lease(tmp_path: Path, monkeypatc
     assert body["model_wait_ms"] == 0.8
     assert body["model_load_ms"] == 0.0
     assert body["compute_ms"] == 12.3
+    assert body["generated_steps"] == 9
     assert [row["t_s"] for row in body["actions"]] == [0.1, 0.2]
     assert body["actions"][1]["joints"] == {"gripper": 2.0}
     assert body["source"]["id"] == "v1"

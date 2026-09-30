@@ -2743,6 +2743,70 @@ select {
   font-size: 10px;
 }
 
+.debug-timing {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.debug-timing.hidden { display: none; }
+.debug-timing-track {
+  display: flex;
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--surface);
+}
+.debug-timing-seg { display: block; height: 100%; min-width: 2px; }
+.debug-timing-seg.is-wait { background: var(--accent-dim); }
+.debug-timing-seg.is-load { background: var(--accent); }
+.debug-timing-seg.is-compute { background: var(--blue); }
+.debug-timing-seg.is-other { background: var(--faint); opacity: 0.5; }
+.debug-timing-seg.is-chunk { background: var(--ok); }
+.debug-timing-seg.is-ghost {
+  min-width: 3px;
+  border-left: 1px dashed var(--ok);
+  background: repeating-linear-gradient(135deg, rgba(93, 186, 154, 0.34) 0 3px, rgba(93, 186, 154, 0.08) 3px 6px);
+}
+.debug-timing-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 6px;
+}
+.debug-timing-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--faint);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.debug-timing-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--faint);
+  flex: none;
+}
+.debug-timing-chip.is-wait .debug-timing-dot { background: var(--accent-dim); }
+.debug-timing-chip.is-load .debug-timing-dot { background: var(--accent); }
+.debug-timing-chip.is-compute .debug-timing-dot { background: var(--blue); }
+.debug-timing-value {
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+}
+.debug-timing-note {
+  margin-top: 6px;
+  color: var(--faint);
+  font-size: 10px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+}
+
 .row-actions {
   display: flex;
   flex-wrap: wrap;

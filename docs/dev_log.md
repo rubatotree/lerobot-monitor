@@ -1,5 +1,13 @@
 # Dev log
 
+## 2026-09-30：Debug 面板推理用时条（含未截取长度）
+
+- 诉求：Debug 页签的推理阶段要有一条条形用时统计，横跨「发起推理 → 动作块结束」，并标出动作块未被 `chunk_size` 截取时本应有的长度。
+- 后端：`ActionChunk` 追加字段 `generated_steps`（截断前策略实际生成的步数；追加到 dataclass 末尾，避免破坏位置参数调用）。本地 `predict_action_chunk` 先保留完整张量再切 `chunk_size`；云 worker 的 `debug_chunk` 在切片前记长度，且只在 debug 模式回传 `generated_steps`（`select_action`/`rtc_chunk` 响应不变）；`MonitorCloudClient.debug_infer` 映射该字段（旧服务器无此键则降级为 `None`）；`/api/debug/infer` 返回体透出。
+- 前端：新增纯计算模块 `web/static/debug-timing.js`（`buildDebugTiming`/`formatTimingMs`）——wait/load/compute/other 以 `latency_ms` 为上限做钳制（四段之和恒等于整段延迟），chunk 段与幽灵段按请求里的 Chunk FPS 折算；`app.js` 新增 `renderChunkTiming`/`clearChunkTiming`（函数声明，验证脚本直接调用），在 Run inference 开始/成功/失败三处接上；`styles.css` 新增 `.debug-timing*`（全主题变量配色：wait 暗紫、load 紫、compute 蓝、other 灰、chunk 绿、would-be 绿斜纹；10px 条高、3px 圆角、chips 自动换行、`min-width: 2px` 保证极小段可见）；`app.js`/`styles.css` 资源版本升到 `20260930-debug-timing`，并新增 `debug-timing.js` 模块脚本。
+- 验证：`scripts/test-debug-timing.mjs` 7/7 通过（冷加载分段、常驻模型 wait/compute 分离、噪声钳制、缺 fps、未截断无幽灵段、空输入、时长格式化）；新增 `scripts/verify-debug-timing.cjs`（真实服务 + Playwright + 合成结果直调渲染），1440×900 与 390×844 共 22/22 通过：段序与占比（load 38.3% / chunk 16.3% / would-be 34.7%）、chips 数值、note 文案、卡片不溢出、清空后隐藏，并输出截图人工核对；同级 venv 全套 556 passed / 1 skipped（2 项 HF 缓存扫描失败为本机环境既有）；改动 Python 文件 ruff 0 新增。
+- 边界：云端幽灵段需服务器部署本构建，旧构建只显示到实际 chunk 结尾；`sequential_select_action` 回退路径不写 `generated_steps`（该路径本就只按 `chunk_size` 逐步生成，不存在「未截取长度」）。
+
 ## 2026-09-30：泳道内拆分云端上传/下载/计算耗时
 
 - 诉求：斜线泳道的时间 profiling 要把数据上传、下载单独标出来，不能全部算作 inference 时间。

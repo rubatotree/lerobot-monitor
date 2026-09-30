@@ -709,6 +709,7 @@ class MonitorCloudClient:
             compute_started = time.perf_counter()
             result = session.infer({**joints, **images_rgb}, chunk_size=chunk_size)
             actions = _poses(result, joints)
+            generated = result.get("generated_steps")
             return ActionChunk(
                 actions=actions,
                 strategy="cloud_policy_chunk",
@@ -718,6 +719,9 @@ class MonitorCloudClient:
                 model_wait_ms=wait_ms,
                 model_load_ms=wait_ms,
                 compute_ms=(time.perf_counter() - compute_started) * 1000,
+                generated_steps=(
+                    int(generated) if isinstance(generated, int) and generated > 0 else None
+                ),
             )
         finally:
             session.close()

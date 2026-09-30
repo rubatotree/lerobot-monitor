@@ -2003,6 +2003,7 @@ def create_app(config: MonitorConfig, *, apply_prefix: bool = True) -> FastAPI:
             "model_wait_ms": round(chunk.model_wait_ms, 3),
             "model_load_ms": round(chunk.model_load_ms, 3),
             "compute_ms": round(chunk.compute_ms, 3),
+            "generated_steps": chunk.generated_steps,
             "actions": actions,
             "evaluation": evaluation,
             "warnings": chunk.warnings,

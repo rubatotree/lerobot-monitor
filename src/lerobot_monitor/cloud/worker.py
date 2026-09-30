@@ -318,6 +318,7 @@ class NativePolicyBackend:
                 if raw.ndim != 3 or raw.shape[0] != 1:
                     raise ValueError("policy chunk must have shape [1,T,A]")
                 if mode == "debug_chunk":
+                    generated_steps = int(raw.shape[1])
                     raw = raw[:, :payload["chunk_size"], :]
                 original = raw.clone()
                 processed = self.loaded.postprocessor(raw)
@@ -336,6 +337,9 @@ class NativePolicyBackend:
                   "shape": [len(actions), self.metadata["action_dim"]], "compute_seconds": time.monotonic() - started}
         if mode == "select_action":
             result["queued_actions"] = queued_actions
+        elif mode == "debug_chunk":
+            # Steps the policy generated before the request's chunk_size truncated them.
+            result["generated_steps"] = generated_steps
         return result
 
     def _queued_actions(self, torch: Any) -> list[list[float]]:

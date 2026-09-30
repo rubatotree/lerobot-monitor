@@ -504,6 +504,45 @@ def test_cloud_inference_reports_transfer_and_compute_stages() -> None:
         session.close()
 
 
+def test_cloud_debug_infer_keeps_the_generated_horizon(tmp_path: Path) -> None:
+    """A debug chunk reports the steps the worker generated before ``chunk_size`` cut them."""
+
+    class Session:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self.payload = payload
+            self.closed = False
+
+        def infer(self, _observation: Any, **_kwargs: Any) -> dict[str, Any]:
+            return self.payload
+
+        def close(self) -> None:
+            self.closed = True
+
+    rows = [[1.0, 2.0], [3.0, 4.0]]
+    base = {"actions": rows, "raw_actions": rows, "action_keys": ["shoulder_pan.pos", "gripper.pos"]}
+    for index, (payload, expected) in enumerate(
+        (({**base, "generated_steps": 50}, 50), (base, None))
+    ):
+        session = Session(payload)
+        client = MonitorCloudClient(tmp_path / f"case{index}", manager=FakeManager())  # type: ignore[arg-type]
+        client.open_session = MagicMock(return_value=session)
+        try:
+            chunk = client.debug_infer(
+                "cloud://host/model",
+                task="pick",
+                state_keys=["shoulder_pan"],
+                extra={},
+                joints={"shoulder_pan": 0.0, "gripper": 0.0},
+                images_rgb={},
+                chunk_size=16,
+            )
+        finally:
+            client.close()
+        assert chunk.generated_steps == expected
+        assert len(chunk.actions) == len(rows)
+        assert session.closed is True
+
+
 def test_submit_load_returns_without_waiting_for_the_job(tmp_path: Path) -> None:
     """A cold load must not hold the request open while the job runs."""
     client = MonitorCloudClient(tmp_path, manager=FakeManager())  # type: ignore[arg-type]

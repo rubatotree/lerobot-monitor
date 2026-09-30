@@ -1771,20 +1771,20 @@ main.episodes-closed {
   border: 1px solid var(--line);
 }
 #replay.hidden { display: none; }
+/* The record bar owns a row of the camera grid instead of covering the
+   windows: #cameras switches to "auto + N equal rows" while it is open. */
+#cameras.record-open { grid-template-rows: auto repeat(var(--cr, 1), minmax(0, 1fr)); }
+#cameras.record-open > .record-transport { grid-column: 1 / -1; grid-row: 1; }
+#cameras.record-open > .camera-empty { grid-row: 2 / -1; }
 .record-transport {
-  position: absolute;
-  z-index: 12;
-  top: 8px;
-  left: 8px;
-  right: 8px;
   display: grid;
   gap: 7px;
   padding: 10px 12px;
+  min-width: 0;
   border: 1px solid #79423f;
   border-radius: 8px;
   background: rgba(17, 20, 30, 0.96);
   color: var(--text);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.32);
   font-size: 12px;
 }
 .record-transport.hidden, .record-transport .hidden { display: none; }
@@ -1802,7 +1802,7 @@ main.episodes-closed {
 .record-save-status { margin: 0; color: var(--muted); line-height: 1.4; overflow-wrap: anywhere; }
 .record-save-status.error { color: #f29aa6; }
 @media (max-width: 700px) {
-  .record-transport { top: 4px; left: 4px; right: 4px; padding: 8px; }
+  .record-transport { padding: 8px; }
   .record-title { max-width: 50%; }
   .record-controls button { min-height: 44px; flex: 1 1 auto; }
   #record-time { width: 100%; margin-left: 0; }

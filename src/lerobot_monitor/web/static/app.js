@@ -452,7 +452,12 @@ async function recordControl(action) {
 }
 
 function renderRecordTransport(incoming) {
-  if (!incoming && liveRecord?.phase === "preparing" && last?.task?.pending !== "record_start") liveRecord = null;
+  const recordMode = (last?.mode || "") === "record";
+  const pendingStart = last?.task?.pending === "record_start";
+  // The bar belongs to the record task. The server keeps reporting the last
+  // session (finalizing/saved/error) after the task stops, so leaving record
+  // mode has to clear it, otherwise it stays over the camera grid forever.
+  if (!incoming && liveRecord && !recordMode && !pendingStart) liveRecord = null;
   if (incoming && (incoming.phase === "preparing" || !liveRecord || incoming.session_id !== liveRecord.session_id || incoming.version >= liveRecord.version)) {
     if (!liveRecord || incoming.session_id !== liveRecord.session_id) lastRecordSaved = -1;
     liveRecord = incoming;
@@ -460,14 +465,15 @@ function renderRecordTransport(incoming) {
   const record = liveRecord;
   const panel = $("record-transport");
   if (!panel) return;
-  const preparing = last?.task?.pending === "record_start" && (!record || record.phase === "preparing" || ["completed", "error"].includes(record.phase));
+  const preparing = pendingStart && (!record || record.phase === "preparing" || ["completed", "error"].includes(record.phase));
   const frozen = preparing || !!record && ["resetting", "recording", "finalizing"].includes(record.phase);
   $("record-panel")?.querySelectorAll("input, select").forEach((input) => { input.disabled = frozen; });
   $("cam-rows")?.querySelectorAll("input, select, button").forEach((input) => { input.disabled = frozen; });
   if ($("hw-enc-threads")) $("hw-enc-threads").disabled = frozen;
   if ($("btn-hdr-scan")) $("btn-hdr-scan").disabled = frozen;
-  const visible = (!!record || preparing) && !replayActive && !["teleop", "rollout"].includes(last?.mode);
+  const visible = (recordMode || pendingStart) && !replayActive;
   panel.classList.toggle("hidden", !visible);
+  $("cameras")?.classList.toggle("record-open", visible);
   if (preparing) {
     const percent = record?.total > 0 ? Math.round(100 * record.done / record.total) : 0;
     $("record-title").textContent = record?.dataset_id || "Selected Dataset";

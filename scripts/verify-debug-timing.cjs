@@ -93,16 +93,16 @@ async function stopChild(child) {
 
 const COLD = {
   fps: 30,
-  latency_ms: 1600,
-  model_wait_ms: 1250,
-  model_load_ms: 1250,
-  compute_ms: 300,
+  latency_ms: 2000,
+  model_wait_ms: 800,
+  model_load_ms: 800,
+  compute_ms: 900,
   actions: Array.from({ length: 16 }, () => ({ gripper: 0 })),
   generated_steps: 50,
   stage_ms: {
     cloud_encode: 10,
     cloud_upload: 250,
-    cloud_compute: 250,
+    cloud_compute: 300,
     cloud_download: 20,
   },
   evaluation: {
@@ -217,20 +217,27 @@ async function runViewport(browser, viewport) {
   const cold = await timingState(page);
   const kinds = cold.segs.map((segment) => segment.kind).join(",");
   check(
-    `${viewport.name} cold run draws wait/load/compute plus the hatched tail`,
-    !cold.hidden && kinds === "load,compute,other,chunk,ghost",
+    `${viewport.name} bar carries gpu compute, chunk and the hatched tail only`,
+    !cold.hidden && kinds === "compute,chunk,ghost",
     kinds,
   );
   const share = (kind) => cold.segs.find((segment) => segment.kind === kind)?.pct ?? 0;
-  check(`${viewport.name} load leg keeps its share`, Math.abs(share("load") - 38.27) < 1.5, String(share("load")));
-  check(`${viewport.name} chunk leg keeps its share`, Math.abs(share("chunk") - 16.33) < 1.5, String(share("chunk")));
-  check(`${viewport.name} would-be tail keeps its share`, Math.abs(share("ghost") - 34.69) < 1.5, String(share("ghost")));
+  check(`${viewport.name} compute leg keeps its share`, Math.abs(share("compute") - 15.25) < 1.5, String(share("compute")));
+  check(`${viewport.name} chunk leg keeps its share`, Math.abs(share("chunk") - 27.12) < 1.5, String(share("chunk")));
+  check(`${viewport.name} would-be tail keeps its share`, Math.abs(share("ghost") - 57.63) < 1.5, String(share("ghost")));
   check(
-    `${viewport.name} chips separate inference, load and compute`,
-    cold.chips.inference === "1.60 s"
-      && cold.chips.load === "1.25 s"
+    `${viewport.name} load and transfer stay out of the bar`,
+    cold.segs.every((segment) => !["load", "wait", "upload", "download", "other"].includes(segment.kind)),
+    kinds,
+  );
+  check(
+    `${viewport.name} chips split inference into gpu, transfer and chores`,
+    cold.chips.inference === "1.20 s"
       && cold.chips.compute === "300 ms"
-      && cold.chips.other === "50 ms",
+      && cold.chips.transfer === "280 ms"
+      && cold.chips.other === "620 ms"
+      && cold.chips.chunk === "533 ms"
+      && cold.chips.load === undefined,
     JSON.stringify(cold.chips),
   );
   check(
@@ -255,12 +262,18 @@ async function runViewport(browser, viewport) {
   await toggleSection(page, "timing");
   const timingSection = (await profileState(page)).sections.find((entry) => entry.section === "timing");
   check(
-    `${viewport.name} timing section lists bar-consistent rows`,
+    `${viewport.name} timing section nests compute and chores under inference`,
     timingSection?.open === true
-      && timingSection.rows.map((row) => row.kind).join(",") === "load,compute,other,inference,chunk,ghost"
-      && timingSection.rows[3].value === "1.60 s"
-      && /16 \/ 50 steps/.test(timingSection.rows[4].detail)
-      && /34 more steps/.test(timingSection.rows[5].detail),
+      && timingSection.meta === "1.20 s"
+      && timingSection.rows.map((row) => row.kind).join(",") === "inference,compute,encode,upload,download,other,chunk,ghost,load"
+      && timingSection.rows[0].value === "1.20 s"
+      && timingSection.rows[0].detail === "excludes load"
+      && timingSection.rows[1].detail === "gpu"
+      && timingSection.rows[1].value === "300 ms"
+      && /16 \/ 50 steps/.test(timingSection.rows[6].detail)
+      && /34 more steps/.test(timingSection.rows[7].detail)
+      && timingSection.rows[8].kind === "load"
+      && timingSection.rows[8].value === "800 ms",
     JSON.stringify(timingSection),
   );
 
@@ -296,8 +309,12 @@ async function runViewport(browser, viewport) {
   const warm = await timingState(page);
   const warmKinds = warm.segs.map((segment) => segment.kind).join(",");
   check(
-    `${viewport.name} warm run drops load and hatched legs`,
-    warmKinds === "wait,compute,other,chunk" && warm.chips.wait === "30 ms",
+    `${viewport.name} warm run keeps compute plus chunk only`,
+    warmKinds === "compute,chunk"
+      && warm.chips.inference === "370 ms"
+      && warm.chips.compute === "350 ms"
+      && warm.chips.other === "20 ms"
+      && warm.chips.transfer === undefined,
     `${warmKinds} | ${JSON.stringify(warm.chips)}`,
   );
   const warmProfile = await profileState(page);

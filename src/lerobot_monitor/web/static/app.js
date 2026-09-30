@@ -6986,15 +6986,18 @@ function renderChunkTiming(result) {
   profile.append(debugProfileSection(
     "timing",
     "Timing",
-    api.formatTimingMs(timing.latencyMs),
-    timing.detailRows.map((row) => debugProfileRow({
-      key: row.key,
-      label: row.key,
-      text: row.text,
-      detail: row.detail,
-      pct: row.pct,
-      color: row.key === "chunk" || row.key === "ghost" ? "var(--ok)" : undefined,
-    })),
+    api.formatTimingMs(timing.inferenceMs),
+    timing.detailRows.map((row) => {
+      const item = debugProfileRow({
+        key: row.key,
+        label: row.key,
+        text: row.text,
+        detail: row.detail,
+        pct: row.pct,
+      });
+      if (row.depth === 1) item.classList.add("is-child");
+      return item;
+    }),
   ));
   if (timing.stageRows.length) {
     profile.append(debugProfileSection(

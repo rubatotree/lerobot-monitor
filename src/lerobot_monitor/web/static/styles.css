@@ -2759,10 +2759,7 @@ select {
   background: var(--surface);
 }
 .debug-timing-seg { display: block; height: 100%; min-width: 2px; }
-.debug-timing-seg.is-wait { background: var(--accent-dim); }
-.debug-timing-seg.is-load { background: var(--accent); }
 .debug-timing-seg.is-compute { background: var(--blue); }
-.debug-timing-seg.is-other { background: var(--faint); opacity: 0.5; }
 .debug-timing-seg.is-chunk { background: var(--ok); }
 .debug-timing-seg.is-ghost {
   min-width: 3px;
@@ -2789,9 +2786,11 @@ select {
   background: var(--faint);
   flex: none;
 }
-.debug-timing-chip.is-wait .debug-timing-dot { background: var(--accent-dim); }
-.debug-timing-chip.is-load .debug-timing-dot { background: var(--accent); }
+.debug-timing-chip.is-inference .debug-timing-dot { background: var(--accent); }
 .debug-timing-chip.is-compute .debug-timing-dot { background: var(--blue); }
+.debug-timing-chip.is-transfer .debug-timing-dot { background: #e0a35c; }
+.debug-timing-chip.is-other .debug-timing-dot { background: var(--faint); }
+.debug-timing-chip.is-chunk .debug-timing-dot { background: var(--ok); }
 .debug-timing-value {
   color: var(--text);
   font-family: "IBM Plex Mono", ui-monospace, monospace;
@@ -2861,13 +2860,25 @@ select {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-.debug-profile-row[data-kind="wait"] { --row-tint: rgba(92, 82, 184, 0.22); }
-.debug-profile-row[data-kind="load"] { --row-tint: rgba(139, 124, 247, 0.22); }
-.debug-profile-row[data-kind="compute"] { --row-tint: rgba(110, 168, 255, 0.22); }
+.debug-profile-row.is-child .debug-profile-label { padding-left: 8px; }
+.debug-profile-row[data-kind="inference"] { --row-tint: rgba(139, 124, 247, 0.12); }
+.debug-profile-row[data-kind="compute"] { --row-tint: rgba(110, 168, 255, 0.24); }
+.debug-profile-row[data-kind="encode"] { --row-tint: rgba(145, 201, 232, 0.20); }
+.debug-profile-row[data-kind="upload"] { --row-tint: rgba(224, 163, 92, 0.24); }
+.debug-profile-row[data-kind="download"] { --row-tint: rgba(201, 139, 212, 0.24); }
 .debug-profile-row[data-kind="other"] { --row-tint: rgba(133, 129, 156, 0.18); }
-.debug-profile-row[data-kind="inference"] { --row-tint: rgba(139, 124, 247, 0.10); }
 .debug-profile-row[data-kind="chunk"],
-.debug-profile-row[data-kind="ghost"] { --row-tint: rgba(93, 186, 154, 0.22); }
+.debug-profile-row[data-kind="ghost"] { --row-tint: rgba(93, 186, 154, 0.24); }
+.debug-profile-row[data-kind="load"] { --row-tint: rgba(92, 82, 184, 0.22); }
+.debug-profile-row[data-kind="wait"] { --row-tint: rgba(92, 82, 184, 0.14); }
+.debug-profile-row[data-kind="compute"] .debug-profile-dot { background: var(--blue); }
+.debug-profile-row[data-kind="encode"] .debug-profile-dot { background: #91c9e8; }
+.debug-profile-row[data-kind="upload"] .debug-profile-dot { background: #e0a35c; }
+.debug-profile-row[data-kind="download"] .debug-profile-dot { background: #c98bd4; }
+.debug-profile-row[data-kind="inference"] .debug-profile-dot { background: var(--accent); }
+.debug-profile-row[data-kind="chunk"] .debug-profile-dot,
+.debug-profile-row[data-kind="ghost"] .debug-profile-dot { background: var(--ok); }
+.debug-profile-row[data-kind="load"] .debug-profile-dot { background: var(--accent-dim); }
 
 .row-actions {
   display: flex;

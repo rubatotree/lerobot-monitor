@@ -1,5 +1,14 @@
 # Dev log
 
+## 2026-09-30：Debug 时间条只留 GPU 计算，LOAD 与传输移出
+
+- 诉求：LOAD 不该算进 inference 时间、也不该出现在时间条里（只在下方 timing 表）；时间条的 compute 只含 GPU 时间，上传/下载与其它杂务不得混入。
+- 语义（全部在前端派生，后端无改动）：`inference = latency − (load + wait)`——会话/部署等待在请求之前发生，先被减去，不再计入 inference；`compute`（条内）= 云端 `stage_ms.cloud_compute`（无 stage 时退化为本地 `compute_ms`），并按 `inference − 传输` 上限钳制；`transfer = enc + up + down`；`other = inference − transfer − compute`，三者在表里对得上 `inference`。时间条现在只画 `compute / chunk / ghost`，`load`、`wait`、`upload`、`download`、`other` 一律不进条。
+- 明细表改为层级占比：`inference`（占整段延迟，标注 `excludes load`）打头，其下缩进列出 `compute (gpu) / encode / upload / download / other`（各自占 inference），随后是 `chunk`、`ghost`，最后是条外的 `load (session)`、`wait`；chips 改为 `inference · gpu · transfer · other · chunk`（不再出现 load）。`CLOUD LEGS` 分区与参考对比分区保持不变。
+- 样式：条内删掉 `is-wait/is-load/is-other` 配色（已无对应段），刷新 chip 圆点为 inference/gpu/transfer/other/chunk，明细行补齐 `encode/upload/download/load/wait` 的底纹与圆点、子行缩进 8px；资源版本升到 `20260930-debug-gpu-only`。
+- 验证：`scripts/test-debug-timing.mjs` 重写为 11 项（条内只有 compute/chunk/ghost、inference 减掉 load、compute 只取 GPU、inflated compute 被钳制、层级占比与子行和等于 100%、本地无传输段、缺 fps/未截断/空输入）全部通过；`scripts/verify-debug-timing.cjs` 两视口 34/34 通过（含「load 与传输不在条内」「chips 拆成 gpu/transfer/other」「timing 子行序与 load 值 800 ms」），并输出截图人工核对层级与底纹；本轮无 Python 改动。
+- 边界：云端没有 stage 分段（旧服务器）时 `compute` 退化为 `compute_ms` 并按 `inference` 上限钳制，此时上传/下载无法单列（显示为 `other` 的一部分）；本地模型本来就没有传输段，`transfer` 恒为 0。
+
 ## 2026-09-30：Debug 时间条下方的可折叠 profile 明细
 
 - 诉求：时间条下方显示详细 profile 信息；范围与形态定为「时序分段 + 云端网络分段 + 逐关节误差」，且可折叠、默认收起。

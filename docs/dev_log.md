@@ -1,5 +1,13 @@
 # Dev log
 
+## 2026-09-30：Debug 时间条按真实次序铺满推理各段，明细改为 LOAD → INFERENCE → CHUNK
+
+- 诉求：占比条此前只画 compute/chunk/ghost，上传/下载/杂务没有对应的段；明细表要严格按时间顺序（load → inference → chunk），inference 之下再按 encode → upload → compute → download → other 细分。
+- 语义（仍全部在前端派生，后端零改动）：条的分母换成 `barMs = inference + chunk + would-be`，段集合与顺序由 `DEBUG_TIMING_SEGMENTS` 固定为 `encode/upload/compute/download/other/chunk/ghost`；`load/wait` 依旧不进条，`inference = latency − session` 不变，`sessionMs` 为新增字段（`load/wait` 继续按模型加载与租约等待拆分导出）。明细行改为 `load(session)` → `inference(excludes load)` → 缩进的 `encode/upload/compute(gpu)/download/other` → `chunk` → `ghost`，每行占比统一以 `barMs` 为分母（子行直接复用条段的占比，与条严格对齐，子行占比之和恒等于 inference 行）。
+- 样式：段配色新增 `is-encode/#91c9e8`、`is-upload/#e0a35c`、`is-download/#c98bd4`、`is-other/var(--faint)@0.5`；chip 圆点同步补齐并删掉 `is-transfer`；明细行 `[data-kind="wait"]` 规则删除（不再产出 wait 行）；资源版本升到 `20260930-debug-timeline`。`CLOUD LEGS`、`REFERENCE` 分区与后端口径未动。
+- 验证：`scripts/test-debug-timing.mjs` 重写 5 项（条序与占比、chips 逐段、明细行序/层级/分母、本地无传输段、钳制用例行序）后 11/11 通过；`scripts/verify-debug-timing.cjs` 两视口 38/38 通过（新增「条内逐段次序与占比」「session 不进条」「chips 列全腿」），截图滚动改为把卡片顶部 160px 定格在视口内；人工核对 1440×900 与 390×844 两张图：条序 enc→up→gpu→down→other→chunk→ghost、chips 换行不溢出、明细表 load→inference→子段→chunk→ghost。
+- 边界：旧服务器不带 `stage_ms` 时只剩 compute/other 两段（本地模型同样没有传输段，`transfer` 恒为 0）；`download` 这类 10-20 ms 的段在 ~300px 的条上只有 2px（CSS `min-width`），是真实比例，不做放大。
+
 ## 2026-09-30：chore 整理：死文件与两个「一直失败」的用例
 
 - 删除 `src/lerobot_monitor/cloud/transfer.py`：0 字节、2026-09-28 写入后从未被任何代码 import（全仓库 grep `cloud.transfer` / `from .transfer` 无命中），是遗留空文件；顺手清掉了先前被句柄占住的空目录 `.pytest-tmp/cloud_rtc_lanes`。

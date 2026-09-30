@@ -1,11 +1,17 @@
-// Pure timing math for the Debug panel's inference bar; no DOM access.
+// Pure timing math for the Debug panel's timeline bar; no DOM access.
 //
-// The bar carries model execution only: GPU compute, then the action chunk's own play
-// time, then — when the request truncated the chunk — a hatched tail for the steps the
-// policy would also have produced. Session/deploy wait and the transfer legs are never
-// charged to inference here; they stay in the detail rows below the bar.
+// One bar walks the request the way the wall clock does: the observation legs
+// (encode/upload/GPU compute/download), then the client-side chores, then the action
+// chunk's own play time and — when the request truncated the chunk — a hatched tail
+// for the steps the policy would also have produced. Opening the session (deploy /
+// model load) happens before the request and never enters the bar; it keeps its own
+// row above inference in the detail table.
 export const DEBUG_TIMING_SEGMENTS = [
+  { key: "encode", label: "encode", kind: "time" },
+  { key: "upload", label: "upload", kind: "time" },
   { key: "compute", label: "compute", kind: "time" },
+  { key: "download", label: "download", kind: "time" },
+  { key: "other", label: "other", kind: "time" },
   { key: "chunk", label: "chunk", kind: "chunk" },
   { key: "ghost", label: "would-be", kind: "ghost" },
 ];
@@ -30,12 +36,12 @@ export function buildDebugTiming(result = {}) {
   const generatedSteps = generated > steps ? generated : null;
   const fps = num(result.fps);
   const latency = num(result.latency_ms);
-  // Opening the session (which may include the model load) precedes the request: it is
-  // reported on its own and subtracted, so it can never inflate the inference number.
-  const waitTotal = Math.min(num(result.model_wait_ms), latency);
-  const load = Math.min(num(result.model_load_ms), waitTotal);
-  const wait = waitTotal - load;
-  const inference = Math.max(0, latency - waitTotal);
+  // Opening the session (deploy / model load) precedes the request: it is measured on
+  // its own and subtracted, so it can never inflate the inference number.
+  const sessionMs = Math.min(num(result.model_wait_ms), latency);
+  const load = Math.min(num(result.model_load_ms), sessionMs);
+  const wait = sessionMs - load;
+  const inference = Math.max(0, latency - sessionMs);
   const stageMs = result.stage_ms && typeof result.stage_ms === "object" ? result.stage_ms : {};
   const stage = (name) => num(stageMs[name]);
   const encode = stage("cloud_encode");
@@ -52,13 +58,11 @@ export function buildDebugTiming(result = {}) {
   const chunkMs = fps > 0 ? (steps / fps) * 1000 : 0;
   const ghostMs = fps > 0 && generatedSteps != null ? ((generatedSteps - steps) / fps) * 1000 : 0;
   const fullMs = chunkMs + ghostMs;
-  const barMs = compute + fullMs;
+  const barMs = inference + fullMs;
   const shareOf = (base, value) => (base > 0 ? (value / base) * 100 : 0);
+  const segmentMs = { encode, upload, compute, download, other, chunk: chunkMs, ghost: ghostMs };
   const segments = DEBUG_TIMING_SEGMENTS
-    .map((segment) => ({
-      ...segment,
-      ms: segment.key === "compute" ? compute : segment.key === "chunk" ? chunkMs : ghostMs,
-    }))
+    .map((segment) => ({ ...segment, ms: segmentMs[segment.key] }))
     .filter((segment) => segment.ms > 0)
     .map((segment) => ({ ...segment, pct: shareOf(barMs, segment.ms) }));
   const caption = [`chunk ${steps}${generatedSteps != null ? ` / ${generatedSteps}` : ""} steps`];
@@ -92,6 +96,7 @@ export function buildDebugTiming(result = {}) {
     computeMs: compute,
     transferMs: transfer,
     otherMs: other,
+    sessionMs,
     loadMs: load,
     waitMs: wait,
     steps,
@@ -103,34 +108,47 @@ export function buildDebugTiming(result = {}) {
     segments,
     chips: [
       { key: "inference", label: "inference", text: formatTimingMs(inference) },
-      ...(compute > 0 ? [{ key: "compute", label: "gpu", text: formatTimingMs(compute) }] : []),
-      ...(transfer > 0 ? [{ key: "transfer", label: "transfer", text: formatTimingMs(transfer) }] : []),
-      ...(other > 0 ? [{ key: "other", label: "other", text: formatTimingMs(other) }] : []),
+      ...segments
+        .filter((segment) => segment.kind === "time")
+        .map((segment) => ({
+          key: segment.key,
+          label: segment.key === "compute" ? "gpu" : segment.label,
+          text: formatTimingMs(segment.ms),
+        })),
       { key: "chunk", label: "chunk", text: chunkMs > 0 ? formatTimingMs(chunkMs) : "—" },
     ],
     caption: caption.join(" · "),
-    // Detail rows are hierarchical: rows inside the request share the inference total,
-    // the phases around it share the whole latency, so every bar length stays readable.
+    // Rows walk the wall clock: session open, the request, its legs, then the chunk's
+    // play time. Every row's share uses the bar's own denominator, so a row tint lines
+    // up with the segment above it.
     detailRows: [
-      { key: "inference", depth: 0, text: formatTimingMs(inference), ms: inference, detail: "excludes load", pct: shareOf(latency, inference) },
-      { key: "compute", depth: 1, text: formatTimingMs(compute), ms: compute, detail: "gpu", pct: shareOf(inference, compute) },
-      ...(encode > 0 ? [{ key: "encode", depth: 1, text: formatTimingMs(encode), ms: encode, detail: "", pct: shareOf(inference, encode) }] : []),
-      ...(upload > 0 ? [{ key: "upload", depth: 1, text: formatTimingMs(upload), ms: upload, detail: "", pct: shareOf(inference, upload) }] : []),
-      ...(download > 0 ? [{ key: "download", depth: 1, text: formatTimingMs(download), ms: download, detail: "", pct: shareOf(inference, download) }] : []),
-      ...(other > 0 ? [{ key: "other", depth: 1, text: formatTimingMs(other), ms: other, detail: "", pct: shareOf(inference, other) }] : []),
+      ...(sessionMs > 0
+        ? [{ key: "load", depth: 0, text: formatTimingMs(sessionMs), ms: sessionMs, detail: "session", pct: shareOf(barMs, sessionMs) }]
+        : []),
+      ...(inference > 0
+        ? [{ key: "inference", depth: 0, text: formatTimingMs(inference), ms: inference, detail: "excludes load", pct: shareOf(barMs, inference) }]
+        : []),
+      ...segments
+        .filter((segment) => segment.kind === "time")
+        .map((segment) => ({
+          key: segment.key,
+          depth: 1,
+          text: formatTimingMs(segment.ms),
+          ms: segment.ms,
+          detail: segment.key === "compute" ? "gpu" : "",
+          pct: segment.pct,
+        })),
       {
         key: "chunk",
         depth: 0,
         text: chunkMs > 0 ? formatTimingMs(chunkMs) : "—",
         ms: chunkMs,
         detail: `${steps}${generatedSteps != null ? ` / ${generatedSteps}` : ""} steps${fps > 0 ? ` · ${Math.round(fps)} fps` : ""}`,
-        pct: shareOf(latency, chunkMs),
+        pct: shareOf(barMs, chunkMs),
       },
       ...(generatedSteps != null
-        ? [{ key: "ghost", depth: 0, text: formatTimingMs(ghostMs), ms: ghostMs, detail: `${generatedSteps - steps} more steps`, pct: shareOf(latency, ghostMs) }]
+        ? [{ key: "ghost", depth: 0, text: formatTimingMs(ghostMs), ms: ghostMs, detail: `${generatedSteps - steps} more steps`, pct: shareOf(barMs, ghostMs) }]
         : []),
-      ...(load > 0 ? [{ key: "load", depth: 0, text: formatTimingMs(load), ms: load, detail: "session", pct: shareOf(latency, load) }] : []),
-      ...(wait > 0 ? [{ key: "wait", depth: 0, text: formatTimingMs(wait), ms: wait, detail: "", pct: shareOf(latency, wait) }] : []),
     ],
     // Cloud legs keep their raw stage names; the renderer maps them to enc/up/gpu/down
     // and paints the matching dot colour. Shares are over the round trip they partition.

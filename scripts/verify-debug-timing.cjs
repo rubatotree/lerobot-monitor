@@ -217,26 +217,31 @@ async function runViewport(browser, viewport) {
   const cold = await timingState(page);
   const kinds = cold.segs.map((segment) => segment.kind).join(",");
   check(
-    `${viewport.name} bar carries gpu compute, chunk and the hatched tail only`,
-    !cold.hidden && kinds === "compute,chunk,ghost",
+    `${viewport.name} bar walks every request leg in time order`,
+    !cold.hidden && kinds === "encode,upload,compute,download,other,chunk,ghost",
     kinds,
   );
   const share = (kind) => cold.segs.find((segment) => segment.kind === kind)?.pct ?? 0;
-  check(`${viewport.name} compute leg keeps its share`, Math.abs(share("compute") - 15.25) < 1.5, String(share("compute")));
-  check(`${viewport.name} chunk leg keeps its share`, Math.abs(share("chunk") - 27.12) < 1.5, String(share("chunk")));
-  check(`${viewport.name} would-be tail keeps its share`, Math.abs(share("ghost") - 57.63) < 1.5, String(share("ghost")));
+  check(`${viewport.name} upload leg keeps its share`, Math.abs(share("upload") - 8.72) < 1.5, String(share("upload")));
+  check(`${viewport.name} gpu compute leg keeps its share`, Math.abs(share("compute") - 10.47) < 1.5, String(share("compute")));
+  check(`${viewport.name} chores keep their share`, Math.abs(share("other") - 21.63) < 1.5, String(share("other")));
+  check(`${viewport.name} chunk leg keeps its share`, Math.abs(share("chunk") - 18.60) < 1.5, String(share("chunk")));
+  check(`${viewport.name} would-be tail keeps its share`, Math.abs(share("ghost") - 39.53) < 1.5, String(share("ghost")));
   check(
-    `${viewport.name} load and transfer stay out of the bar`,
-    cold.segs.every((segment) => !["load", "wait", "upload", "download", "other"].includes(segment.kind)),
+    `${viewport.name} session leg stays out of the bar`,
+    cold.segs.every((segment) => !["load", "wait"].includes(segment.kind)),
     kinds,
   );
   check(
-    `${viewport.name} chips split inference into gpu, transfer and chores`,
+    `${viewport.name} chips list every request leg beside the inference total`,
     cold.chips.inference === "1.20 s"
+      && cold.chips.encode === "10 ms"
+      && cold.chips.upload === "250 ms"
       && cold.chips.compute === "300 ms"
-      && cold.chips.transfer === "280 ms"
+      && cold.chips.download === "20 ms"
       && cold.chips.other === "620 ms"
       && cold.chips.chunk === "533 ms"
+      && cold.chips.transfer === undefined
       && cold.chips.load === undefined,
     JSON.stringify(cold.chips),
   );
@@ -262,18 +267,19 @@ async function runViewport(browser, viewport) {
   await toggleSection(page, "timing");
   const timingSection = (await profileState(page)).sections.find((entry) => entry.section === "timing");
   check(
-    `${viewport.name} timing section nests compute and chores under inference`,
+    `${viewport.name} timing section walks load, inference, its legs, then the chunk`,
     timingSection?.open === true
       && timingSection.meta === "1.20 s"
-      && timingSection.rows.map((row) => row.kind).join(",") === "inference,compute,encode,upload,download,other,chunk,ghost,load"
-      && timingSection.rows[0].value === "1.20 s"
-      && timingSection.rows[0].detail === "excludes load"
-      && timingSection.rows[1].detail === "gpu"
-      && timingSection.rows[1].value === "300 ms"
-      && /16 \/ 50 steps/.test(timingSection.rows[6].detail)
-      && /34 more steps/.test(timingSection.rows[7].detail)
-      && timingSection.rows[8].kind === "load"
-      && timingSection.rows[8].value === "800 ms",
+      && timingSection.rows.map((row) => row.kind).join(",") === "load,inference,encode,upload,compute,download,other,chunk,ghost"
+      && timingSection.rows[0].value === "800 ms"
+      && timingSection.rows[0].detail === "session"
+      && timingSection.rows[1].value === "1.20 s"
+      && timingSection.rows[1].detail === "excludes load"
+      && timingSection.rows[4].kind === "compute"
+      && timingSection.rows[4].value === "300 ms"
+      && timingSection.rows[4].detail === "gpu"
+      && /16 \/ 50 steps/.test(timingSection.rows[7].detail)
+      && /34 more steps/.test(timingSection.rows[8].detail),
     JSON.stringify(timingSection),
   );
 
@@ -309,11 +315,12 @@ async function runViewport(browser, viewport) {
   const warm = await timingState(page);
   const warmKinds = warm.segs.map((segment) => segment.kind).join(",");
   check(
-    `${viewport.name} warm run keeps compute plus chunk only`,
-    warmKinds === "compute,chunk"
+    `${viewport.name} local run keeps gpu plus chores with no transfer legs`,
+    warmKinds === "compute,other,chunk"
       && warm.chips.inference === "370 ms"
       && warm.chips.compute === "350 ms"
       && warm.chips.other === "20 ms"
+      && warm.chips.chunk === "133 ms"
       && warm.chips.transfer === undefined,
     `${warmKinds} | ${JSON.stringify(warm.chips)}`,
   );
@@ -334,7 +341,21 @@ async function runViewport(browser, viewport) {
 
   await renderTiming(page, COLD);
   fs.mkdirSync(SHOTS, { recursive: true });
-  await page.locator("#dbg-timing").evaluate((element) => element.scrollIntoView({ block: "center" }));
+  // Park the card's top 160 px into the scrollport: neither the sticky tab strip nor a
+  // short scrollport may hide the bar this shot is meant to prove.
+  await page.locator("#dbg-timing").evaluate((element) => {
+    const OFFSET = 160;
+    const box = element.getBoundingClientRect();
+    let scroller = element.parentElement;
+    while (scroller && scroller !== document.body && scroller.scrollHeight <= scroller.clientHeight + 1) {
+      scroller = scroller.parentElement;
+    }
+    if (scroller && scroller !== document.body) {
+      scroller.scrollTop += (box.top - scroller.getBoundingClientRect().top) - OFFSET;
+      return;
+    }
+    window.scrollBy(0, box.top - OFFSET);
+  });
   await page.waitForTimeout(150);
   await page.screenshot({ path: path.join(SHOTS, `debug-timing-${viewport.name}.png`) });
   check(`${viewport.name} no page errors`, errors.length === 0, errors.join(" | "));

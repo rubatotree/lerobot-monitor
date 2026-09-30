@@ -9,19 +9,24 @@ const barKeys = (timing) => timing.segments.map((segment) => segment.key);
 const barSum = (timing) => timing.segments.reduce((total, segment) => total + segment.pct, 0);
 const approx = (value, expected, tolerance = 0.01) => Math.abs(value - expected) < tolerance;
 
-test('the bar carries model execution only: no load, no transfer, no chores', () => {
-  assert.deepEqual(DEBUG_TIMING_SEGMENTS.map((segment) => segment.key), ['compute', 'chunk', 'ghost']);
+test('the bar walks the request legs in order and keeps the session leg out', () => {
+  assert.deepEqual(
+    DEBUG_TIMING_SEGMENTS.map((segment) => segment.key),
+    ['encode', 'upload', 'compute', 'download', 'other', 'chunk', 'ghost'],
+  );
   const timing = buildDebugTiming({
     fps: 30, latency_ms: 2000, model_wait_ms: 800, model_load_ms: 800, compute_ms: 900,
     actions: row(16), generated_steps: 50,
     stage_ms: { cloud_encode: 10, cloud_upload: 250, cloud_compute: 300, cloud_download: 20 },
   });
-  assert.deepEqual(barKeys(timing), ['compute', 'chunk', 'ghost']);
+  assert.deepEqual(barKeys(timing), ['encode', 'upload', 'compute', 'download', 'other', 'chunk', 'ghost']);
   assert.ok(approx(barSum(timing), 100));
-  assert.ok(approx(timing.segments[0].pct, 15.254)); // 300 of 1966.67 ms
+  assert.ok(approx(timing.segments[1].pct, 8.7209)); // upload 250 of 2866.67 ms
+  assert.ok(approx(timing.segments[2].pct, 10.4651)); // compute 300 of 2866.67 ms
+  assert.equal(timing.sessionMs, 800);
   assert.equal(timing.loadMs, 800);
   assert.equal(timing.waitMs, 0);
-  assert.equal('load' in timing.segments.reduce((all, segment) => ({ ...all, [segment.key]: true }), {}), false);
+  assert.ok(timing.segments.every((segment) => segment.key !== 'load'));
 });
 
 test('inference excludes the session wait while compute stays GPU only', () => {
@@ -37,8 +42,10 @@ test('inference excludes the session wait while compute stays GPU only', () => {
   assert.equal(timing.inferenceMs, timing.computeMs + timing.transferMs + timing.otherMs);
   assert.deepEqual(timing.chips.map((chip) => [chip.key, chip.text]), [
     ['inference', '1.20 s'],
+    ['encode', '10 ms'],
+    ['upload', '250 ms'],
     ['compute', '300 ms'],
-    ['transfer', '280 ms'],
+    ['download', '20 ms'],
     ['other', '620 ms'],
     ['chunk', '533 ms'],
   ]);
@@ -46,40 +53,49 @@ test('inference excludes the session wait while compute stays GPU only', () => {
   assert.match(timing.caption, /533 ms of 1\.67 s/);
 });
 
-test('detail rows nest compute and chores under inference, load stays outside', () => {
+test('detail rows walk load, inference, its legs, then the chunk', () => {
   const timing = buildDebugTiming({
     fps: 30, latency_ms: 2000, model_wait_ms: 800, model_load_ms: 800, compute_ms: 900,
     actions: row(16), generated_steps: 50,
     stage_ms: { cloud_encode: 10, cloud_upload: 250, cloud_compute: 300, cloud_download: 20 },
   });
   assert.deepEqual(keys(timing.detailRows), [
-    'inference', 'compute', 'encode', 'upload', 'download', 'other', 'chunk', 'ghost', 'load',
+    'load', 'inference', 'encode', 'upload', 'compute', 'download', 'other', 'chunk', 'ghost',
   ]);
-  assert.deepEqual(timing.detailRows.map((entry) => entry.depth), [0, 1, 1, 1, 1, 1, 0, 0, 0]);
-  assert.ok(approx(rowOf(timing, 'inference').pct, 60)); // share of the whole latency
-  assert.ok(approx(rowOf(timing, 'compute').pct, 25)); // share of inference
-  assert.ok(approx(rowOf(timing, 'upload').pct, 20.833));
-  assert.ok(approx(rowOf(timing, 'other').pct, 51.667));
+  assert.deepEqual(timing.detailRows.map((entry) => entry.depth), [0, 0, 1, 1, 1, 1, 1, 0, 0]);
+  assert.ok(approx(rowOf(timing, 'load').pct, 27.907)); // 800 of 2866.67 ms
+  assert.ok(approx(rowOf(timing, 'inference').pct, 41.860));
+  assert.ok(approx(rowOf(timing, 'encode').pct, 0.349));
+  assert.ok(approx(rowOf(timing, 'upload').pct, 8.721));
+  assert.ok(approx(rowOf(timing, 'compute').pct, 10.465));
+  assert.ok(approx(rowOf(timing, 'download').pct, 0.698));
+  assert.ok(approx(rowOf(timing, 'other').pct, 21.628));
+  assert.ok(approx(rowOf(timing, 'chunk').pct, 18.605));
+  assert.ok(approx(rowOf(timing, 'ghost').pct, 39.535));
   assert.equal(rowOf(timing, 'compute').detail, 'gpu');
   assert.equal(rowOf(timing, 'inference').detail, 'excludes load');
   assert.equal(rowOf(timing, 'load').detail, 'session');
+  assert.equal(rowOf(timing, 'load').text, '800 ms');
   const children = timing.detailRows.filter((entry) => entry.depth === 1);
-  assert.ok(approx(children.reduce((total, entry) => total + entry.pct, 0), 100));
+  assert.ok(approx(children.reduce((total, entry) => total + entry.pct, 0), rowOf(timing, 'inference').pct));
   assert.equal(rowOf(timing, 'chunk').detail, '16 / 50 steps · 30 fps');
   assert.equal(rowOf(timing, 'ghost').detail, '34 more steps');
 });
 
-test('local runs have no transfer legs and keep the wait row', () => {
+test('local runs keep the session row and have no transfer legs', () => {
   const timing = buildDebugTiming({
     fps: 30, latency_ms: 400, model_wait_ms: 30, model_load_ms: 0, compute_ms: 350, actions: row(4),
   });
-  assert.deepEqual(barKeys(timing), ['compute', 'chunk']);
+  assert.deepEqual(barKeys(timing), ['compute', 'other', 'chunk']);
   assert.equal(timing.inferenceMs, 370);
   assert.equal(timing.computeMs, 350);
   assert.equal(timing.transferMs, 0);
   assert.equal(timing.otherMs, 20);
+  assert.equal(timing.sessionMs, 30);
+  assert.equal(timing.loadMs, 0);
   assert.equal(timing.waitMs, 30);
-  assert.deepEqual(keys(timing.detailRows), ['inference', 'compute', 'other', 'chunk', 'wait']);
+  assert.deepEqual(keys(timing.detailRows), ['load', 'inference', 'compute', 'other', 'chunk']);
+  assert.equal(rowOf(timing, 'load').text, '30 ms');
   assert.deepEqual(timing.chips.map((chip) => [chip.key, chip.text]), [
     ['inference', '370 ms'], ['compute', '350 ms'], ['other', '20 ms'], ['chunk', '133 ms'],
   ]);
@@ -93,7 +109,7 @@ test('an inflated compute measurement is clamped inside the request window', () 
   assert.equal(timing.computeMs, 600);
   assert.equal(timing.otherMs, 0);
   assert.deepEqual(barKeys(timing), ['compute']);
-  assert.deepEqual(keys(timing.detailRows), ['inference', 'compute', 'chunk', 'load']);
+  assert.deepEqual(keys(timing.detailRows), ['load', 'inference', 'compute', 'chunk']);
 });
 
 test('missing fps reports steps without inventing a duration', () => {

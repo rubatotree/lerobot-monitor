@@ -6954,7 +6954,7 @@ function renderChunkTiming(result) {
   }
   const track = document.createElement("div");
   track.className = "debug-timing-track";
-  track.setAttribute("aria-label", `inference ${api.formatTimingMs(timing.latencyMs)} · ${timing.caption}`);
+  track.setAttribute("aria-label", `timing ${api.formatTimingMs(timing.barMs)} · inference ${api.formatTimingMs(timing.inferenceMs)} · ${timing.caption}`);
   timing.segments.forEach((segment) => {
     const bar = document.createElement("span");
     bar.className = `debug-timing-seg is-${segment.key}`;

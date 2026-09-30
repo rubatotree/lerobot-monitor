@@ -2759,7 +2759,11 @@ select {
   background: var(--surface);
 }
 .debug-timing-seg { display: block; height: 100%; min-width: 2px; }
+.debug-timing-seg.is-encode { background: #91c9e8; }
+.debug-timing-seg.is-upload { background: #e0a35c; }
 .debug-timing-seg.is-compute { background: var(--blue); }
+.debug-timing-seg.is-download { background: #c98bd4; }
+.debug-timing-seg.is-other { background: var(--faint); opacity: 0.5; }
 .debug-timing-seg.is-chunk { background: var(--ok); }
 .debug-timing-seg.is-ghost {
   min-width: 3px;
@@ -2787,8 +2791,10 @@ select {
   flex: none;
 }
 .debug-timing-chip.is-inference .debug-timing-dot { background: var(--accent); }
+.debug-timing-chip.is-encode .debug-timing-dot { background: #91c9e8; }
+.debug-timing-chip.is-upload .debug-timing-dot { background: #e0a35c; }
 .debug-timing-chip.is-compute .debug-timing-dot { background: var(--blue); }
-.debug-timing-chip.is-transfer .debug-timing-dot { background: #e0a35c; }
+.debug-timing-chip.is-download .debug-timing-dot { background: #c98bd4; }
 .debug-timing-chip.is-other .debug-timing-dot { background: var(--faint); }
 .debug-timing-chip.is-chunk .debug-timing-dot { background: var(--ok); }
 .debug-timing-value {
@@ -2870,7 +2876,6 @@ select {
 .debug-profile-row[data-kind="chunk"],
 .debug-profile-row[data-kind="ghost"] { --row-tint: rgba(93, 186, 154, 0.24); }
 .debug-profile-row[data-kind="load"] { --row-tint: rgba(92, 82, 184, 0.22); }
-.debug-profile-row[data-kind="wait"] { --row-tint: rgba(92, 82, 184, 0.14); }
 .debug-profile-row[data-kind="compute"] .debug-profile-dot { background: var(--blue); }
 .debug-profile-row[data-kind="encode"] .debug-profile-dot { background: #91c9e8; }
 .debug-profile-row[data-kind="upload"] .debug-profile-dot { background: #e0a35c; }

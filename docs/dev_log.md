@@ -1,5 +1,24 @@
 # Dev log
 
+## 2026-09-30：Main view 摄像头窗口旋转（0/90/180/270）
+
+- 主视图 `#cameras` 每张 `.cam-card` 头部新增旋转控件（`⟳ 0°` 循环 0→90→180→270，`aria-pressed` 标记是否旋转）；媒体区包进 `.cam-stage`，只旋转窗口显示。
+- 90°/270° 用容器单位换向：`.cam-stage` 设 `container-type: size`，图片 `width: 100cqh; height: 100cqw` 后 `transform: rotate()`，所以竖装相机在横窗里按 `object-fit: contain` 满幅显示，不再被压扁或裁掉内容；180° 只做镜像。
+- 选择按相机身份（`device_key`，如 `local:0`）存入 `lerobot-monitor-camera-rotation`，刷新/重启沿用；回到 0° 时删除该条目。视频流、快照抓帧与 `feed_robot` 保持原始方向（`mediaFrameDataUrl` 读原始帧），模型输入不受影响。
+- 验证：新增 `scripts/verify-camera-rotation.cjs` 20/20（合成状态流 + 路由两色 PNG；像素断言未旋转红左/蓝右、90° 红上/蓝下、180° 左右互换、270° 红下/蓝上；图片布局盒换向与 transform 矩阵；刷新恢复旋转；390px 无溢出且控件可用），截图 `.agent-progress/camera-rotation-shots/`。既有 `verify-ui-fixes.cjs` 15/15、`test-rollout-lanes.mjs` 13/13、`tests/test_app.py` 41 passed / 1 skipped（唯一失败仍是 venv 缺 `huggingface_hub` 的虚拟录制用例，与本轮无关）。
+- 边界：真机相机与多路/远程相机未验证；旋转目前只作用于主视图窗口，Hardware 迷你预览与 replay 视图仍按原始方向显示。
+
+## 2026-09-30：六项 UI 修复（preset 资源、泳道带、arm 默认、页签、复制、白线拖动）
+
+- Preset 载入兜底：`ensureSelectOption` 在 `applyRolloutFields` / `applyDebugFields` / `applyRecordFields` 中，为 preset 里已记录但当前列表缺失的 model path / dataset id 合成 option，`applyLibraryDrop` 也改用同一 helper；`setSelectValue` 不再把拖入过、后来不在列表里的资源静默清空（只做载入兜底，preset 仍手动 Save）。
+- Commanded action 泳道带按需保留：`mkChart` 初始 `$laneHeight = 0`，新增 `setRolloutLaneBand`；`updateRolloutLanes` 在有 rollout timeline 时置 64px 并同步 `layout.padding.bottom`，`clearRolloutLanes` 收回（冻结视图保持）。空闲时图表填满整个下方。
+- arm 默认值：`refreshPorts` 对 `#arm-port` 使用 `savedPortValue(uiHw, "arm_port", "")`，虚拟 follower 仍是可选设备但不再是默认；`robot-preview.js` 预览电源默认关闭（仅显式存过 `"1"` 才自动上电），本机 `config.yaml` 的 `virtual_follower.auto_connect` 改为 `false`，因此启动后 arm 留空或沿用硬件 preset 端口，不再连接 `virtual://preview`。
+- 侧栏 Hardware 页签移到 Cloud 右侧（DOM 顺序即键盘导航顺序，面板顺序不变）。
+- 元信息复制：新增 `copyTextToClipboard` / `makeCopyChip` / `markCopyChip`（`navigator.clipboard` + `execCommand` 回退，按钮内 1.2s ✓ 反馈）；Library 元信息行与描述、episode 摘要、debug timing/load progress/model residency、Cloud 面板主机/GPU/模型/任务卡片均加入复制按钮，块级 Copy all 复制 `Label: value` 全量行。
+- rollout 白线可拖动：`rolloutWindowSplit` 以「过去占比」拆分窗口（默认比例保持历史行为），拖动只改变过去/未来占比、总跨度不变，比例存 `lerobot-monitor-rollout-now-fraction`，双击复位；`renderLiveFrame` 抽出供动画与拖动共用，泳道窗口跟随同一拆分。
+- 验证：`node --check` 三个脚本通过；`tests/test_app.py` 40 passed / 1 skipped（`test_virtual_record_api_publishes_to_library_dataset` 因 venv 缺 `huggingface_hub` 失败，与本轮前端改动无关）；`scripts/test-rollout-lanes.mjs` 13/13；扩展后的 `scripts/verify-rollout-lanes.cjs` 98/98（含空闲收回泳道带、拖动改变窗口比例、跨度不变、比例落盘、双击复位，1440×900 与 390×844）；新增 `scripts/verify-ui-fixes.cjs` 15/15（页签顺序、arm 留空、虚拟预览默认不上电、三类 preset 载入兜底、元信息行/整块与 Cloud 主机复制）。
+- 边界：未在真实机械臂/相机环境验证；本机 `config.yaml` 的 `virtual_follower.auto_connect: false` 属本地配置（gitignore），如需恢复「无硬件时自动连接虚拟从臂」改回 `true` 并点开 Arm preview 电源即可。
+
 ## 2026-09-30：Debug 时间条按真实次序铺满推理各段，明细改为 LOAD → INFERENCE → CHUNK
 
 - 诉求：占比条此前只画 compute/chunk/ghost，上传/下载/杂务没有对应的段；明细表要严格按时间顺序（load → inference → chunk），inference 之下再按 encode → upload → compute → download → other 细分。

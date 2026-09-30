@@ -17,6 +17,7 @@ from lerobot_monitor.monitor_cloud import (
     CloudRequestError,
     CloudTarget,
     MonitorCloudClient,
+    RemoteChunkEvent,
     RemoteRTCInferenceEngine,
     RemoteSession,
     RemoteSyncInferenceEngine,
@@ -122,6 +123,104 @@ def test_remote_rtc_engine_produces_monitor_joint_names_and_closes() -> None:
     assert engine.stop() is True
     assert engine.wait_stopped(1) is True
     assert session.closed is True
+
+
+class LifecycleRemoteSession(FakeRemoteSession):
+    """Scripts whole chunks so the engine's lifecycle events can be asserted."""
+
+    def __init__(self, *, delay_s: float = 0.0, error: Exception | None = None) -> None:
+        super().__init__()
+        self.delay_s = delay_s
+        self.error = error
+        self.stages: list[Any] = []
+        self.prefix_calls: list[Any] = []
+
+    def infer(self, observation: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        self.calls += 1
+        self.prefix_calls.append(kwargs.get("prefix_raw"))
+        if self.error is not None:
+            raise self.error
+        if self.delay_s:
+            time.sleep(self.delay_s)
+        rows = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]
+        self.stages = [_LifecycleStage("cloud_compute", 100.0, 100.1)]
+        return {"raw_actions": rows, "actions": rows, "action_keys": self.action_keys}
+
+
+class _LifecycleStage:
+    """Minimal cloud-stage stand-in: note_stage reads name/start/end/gpu_ms."""
+
+    def __init__(self, name: str, start: float, end: float) -> None:
+        self.name = name
+        self.start = start
+        self.end = end
+        self.gpu_ms = None
+
+
+def test_remote_rtc_engine_reports_chunk_lifecycle() -> None:
+    session = LifecycleRemoteSession(delay_s=0.2)
+    engine = RemoteRTCInferenceEngine(session, fps=1, queue_threshold=2)  # type: ignore[arg-type]
+    events: list[RemoteChunkEvent] = []
+    engine.chunk_observer = events.append
+    engine.observation_provider = lambda observation: observation
+    engine.start()
+    try:
+        engine.notify_observation({"shoulder_pan": 0.0, "gripper": 0.0})
+        engine.resume()
+        deadline = time.monotonic() + 2
+        while engine.qsize() == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert engine.get_action(None) == {"shoulder_pan": 1.0, "gripper": 2.0}
+        assert engine.get_action(None) == {"shoulder_pan": 3.0, "gripper": 4.0}
+        # Refilling from the two leftover steps makes the 0.2 s round trip the delay.
+        deadline = time.monotonic() + 3
+        while engine.qsize() < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert engine.qsize() == 3
+        assert engine.stop() is True
+    finally:
+        engine.stop()
+
+    assert session.closed is True
+    lifecycle = [(event.kind, event.chunk_id) for event in events if event.kind != "stage"]
+    assert lifecycle == [
+        ("started", 1), ("ready", 1), ("accepted", 1),
+        ("consumed", 1), ("consumed", 1),
+        ("started", 2), ("ready", 2), ("accepted", 2),
+    ]
+    by_key = {(event.kind, event.chunk_id): event for event in events}
+    assert by_key[("ready", 1)].steps == 4
+    first = by_key[("accepted", 1)]
+    assert (first.steps, first.merge.prefix_trimmed, first.merge.replaced) == (4, 0, ())  # type: ignore[union-attr]
+    assert first.actions[0] == {"shoulder_pan": 1.0, "gripper": 2.0}
+    assert [event.action_index for event in events if event.kind == "consumed"] == [0, 1]
+    # One step elapsed during the round trip at fps=1, and the two steps the consumer
+    # left behind are the replaced steps LeRobot's merge would report.
+    second = by_key[("accepted", 2)]
+    assert (second.steps, second.merge.prefix_trimmed, second.merge.replaced) == (3, 1, ((1, 2),))  # type: ignore[union-attr]
+    assert session.prefix_calls == [None, [[5.0, 6.0], [7.0, 8.0]]]
+    assert {event.chunk_id for event in events if event.kind == "stage"} == {1, 2}
+
+
+def test_remote_rtc_engine_reports_a_failed_chunk() -> None:
+    session = LifecycleRemoteSession(error=CloudRequestError("cloud policy failed"))
+    engine = RemoteRTCInferenceEngine(session, fps=1, queue_threshold=2)  # type: ignore[arg-type]
+    events: list[RemoteChunkEvent] = []
+    engine.chunk_observer = events.append
+    engine.observation_provider = lambda observation: observation
+    engine.start()
+    try:
+        engine.notify_observation({"shoulder_pan": 0.0, "gripper": 0.0})
+        engine.resume()
+        deadline = time.monotonic() + 2
+        while not engine.failed and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        engine.stop()
+
+    assert engine.failed is True
+    assert [(event.kind, event.chunk_id) for event in events] == [("started", 1), ("failed", 1)]
 
 
 class FakeManager:

@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 import uuid
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -808,6 +808,33 @@ class RemoteSyncInferenceEngine:
         return True
 
 
+@dataclass(frozen=True)
+class RemoteChunkEvent:
+    """Cloud producer lifecycle; mirrors LeRobot's RTCChunkEvent for the chart adapter.
+
+    ``actions`` holds joint-space poses (the cloud reports named action columns), not
+    tensors, and ``stage`` carries one completed transfer/compute phase for ``chunk_id``.
+    """
+
+    kind: str
+    chunk_id: int
+    steps: int = 0
+    actions: tuple[dict[str, float], ...] = ()
+    merge: _RemoteMergeReceipt | None = None
+    action_index: int | None = None
+    stage: Any = None
+
+
+@dataclass(frozen=True)
+class _RemoteMergeReceipt:
+    """The LeRobot ``QueueMergeReceipt`` subset the chart adapter reads."""
+
+    prefix_trimmed: int
+    accepted_steps: int
+    replaced: tuple[tuple[int, int], ...]
+    timestamp: float
+
+
 class RemoteRTCInferenceEngine:
     def __init__(
         self,
@@ -820,6 +847,7 @@ class RemoteRTCInferenceEngine:
         self.fps = max(1.0, float(fps))
         self.queue_threshold = max(0, int(queue_threshold))
         self.observation_provider: Any | None = None
+        self.chunk_observer: Any | None = None
         self.failed = False
         self.failure_traceback: str | None = None
         self.dispatched_chunk_id: int | None = None
@@ -866,6 +894,7 @@ class RemoteRTCInferenceEngine:
             _raw, action, chunk_id, index = self._queue.popleft()
         self.dispatched_chunk_id = chunk_id
         self.dispatched_action_index = index
+        self._emit(RemoteChunkEvent("consumed", chunk_id, action_index=index))
         return dict(action)
 
     def qsize(self) -> int:
@@ -882,6 +911,23 @@ class RemoteRTCInferenceEngine:
     def leftover_poses(self, fallback: Mapping[str, float]) -> list[dict[str, float]]:
         return [{**fallback, **pose} for pose in self.get_processed_left_over()]
 
+    def _emit(self, event: RemoteChunkEvent) -> None:
+        observer = self.chunk_observer
+        if observer is None:
+            return
+        try:
+            observer(event)
+        except Exception:
+            # Chart telemetry must never affect control.
+            logger.debug("remote RTC chunk observer failed", exc_info=True)
+
+    def _publish_stages(self, chunk_id: int) -> None:
+        """Forward this request's transfer/compute phases to the chunk they produced."""
+        if self.chunk_observer is None:
+            return
+        for stage in self.session.stages:
+            self._emit(RemoteChunkEvent("stage", chunk_id, stage=stage))
+
     def _run(self) -> None:
         try:
             while not self._stop.is_set():
@@ -893,6 +939,8 @@ class RemoteRTCInferenceEngine:
                 if observation is None or len(prefix) > self.queue_threshold:
                     self._stop.wait(0.01)
                     continue
+                self._sequence += 1
+                chunk_id = self._sequence
                 if self.observation_provider is not None:
                     observation = self.observation_provider(observation)
                 raw_prefix = [list(item[0]) for item in prefix] or None
@@ -907,35 +955,50 @@ class RemoteRTCInferenceEngine:
                         conditioned_delay,
                         int(self.session.metadata.get("rtc_training_max_delay") or 0),
                     )
-                result = self.session.infer(
-                    observation,
-                    prefix_raw=raw_prefix,
-                    prefix_absolute=absolute_prefix,
-                    inference_delay=conditioned_delay,
-                )
+                self._emit(RemoteChunkEvent("started", chunk_id))
+                try:
+                    result = self.session.infer(
+                        observation,
+                        prefix_raw=raw_prefix,
+                        prefix_absolute=absolute_prefix,
+                        inference_delay=conditioned_delay,
+                    )
+                except BaseException:
+                    self._emit(RemoteChunkEvent("failed", chunk_id))
+                    raise
+                finally:
+                    self._publish_stages(chunk_id)
                 delay = math.ceil((time.perf_counter() - started) * self.fps) if prefix else 0
                 self._last_delay = delay
                 raw_rows = result.get("raw_actions") or []
                 action_rows = result.get("actions") or []
                 keys = [str(key) for key in result.get("action_keys") or self.session.action_keys]
                 trimmed = min(delay, len(raw_rows), len(action_rows))
-                self._sequence += 1
+                # The server reported the whole horizon; the executed part follows as "accepted".
+                self._emit(RemoteChunkEvent("ready", chunk_id, len(action_rows)))
                 replacement: deque[tuple[list[float], dict[str, float], int, int]] = deque()
+                accepted_poses: list[dict[str, float]] = []
                 for index, (raw, action) in enumerate(zip(raw_rows[trimmed:], action_rows[trimmed:])):
-                    replacement.append(
-                        (
-                            [float(value) for value in raw],
-                            {
-                                (key[:-4] if key.endswith(".pos") else key): float(action[pos])
-                                for pos, key in enumerate(keys)
-                                if pos < len(action)
-                            },
-                            self._sequence,
-                            index + trimmed,
-                        )
-                    )
+                    pose = {
+                        (key[:-4] if key.endswith(".pos") else key): float(action[pos])
+                        for pos, key in enumerate(keys)
+                        if pos < len(action)
+                    }
+                    accepted_poses.append(pose)
+                    replacement.append(([float(value) for value in raw], pose, chunk_id, index + trimmed))
+                # Steps the consumer could not drain during inference stay in the old
+                # chunk when the queue is replaced, exactly as LeRobot's merge reports
+                # them: counted under the lock that swaps the queue.
+                accepted_at = time.perf_counter()
                 with self._lock:
+                    replaced = tuple(sorted(Counter(item[2] for item in self._queue).items()))
                     self._queue = replacement
+                self._emit(
+                    RemoteChunkEvent(
+                        "accepted", chunk_id, len(replacement), tuple(accepted_poses),
+                        _RemoteMergeReceipt(trimmed, len(replacement), replaced, accepted_at),
+                    )
+                )
         except BaseException:  # the control loop surfaces this traceback
             self.failed = True
             self.failure_traceback = traceback.format_exc()

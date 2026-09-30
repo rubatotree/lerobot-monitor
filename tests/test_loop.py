@@ -1135,6 +1135,96 @@ def test_rtc_tick_observes_queue_handoff_and_uses_timeline_latency(
     assert loop._rollout_infer_ms == 62.5
 
 
+def test_cloud_rtc_events_fill_timeline_and_mark_dispatch(tmp_path: Path) -> None:
+    """A cloud RTC rollout must feed the same lane telemetry a local one does."""
+    rows = [[float(index + 1), float(index + 2)] for index in range(4)]
+
+    class Session:
+        def __init__(self) -> None:
+            self.action_keys = ["shoulder_pan.pos", "gripper.pos"]
+            self.metadata = {"rtc_training_max_delay": 0}
+            self.overrides: dict[str, str] = {}
+            self.stages: list = []
+            self.closed = False
+
+        def infer(self, observation, **kwargs):
+            started = time.perf_counter()
+            self.stages = [SimpleNamespace(name="cloud_compute", start=started, end=started, gpu_ms=12.5)]
+            return {"raw_actions": rows, "actions": rows, "action_keys": self.action_keys}
+
+        def reset(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    loop = _loop(tmp_path)
+    session = Session()
+    cloud = MagicMock()
+    cloud.open_session.return_value = session
+    loop.cloud_client = cloud
+    # Zero threshold refills only an empty queue, so the first chunk stays in place
+    # while the ticks below consume it.
+    loop.rollout_extra = {"inference.type": "rtc", "inference.queue_threshold": "0"}
+    loop.joints = {name: 0.0 for name in JOINT_ORDER}
+    loop.cameras.rollout_rgb_map.return_value = {}
+    loaded = LoadedPolicy(
+        path="cloud://8x4090-server/smolvla",
+        device="remote",
+        task="pick",
+        policy=MagicMock(),
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        dataset_features={},
+        ordered_action_keys=list(JOINT_ORDER),
+    )
+
+    assert loop._begin_rollout(
+        loaded, {"record": False, "duration_s": 0, "policy_fps": 15}, loaded.path
+    ) is True
+    engine = loop._inference_engine
+    assert loop._engine_chunk_events is True
+    assert engine.chunk_observer is not None
+    assert cloud.open_session.call_args.kwargs["mode"] == "rtc_chunk"
+    try:
+        engine.notify_observation(dict(loop.joints))
+        deadline = time.monotonic() + 3
+        while engine.qsize() == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert engine.qsize() == len(rows)
+
+        loop._output_due = True
+        deadline = time.monotonic() + 3
+        timeline = None
+        while time.monotonic() < deadline:
+            loop._tick_rollout()
+            snapshot = loop.snapshot()["rollout_timeline"]
+            if snapshot and snapshot["blocks"][0]["active"] is not None:
+                timeline = snapshot
+                break
+        # One more tick drains the preview the accepted event published.
+        loop._tick_rollout()
+
+        assert timeline is not None
+        block = timeline["blocks"][0]
+        assert block["kind"] == "rtc"
+        assert block["accepted_steps"] == len(rows)
+        assert block["end"] >= block["start"]
+        assert block["active"] is not None
+        assert block["status"] == "active"
+        assert block["consumed_steps"] >= 1
+        assert [stage["name"] for stage in block["stages"]] == ["cloud_compute"]
+        assert block["stages"][0]["gpu_ms"] == pytest.approx(12.5)
+        assert loop._rollout_prediction is not None
+        assert "shoulder_pan" in loop._rollout_prediction["actions"][0]
+    finally:
+        loop._end_rollout()
+    deadline = time.monotonic() + 3
+    while not session.closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert session.closed is True
+
+
 def test_sync_tick_tracks_source_token_and_uses_timeline_latency(
     tmp_path: Path,
     monkeypatch,

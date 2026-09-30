@@ -16,7 +16,7 @@ import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Mapping, TextIO
 
 from .cameras import CameraHub
 from .config import MonitorConfig
@@ -309,7 +309,7 @@ class ControlLoop:
         self._prediction_sequence = 0
         self._inference_engine: Any | None = None
         self._inference_worker: PolicyWorker | None = None
-        self._rtc_native_events = False
+        self._engine_chunk_events = False
         self._rtc_preview: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         self._rtc_goal_chunk: int | None = None
         self._rtc_goal_index: int | None = None
@@ -2882,9 +2882,9 @@ class ControlLoop:
             self.mode = "idle"
             return
         now = time.perf_counter()
-        if not self._rtc_native_events and self._inference_worker is None:
+        if not self._engine_chunk_events and self._inference_worker is None:
             self._observe_rollout_queue()
-        elif self._rtc_native_events:
+        elif self._engine_chunk_events:
             try:
                 self._rollout_prediction = self._rtc_preview.get_nowait()
             except queue.Empty:
@@ -2939,10 +2939,10 @@ class ControlLoop:
             if can_advance:
                 started = time.perf_counter()
                 action = engine.get_action(None)
-                if self._rtc_native_events and action is not None:
+                if self._engine_chunk_events and action is not None:
                     self._rtc_goal_chunk = engine.dispatched_chunk_id
                     self._rtc_goal_index = getattr(engine, "dispatched_action_index", None)
-                elif not self._rtc_native_events:
+                elif not self._engine_chunk_events:
                     self._observe_rollout_queue()
                 measured_infer_ms = (time.perf_counter() - started) * 1000.0
                 self._rollout_infer_ms = self._timeline_latency_ms(measured_infer_ms)
@@ -2980,7 +2980,7 @@ class ControlLoop:
             sent = self._send_pose(pose, hold=self._rollout_waiting)
             if sent:
                 self._rollout_goal_sent = True
-            if sent and (self._rtc_native_events or worker is not None):
+            if sent and (self._engine_chunk_events or worker is not None):
                 try:
                     self._rollout_timeline.note_dispatched(self._rtc_goal_chunk, index=self._rtc_goal_index)
                 except Exception as exc:  # noqa: BLE001 - charts cannot stop a rollout
@@ -2992,7 +2992,7 @@ class ControlLoop:
             if hold_pose:
                 self._send_pose(dict(hold_pose), hold=True)
         self._maybe_record("rollout")
-        if worker is None and not self._rtc_native_events and now >= self._next_prediction_t:
+        if worker is None and not self._engine_chunk_events and now >= self._next_prediction_t:
             queued = inference_leftover_poses(engine, self.loaded_policy, self.joints)
             if queued:
                 self._record_rollout_prediction(queued)
@@ -3096,16 +3096,22 @@ class ControlLoop:
         return observation
 
     def _bind_rtc_events(self, engine: Any, loaded: LoadedPolicy) -> None:
-        """Adapt LeRobot producer events to charts without inspecting its private queues."""
+        """Adapt producer chunk events to charts without inspecting private queues."""
         if not hasattr(engine, "observation_provider") or not hasattr(engine, "chunk_observer"):
             raise RuntimeError("RTC requires the updated sibling LeRobot inference engine")
         engine.observation_provider = self._prepare_rollout_observation
         preview: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         self._rtc_preview = preview
-        self._rtc_native_events = True
+        self._engine_chunk_events = True
         timeline = self._rollout_timeline
         step_s, origin = self._prediction_step_s(), self.task_t0
         fallback = dict(self.joints)
+
+        def project(action: Any) -> dict[str, float]:
+            """Cloud events carry joint-space rows; LeRobot events carry action tensors."""
+            if isinstance(action, Mapping):
+                return {**fallback, **{str(key): float(value) for key, value in action.items()}}
+            return pose_from_action_tensor(loaded, action, fallback)
 
         def observe(event: Any) -> None:
             if self._inference_engine is not engine:
@@ -3119,6 +3125,8 @@ class ControlLoop:
                 )
             elif event.kind == "consumed":
                 timeline.note_consumed(event.chunk_id, index=event.action_index)
+            elif event.kind == "stage":
+                timeline.note_stage(event.chunk_id, event.stage)
             elif event.kind == "accepted":
                 receipt = getattr(event, "merge", None)
                 timeline.note_chunk_accepted(
@@ -3131,7 +3139,7 @@ class ControlLoop:
                     "id": event.chunk_id, "t_s": round(time.perf_counter() - origin, 3),
                     "step_s": round(step_s, 6), "strategy": "policy_queue", "degraded": False,
                     "latency_ms": 0.0,
-                    "actions": [pose_from_action_tensor(loaded, action, fallback) for action in event.actions],
+                    "actions": [project(action) for action in event.actions],
                 }
                 try:
                     preview.get_nowait()
@@ -3159,8 +3167,9 @@ class ControlLoop:
             self._rollout_timeline.set_enabled(False)
             self._rollout_timeline = RolloutTimeline()
             self._rollout_timeline.set_enabled(True, epoch_monotonic=self.task_t0)
-            # RTC now reports its own producer lifecycle. The synchronous worker
-            # already times calls; neither path needs to monkey-patch the policy.
+            # RTC reports its own producer lifecycle, in-process and cloud. The
+            # synchronous worker already times calls; neither path needs to
+            # monkey-patch the policy.
             state = getattr(loaded.policy, "_monitor_timeline_state", None)
             if isinstance(state, dict):
                 state["timeline"] = None
@@ -3188,7 +3197,7 @@ class ControlLoop:
                         fps=self.effective_policy_fps,
                         queue_threshold=config.queue_threshold,
                     )
-                    engine.observation_provider = self._prepare_rollout_observation
+                    self._bind_rtc_events(engine, loaded)
                 else:
                     engine = RemoteSyncInferenceEngine(session)
                 self._inference_engine = engine
@@ -3269,7 +3278,7 @@ class ControlLoop:
         worker = self._inference_worker
         lease = self._active_policy_lease
         self._inference_worker = None
-        self._rtc_native_events = False
+        self._engine_chunk_events = False
         self._rtc_goal_chunk = None
         self._rtc_goal_index = None
         self._active_policy_owner = None

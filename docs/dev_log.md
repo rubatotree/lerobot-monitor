@@ -1,5 +1,14 @@
 # Dev log
 
+## 2026-09-30：云端 RTC rollout 补齐 chunk 生命周期（泳道恢复）
+
+- 现象：`Model = cloud SmolVLA + inference.type=rtc` 的 rollout 中 command action 图底部泳道带空白（无推理带、chunk 带、重叠与 tooltip）；云端 ACT、本地模型均正常。实测主机目录确认差异来源：`8x4090-server` 的 ACT 部署 `capabilities.rtc_chunk=False`，只能走 `select_action`（云 sync 的 PolicyWorker 早已上报事件），SmolVLA 部署支持 `rtc_chunk`。
+- 根因：`RolloutTimeline` 的 block 只由 `_bind_rtc_events` 创建，而它只被本地路径调用；`RemoteRTCInferenceEngine` 既不发出 chunk 生命周期事件也没有 `chunk_observer`，`_tick_rollout` 因此走「只激活已有 block」的队列轮询分支，`snapshot()` 返回 null → 前端 `buildRolloutLanes` 直接不画泳道。
+- 修复（客户端合成；不改会话协议、不要求升级服务器，旧构建照常工作）：`RemoteRTCInferenceEngine` 新增 `RemoteChunkEvent`（`kind`/`actions`(关节空间 pose)/merge receipt/`action_index`/`stage`）与 `chunk_observer`，在 `_run` 内按 native 语义发出 `started`、`ready`（steps=完整 horizon）、`accepted`（steps=入队步数、`prefix_trimmed`=delay、`replaced`=合并锁内旧 chunk 未消费步数）、`session.stages → stage`，推理异常发 `failed`，`get_action` 发 `consumed`。loop 侧 `_bind_rtc_events` 成为两种引擎共用适配器（新增 Mapping 行投影与 `stage` 分支），云端 RTC 分支改为调用它，标志 `_rtc_native_events` 更名 `_engine_chunk_events`。于是 `_tick_rollout` 的 preview 排空、goal chunk/index 与 `note_dispatched` 通路对云端 RTC 一并生效。
+- 前端零改动：快照字段与本地 RTC 相同，`rollout-lanes.js` 无需修改。
+- 验证：新增引擎事件用例（事件序与 `trim`/`replaced`/消费索引/前缀行、失败路径）与 loop 用例（`_begin_rollout` 云端 RTC → 真实 timeline：kind/steps/active/status/consumed/stages + preview 载荷）；跨层校验把该快照喂给真实 `rollout-lanes.js`，产出 inference/action/planned/wait 相位与 cloud_encode/cloud_compute 阶段带。同级 venv 全套 554 passed / 1 skipped（2 项 HF 缓存扫描失败为本机环境既有，置空 `HF_HOME` 即通过）；monitor 精简 venv 除缺 torch/huggingface_hub 的既有失败外全绿；Node `test-rollout-lanes.mjs` 13/13；改动文件 ruff 0 新增。
+- 边界：未在真实 4090 上加载模型跑浏览器 rollout（本机无机器人/相机；部署保持 unloaded，GPU1 正被 Blender 占用），硬件端验收留给用户；云端 RTC 与本地 RTC 一致地不画 planned 尾迹（native RTC 不写 `predicted_steps`）；不发射 `discarded`（云端无 epoch/reset 失效守卫）；推理带含 PNG 编码与往返，宽度大于纯 GPU 计算（与云 sync 口径一致）。
+
 ## 2026-09-30：云模型 Load 自动选择空闲 GPU
 
 - 左侧模型库对云模型点 Load 不再先弹 GPU 选择窗：自动拉取主机目录，把负载提交到编号最小的空闲（健康且非 busy）GPU，并直接进入侧边进度跟踪（"Loading … on GPU N"）。弹窗仅保留给"所有 GPU 都被占用、需要选择共享哪张卡"的场景；主机无健康 GPU 时不弹窗，直接在卡片与日志报错。点击期间沿用请求守卫（按钮显示 Requesting…），提交前同步移交守卫给加载动作，双击不会产生两次加载。

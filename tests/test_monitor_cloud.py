@@ -50,7 +50,12 @@ def test_cloud_model_registry_is_playable_without_local_path(tmp_path: Path) -> 
     assert registry.list()[0]["path"] == target.uri
 
 
-def test_cloud_model_registry_migrates_legacy_gpu_binding(tmp_path: Path) -> None:
+def test_cloud_model_registry_migrates_legacy_gpu_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A populated host Hub cache must not leak into the registry listing.
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
     store = JsonStore(tmp_path / "store.json")
     legacy = CloudTarget("8x4090-server", "act", "GPU-old")
     store.put_model(
@@ -721,7 +726,12 @@ class FakeAppCloud:
         self.loaded_gpu = ""
 
 
-def test_monitor_api_registers_cloud_deployment_as_library_model(tmp_path: Path) -> None:
+def test_monitor_api_registers_cloud_deployment_as_library_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A populated host Hub cache must not leak into the library listing.
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
     app = create_app(
         MonitorConfig(
             store_path=tmp_path / "store.json",

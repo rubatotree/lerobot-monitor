@@ -11,7 +11,11 @@ from typing import Any
 
 import numpy as np
 import pytest
-import torch
+
+# The native engine needs torch; the monitor's slim venv skips this file instead of
+# failing collection (same convention as test_native_rtc.py).
+torch = pytest.importorskip("torch")
+
 from lerobot.policies.rtc.action_queue import ActionQueue
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.rollout.inference.profiling import PipelineProfiler

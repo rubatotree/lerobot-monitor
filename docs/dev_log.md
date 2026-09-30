@@ -1,5 +1,12 @@
 # Dev log
 
+## 2026-09-30：chore 整理：死文件与两个「一直失败」的用例
+
+- 删除 `src/lerobot_monitor/cloud/transfer.py`：0 字节、2026-09-28 写入后从未被任何代码 import（全仓库 grep `cloud.transfer` / `from .transfer` 无命中），是遗留空文件；顺手清掉了先前被句柄占住的空目录 `.pytest-tmp/cloud_rtc_lanes`。
+- 那两个「一直测试不通」的用例没有删除，而是修好了（保住覆盖）：`tests/test_monitor_cloud.py::test_cloud_model_registry_migrates_legacy_gpu_binding` 与 `::test_monitor_api_registers_cloud_deployment_as_library_model` 的失败根因不在代码——它们断言 `len(registry.list()) == 1` / `GET /api/models == []` 时把**本机真实 HF 缓存**里已存在的模型也算进去了（本机 `HF_HOME=D:/Cache/huggingface`，扫描出 7 个模型）。两条用例开头按仓库既有约定隔离缓存（`monkeypatch.setenv("HF_HOME", tmp_path / "hf")` + `monkeypatch.delenv("HUGGINGFACE_HUB_CACHE")`），于是任何机器上都确定通过，不再依赖运行环境是否干净。
+- `tests/test_native_rollout_profiling.py` 原来裸 `import torch`，在精简 venv 下会让 `uv run pytest tests` 直接停在收集阶段（整轮中断）；改为 `torch = pytest.importorskip("torch")`，与同目录 `test_native_rtc.py` 同一约定——缺依赖时跳过而不是炸掉整轮。
+- 验证：同级完整 venv 全套 **558 passed / 1 skipped / 0 failed**（此前固定 2 failed，现在全绿）；monitor 精简 venv `uv run pytest tests` 能跑完（526 passed / 18 skipped / 8 failed，这 8 项是既有的「缺 huggingface_hub/torch」环境失败，在完整 venv 中全部通过），收集阶段不再报错；改动文件 ruff 0 新增。
+
 ## 2026-09-30：Debug 时间条只留 GPU 计算，LOAD 与传输移出
 
 - 诉求：LOAD 不该算进 inference 时间、也不该出现在时间条里（只在下方 timing 表）；时间条的 compute 只含 GPU 时间，上传/下载与其它杂务不得混入。

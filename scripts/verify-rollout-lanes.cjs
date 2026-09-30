@@ -392,11 +392,16 @@ async function runViewport(browser, viewport, base, frames) {
       dispatched_steps:24, remaining_steps:0, replaced_steps:21, replaced_by:502,
       replaced_at:detail.rollout_timeline.t_s-.4, action_end:detail.rollout_timeline.t_s-.3,
       step_s:1/30,status:"replaced", stages:[{name:"model",start:detail.rollout_timeline.t_s-1.48,end:detail.rollout_timeline.t_s-.92,gpu_ms:301}] },
-    { id:502,kind:"rtc",start:detail.rollout_timeline.t_s-1,end:detail.rollout_timeline.t_s-.45,
-      accepted_at:detail.rollout_timeline.t_s-.4,active:detail.rollout_timeline.t_s-.3,
+    { id:502,kind:"rtc",start:detail.rollout_timeline.t_s-1.96,end:detail.rollout_timeline.t_s-.02,
+      accepted_at:detail.rollout_timeline.t_s-.05,active:detail.rollout_timeline.t_s-.3,
       steps:45,original_steps:51,prefix_trimmed:6,accepted_steps:45,consumed_steps:9,dispatched_steps:9,
       remaining_steps:36,replaced_steps:0,step_s:1/30,status:"active",
-      stages:[{name:"model",start:detail.rollout_timeline.t_s-.98,end:detail.rollout_timeline.t_s-.48,gpu_ms:288}] }
+      // Cloud RTC chunk: the round trip is split into its transfer and compute legs.
+      stages:[
+        {name:"cloud_encode",start:detail.rollout_timeline.t_s-1.94,end:detail.rollout_timeline.t_s-1.90,gpu_ms:null},
+        {name:"cloud_upload",start:detail.rollout_timeline.t_s-1.90,end:detail.rollout_timeline.t_s-.50,gpu_ms:null},
+        {name:"cloud_compute",start:detail.rollout_timeline.t_s-.50,end:detail.rollout_timeline.t_s-.06,gpu_ms:288},
+        {name:"cloud_download",start:detail.rollout_timeline.t_s-.06,end:detail.rollout_timeline.t_s-.03,gpu_ms:null}] }
   ];
   detail.prediction = { ...detail.prediction,id:1,t_s:detail.rollout_timeline.blocks[1].active,actions:detail.prediction.actions.slice(0,2) };
   // Deliver at the current browser-relative wall time while preserving relative event times.
@@ -410,6 +415,48 @@ async function runViewport(browser, viewport, base, frames) {
   await page.locator("#chart-scale").selectOption("2");
   await page.waitForTimeout(120);
   check(`${viewport.name} new run clears old predictions`,await page.evaluate(()=>window.Chart.getChart(document.getElementById("chart-action")).$predictions.every(ds=>ds.data.length===2)));
+  const cloudLane=await page.evaluate(()=>{
+    const c=window.Chart.getChart(document.getElementById("chart-action"));
+    const stages=(c.$ribbonSegments||[]).filter(s=>s.ribbon.id===502&&s.stage);
+    const ribbon=(c.$rolloutLanes.ribbons||[]).find(r=>r.id===502);
+    return {
+      names:stages.map(s=>s.stage),
+      blockStages:(ribbon?.block.stages||[]).map(s=>s.name),
+      labels:c.$rolloutLaneDrawStats?.stageLabels||[],
+    };
+  });
+  // The local encode phase is sub-second, so the chart may already have scrolled past its
+  // window: the block must still carry it (tooltip), and the legs must keep their segments.
+  check(`${viewport.name} cloud transfer phases render as separate segments`,
+    ["cloud_upload","cloud_compute","cloud_download"].every(name=>cloudLane.names.includes(name))
+      && cloudLane.blockStages.includes("cloud_encode"),
+    JSON.stringify(cloudLane));
+  check(`${viewport.name} cloud phases carry duration labels`,cloudLane.labels.length>0,JSON.stringify(cloudLane.labels));
+  check(`${viewport.name} upload leg labelled in its own window`,
+    cloudLane.labels.some(text=>text.startsWith("up ")),
+    JSON.stringify(cloudLane.labels));
+  const cloudHover=await page.evaluate(()=>{
+    const c=window.Chart.getChart(document.getElementById("chart-action"));
+    const segment=(c.$ribbonSegments||[]).find(s=>s.ribbon.id===502&&s.stage==="cloud_upload");
+    return segment?{x:(segment.x1+segment.x2)/2,y:(segment.y1+segment.y2)/2}:null;
+  });
+  if (cloudHover) {
+    await page.locator("#chart-action").hover({position:cloudHover,force:true});
+    await page.waitForTimeout(120);
+  }
+  const cloudTooltip=await page.evaluate(()=>{
+    const c=window.Chart.getChart(document.getElementById("chart-action"));
+    const pointer=c?.$pointerPosition||null;
+    const laneHovered=pointer?Boolean(window.pointerYInRolloutLanes(c,pointer.y)):false;
+    const target=pointer?c.scales.x.getValueForPixel(pointer.x):null;
+    const model=Number.isFinite(Number(target))?window.chartTooltipModel(c,target,laneHovered):null;
+    return model?.lane?.text||"";
+  });
+  check(`${viewport.name} cloud hover splits transfer from compute`,
+    /cloud_upload/.test(cloudTooltip)&&/Round trip/.test(cloudTooltip)&&/Cloud legs/.test(cloudTooltip),
+    cloudTooltip);
+  await page.mouse.move(1,1);
+  await page.waitForTimeout(60);
   const stableBefore=await page.evaluate(()=>{
     const c=window.Chart.getChart(document.getElementById("chart-action"));
     return {start:c.$rolloutLanes.ribbons[0].block.start,pred:c.$predictions[0]?.data[0]?.x};

@@ -1,5 +1,14 @@
 # Dev log
 
+## 2026-09-30：泳道内拆分云端上传/下载/计算耗时
+
+- 诉求：斜线泳道的时间 profiling 要把数据上传、下载单独标出来，不能全部算作 inference 时间。
+- 现状：云端 RTC 的 block 自上一提交起已带 `cloud_encode/cloud_upload/cloud_compute/cloud_download` 四个阶段，颜色映射也已存在，但阶段子带被图例开关 `inferenceStages`（默认 false）挡住，斜带上只有一个总时长标签。
+- 前端：`inferenceStages` 默认改为开启（含图例开关），并在斜带的 inference 行新增逐阶段时长标签（`enc/up/gpu/down + 时长`，只在该阶段自身像素宽度放得下时绘制，行 y=+40，与总时长/+chunk 行错开 12px 防重叠）；阶段配色/简称映射从渲染函数内提到模块级常量（`STAGE_COLORS`/`STAGE_LABELS`/`stageColor`/`stageLabel`/`isCloudStage`），供画布与 tooltip 共用。tooltip 对含云端阶段的 block 把总时长改称 `Round trip`，并新增 `Cloud legs: enc … · up … · gpu … · down …` 汇总行（阶段明细行保留）。
+- 图例持久化加了 schema 版本（`CHART_LEGEND_VERSION=2`）：v1 存下的 `inferenceStages=false` 会被丢弃并回到新默认，避免老会话永久看不到阶段带；此后开关照常持久化。`app.js` 资源版本升到 `20260930-cloud-legs`。
+- 验证：`scripts/verify-rollout-lanes.cjs` 新增云端 chunk 场景（502 号 block 带四个 cloud 阶段，upload 跨度 1.4s）与 4 项断言/视口：阶段各自成段（upload/compute/download 可见 + block 保留 encode，被 2s 窗口滚出属预期）、阶段标签非空、upload 标签落在自身窗口、悬停 tooltip 同时含 `cloud_upload`/`Round trip`/`Cloud legs`。1440×900 与 390×844 共 84/84 通过；`node scripts/test-rollout-lanes.mjs` 13/13；`node --check` 通过。
+- 边界：`up 1.40 s` 这类标签需要该阶段在屏上有足够像素（默认 20s 窗口下云阶段只有几像素宽，此时看颜色分段与 tooltip 数值；缩放到 2s 或阶段较长时显示标签）。窄面板（验证用 1440 布局下 action 图仅 205px）也能画出至少一个阶段标签。
+
 ## 2026-09-30：云端 RTC rollout 补齐 chunk 生命周期（泳道恢复）
 
 - 现象：`Model = cloud SmolVLA + inference.type=rtc` 的 rollout 中 command action 图底部泳道带空白（无推理带、chunk 带、重叠与 tooltip）；云端 ACT、本地模型均正常。实测主机目录确认差异来源：`8x4090-server` 的 ACT 部署 `capabilities.rtc_chunk=False`，只能走 `select_action`（云 sync 的 PolicyWorker 早已上报事件），SmolVLA 部署支持 `rtc_chunk`。

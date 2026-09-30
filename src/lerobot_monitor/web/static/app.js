@@ -184,6 +184,25 @@ const ROLLOUT_LANE_MAX_BLOCKS = 200;
 const ROLLOUT_OVERLAP_MIN_S = 0.02;
 const ROLLOUT_CHUNK_COLOR = "#5dba9a";
 const ROLLOUT_INFERENCE_COLOR = "#58a8ff";
+// Producer phases: local profiler stages plus the cloud RTC legs (encode, network,
+// remote GPU compute), so transfer time is never folded into one "inference" number.
+const STAGE_COLORS = {
+  observation: "#83b9ff", observation_prepare: "#83b9ff", preprocessing: "#91c9e8",
+  preprocess: "#91c9e8", model: "#58a8ff", model_call: "#58a8ff", postprocessing: "#b8b8ee",
+  postprocess: "#b8b8ee", cpu_transfer: "#b5c5e2", publish: "#7fcfd4", lock_wait: "#c4b4a4",
+  rtc_prefix: "#799ccc",
+  cloud_encode: "#91c9e8", cloud_upload: "#e0a35c", cloud_compute: "#58a8ff", cloud_download: "#c98bd4",
+};
+const STAGE_LABELS = {
+  observation: "obs", observation_prepare: "obs", preprocessing: "pre", preprocess: "pre",
+  model: "model", model_call: "model", postprocessing: "post", postprocess: "post",
+  cpu_transfer: "cpu", publish: "pub", lock_wait: "lock", rtc_prefix: "prefix",
+  queue_lock_wait: "queue", action_prepare: "act",
+  cloud_encode: "enc", cloud_upload: "up", cloud_compute: "gpu", cloud_download: "down",
+};
+const stageColor = (name) => STAGE_COLORS[name] || ROLLOUT_INFERENCE_COLOR;
+const stageLabel = (name) => STAGE_LABELS[name] || String(name || "");
+const isCloudStage = (stage) => String((stage && stage.name) || "").startsWith("cloud_");
 const LIVE_RIGHT_PADDING_S = 0.2;
 const LIVE_FRAME_RATE = 30;
 const TIME_LABEL_EDGE_FADE_PX = 24;
@@ -203,7 +222,7 @@ const chartLegendVisibility = {
   chunkSpan: true,
   chunkOverlap: true,
   inference: true,
-  inferenceStages: false,
+  inferenceStages: true,
   joints: new Map(),
 };
 let chartFreeze = null;
@@ -211,12 +230,17 @@ let liveRolloutTimeline = null;
 let liveRolloutEpoch = null;
 let liveRolloutRun = null;
 const CHART_LEGEND_STORAGE_KEY = "lerobot-monitor-chart-legend";
+// Bumping the schema drops toggles saved by an older default — v1 stored
+// inferenceStages=false, which would keep the transfer stages hidden forever.
+const CHART_LEGEND_VERSION = 2;
 try {
   const savedLegend = JSON.parse(localStorage.getItem(CHART_LEGEND_STORAGE_KEY) || "{}");
-  ["command", "prediction", "gap", "mode", "now", "chunkIn", "chunkSpan", "chunkOverlap", "inference", "inferenceStages"]
-    .forEach((key) => {
-      if (savedLegend && typeof savedLegend[key] === "boolean") chartLegendVisibility[key] = savedLegend[key];
-    });
+  if (savedLegend && savedLegend.version === CHART_LEGEND_VERSION) {
+    ["command", "prediction", "gap", "mode", "now", "chunkIn", "chunkSpan", "chunkOverlap", "inference", "inferenceStages"]
+      .forEach((key) => {
+        if (typeof savedLegend[key] === "boolean") chartLegendVisibility[key] = savedLegend[key];
+      });
+  }
 } catch { /* ignore */ }
 const CHART_SCALE_OPTIONS = [
   { seconds: 2, label: "2s" },
@@ -906,11 +930,16 @@ function rolloutLaneTooltipModel(chart) {
   const a = ribbon.action;
   const analysis = window.RolloutLanes.ribbonAnalysis(ribbon, now);
   const overlaps = chart.$rolloutLanes.overlaps.filter(o => o.ids.includes(b.id));
+  const cloudStages = (b.stages || []).filter(isCloudStage);
+  const phaseDuration = (item) => duration((item.end ?? now) - item.start);
   const parts = [
     `chunk #${b.id} · ${b.kind || "sync"} · ${b.status || (b.failed ? "failed" : a ? "active" : "waiting")}`,
     `Focus: ${stage || phase} · total ${duration(analysis.total)}`,
-    `Inference ${duration(ribbon.inference.end - b.start)} · ${time(b.start)} → ${time(b.end)}`,
-    ...b.stages.map(st => `  ${st.name}: ${duration((st.end ?? now) - st.start)}${st.gpu_ms != null ? ` · GPU ${Number(st.gpu_ms).toFixed(2)} ms` : ""}`),
+    `${cloudStages.length ? "Round trip" : "Inference"} ${duration(ribbon.inference.end - b.start)} · ${time(b.start)} → ${time(b.end)}`,
+    ...(cloudStages.length
+      ? [`Cloud legs: ${cloudStages.map(st => `${stageLabel(st.name)} ${phaseDuration(st)}`).join(" · ")}`]
+      : []),
+    ...b.stages.map(st => `  ${st.name}: ${phaseDuration(st)}${st.gpu_ms != null ? ` · GPU ${Number(st.gpu_ms).toFixed(2)} ms` : ""}`),
     `Accepted ${time(b.accepted_at)} · first send ${time(b.active)}`,
     `Queue wait ${duration(analysis.queueWait)}`,
     `Action elapsed ${duration(analysis.actionElapsed)} / plan ${duration(analysis.plan)}`,
@@ -1377,11 +1406,6 @@ const rolloutLanesPlugin = {
     const pointer = chart.$pointerPosition;
     const hit = pointer?.inside ? window.RolloutLanes.hitTestRibbon(segments, pointer.x, pointer.y) : null;
     chart.$hoveredRibbon = hit?.ribbon.id ?? null;
-    const stageColors = { observation: "#83b9ff", observation_prepare: "#83b9ff", preprocessing: "#91c9e8",
-      preprocess: "#91c9e8", model: "#58a8ff", model_call: "#58a8ff", postprocessing: "#b8b8ee",
-      postprocess: "#b8b8ee", cpu_transfer: "#b5c5e2", publish: "#7fcfd4", lock_wait: "#c4b4a4", rtc_prefix: "#799ccc",
-      // Cloud inference phases: local encode, network legs, and remote GPU compute.
-      cloud_encode: "#91c9e8", cloud_upload: "#e0a35c", cloud_compute: "#58a8ff", cloud_download: "#c98bd4" };
     ctx.save();
     ctx.beginPath(); ctx.rect(area.left, area.bottom + 1, area.right-area.left, 63); ctx.clip();
     ctx.fillStyle = "rgba(15, 22, 32, .55)";
@@ -1408,7 +1432,7 @@ const rolloutLanesPlugin = {
       const { phase, ribbon } = segment;
       const selected = ribbon.id === chart.$hoveredRibbon;
       ctx.strokeStyle = ribbon.block.failed ? "#e06b7a" : phase === "inference"
-        ? stageColors[segment.stage] || ROLLOUT_INFERENCE_COLOR
+        ? stageColor(segment.stage)
         : phase === "action" ? ROLLOUT_CHUNK_COLOR : phase === "planned" ? "rgba(93,186,154,.38)" : "#87929e";
       ctx.lineWidth = selected ? 5 : 3;
       ctx.setLineDash(["wait", "replaced"].includes(phase) ? [3,3] : []);
@@ -1420,25 +1444,39 @@ const rolloutLanesPlugin = {
     chart.$rolloutLaneDrawStats.chunks = new Set(segments.filter(s => ['action','planned','replaced'].includes(s.phase)).map(s => s.ribbon.id)).size;
     chart.$rolloutLaneDrawStats.inferences = new Set(segments.filter(s => s.phase === 'inference').map(s => s.ribbon.id)).size;
     const labels = [];
+    const stageLabels = [];
     const duration = window.RolloutLanes.formatDuration;
     ctx.font = "9px 'IBM Plex Mono', monospace"; ctx.textBaseline = "middle";
     lanes.ribbons.forEach(ribbon => {
       const label = (span, text, y, color) => {
-        if (!span) return;
+        if (!span) return false;
         const left = Math.max(area.left, scale.getPixelForValue(span.start));
         const right = Math.min(area.right, scale.getPixelForValue(span.end));
         const width = ctx.measureText(text).width;
-        if (right-left < width+8 || labels.some(box => Math.abs(box.y-y) < 12 && left < box.right && right > box.left)) return;
+        if (right-left < width+8 || labels.some(box => Math.abs(box.y-y) < 12 && left < box.right && right > box.left)) return false;
         labels.push({ left, right, y });
         ctx.fillStyle = 'rgba(10,15,24,.9)'; ctx.fillRect(left+3,y-6,width+4,12);
         ctx.fillStyle = color; ctx.fillText(text,left+5,y);
+        return true;
       };
       if (chartLegendVisibility.inference !== false) label(ribbon.inference,
         duration(ribbon.inference.end-ribbon.inference.start), area.bottom+54, '#b9d9ff');
+      // Each producer phase keeps its own time window: encode, upload, remote GPU
+      // compute and download are labelled instead of one opaque round-trip number.
+      if (chartLegendVisibility.inference !== false && chartLegendVisibility.inferenceStages !== false) {
+        (ribbon.block.stages || []).forEach(stage => {
+          const end = stage.end ?? lanes.now;
+          const text = `${stageLabel(stage.name)} ${duration(end - stage.start)}`;
+          if (label({ start: stage.start, end }, text, area.bottom + 40, stageColor(stage.name))) {
+            stageLabels.push(text);
+          }
+        });
+      }
       if (chartLegendVisibility.chunkSpan !== false && ribbon.action) label(ribbon.action,
         `${duration(window.RolloutLanes.ribbonAnalysis(ribbon,lanes.now).actionElapsed)} / ${duration(ribbon.action.end-ribbon.action.start)}`,
         area.bottom+20,'#b9e5d4');
     });
+    chart.$rolloutLaneDrawStats.stageLabels = stageLabels;
     ctx.restore();
   },
 };
@@ -1739,7 +1777,7 @@ function legendItemVisible(group, key) {
 }
 
 function persistChartLegendVisibility() {
-  const saved = {};
+  const saved = { version: CHART_LEGEND_VERSION };
   ["command", "prediction", "gap", "mode", "now", "chunkIn", "chunkSpan", "chunkOverlap", "inference", "inferenceStages"]
     .forEach((key) => { saved[key] = chartLegendVisibility[key] !== false; });
   try { localStorage.setItem(CHART_LEGEND_STORAGE_KEY, JSON.stringify(saved)); } catch { /* ignore */ }
